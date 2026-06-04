@@ -173,20 +173,21 @@ impl App {
         self.src.visible = src_visible(&self.rows, &self.src.query);
         self.src.clamp_cursor();
 
-        let fuzzy_src = if self.dst_filters.fuzzy_from_src {
-            self.src
-                .visible
-                .get(self.src.cursor)
-                .and_then(|&i| self.rows.get(i))
-                .cloned()
-        } else {
-            None
-        };
+        // Hand the current src to dst_visible so it always gets excluded from
+        // the dst list (you can't copy a track onto itself); the fuzzy flag is
+        // a separate axis that further narrows by normalized title + length.
+        let src = self
+            .src
+            .visible
+            .get(self.src.cursor)
+            .and_then(|&i| self.rows.get(i))
+            .cloned();
         self.dst.visible = dst_visible(
             &self.rows,
             &self.dst.query,
             self.dst_filters.auto,
-            fuzzy_src.as_ref(),
+            src.as_ref(),
+            self.dst_filters.fuzzy_from_src,
             DURATION_TOL_SECS,
         );
         self.dst.clamp_cursor();

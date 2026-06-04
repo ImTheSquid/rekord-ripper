@@ -93,23 +93,27 @@ pub fn load_rows(db: &MasterDb) -> Result<Vec<TrackRow>> {
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-/// Filter composition for the destination column. AND of three independent
-/// predicates: typed search, auto-mode, fuzzy-match-from-source.
+/// Filter composition for the destination column. AND of four predicates:
+/// typed search, auto-mode, fuzzy-match-from-source, and "not the current src"
+/// (you can't copy a track onto itself, so it never belongs in the dst list).
 pub fn dst_visible(
     rows: &[TrackRow],
     query: &str,
     auto: bool,
-    fuzzy_src: Option<&TrackRow>,
+    src: Option<&TrackRow>,
+    fuzzy_from_src: bool,
     duration_tol_secs: i64,
 ) -> Vec<usize> {
     let q = query.trim().to_lowercase();
+    let src_id = src.map(|s| s.id.as_str());
     rows.iter()
         .enumerate()
+        .filter(|(_, r)| src_id.is_none_or(|id| r.id != id))
         .filter(|(_, r)| q.is_empty() || r.search_blob.contains(&q))
         .filter(|(_, r)| !auto || r.is_unlocked_cueless_audio)
-        .filter(|(_, r)| match fuzzy_src {
-            None => true,
-            Some(src) => fuzzy_match(src, r, duration_tol_secs),
+        .filter(|(_, r)| match (fuzzy_from_src, src) {
+            (true, Some(s)) => fuzzy_match(s, r, duration_tol_secs),
+            _ => true,
         })
         .map(|(i, _)| i)
         .collect()
@@ -183,8 +187,11 @@ mod tests {
             row("3", "Track", "C", 12000, 200, 0, 5, true),   // locked
             row("4", "Track", "D", 12000, 200, 0, 19, false), // streaming
         ];
-        assert_eq!(dst_visible(&rows, "", true, None, 1), vec![0]);
-        assert_eq!(dst_visible(&rows, "", false, None, 1), vec![0, 1, 2, 3]);
+        assert_eq!(dst_visible(&rows, "", true, None, false, 1), vec![0]);
+        assert_eq!(
+            dst_visible(&rows, "", false, None, false, 1),
+            vec![0, 1, 2, 3]
+        );
     }
 
     #[test]
@@ -196,8 +203,19 @@ mod tests {
             row("4", "Ritual Pharmacy", "Different", 14600, 221, 0, 5, false),      // wrong artist
             row("5", "Ritual Pharmacy", "porf0d", 14600, 230, 0, 5, false),         // length too far
         ];
-        let vis = dst_visible(&rows, "", false, Some(&src), 1);
+        let vis = dst_visible(&rows, "", false, Some(&src), true, 1);
         assert_eq!(vis, vec![0]); // only row index 0 (id=2) matches
+    }
+
+    #[test]
+    fn src_is_excluded_from_dst_even_when_fuzzy_off() {
+        let src = row("1", "Same", "A", 12000, 200, 0, 5, false);
+        let rows = vec![
+            row("1", "Same", "A", 12000, 200, 0, 5, false), // the src itself
+            row("2", "Other", "A", 12000, 200, 0, 5, false),
+        ];
+        let vis = dst_visible(&rows, "", false, Some(&src), false, 1);
+        assert_eq!(vis, vec![1]);
     }
 
     #[test]
@@ -211,7 +229,7 @@ mod tests {
             row("6", "Foo", "Bar", 12000, 200, 0, 5, false),    // matches; will fail text
         ];
         // Text filter: just "Foo".
-        let vis = dst_visible(&rows, "foo", true, Some(&src), 1);
+        let vis = dst_visible(&rows, "foo", true, Some(&src), true, 1);
         assert_eq!(vis, vec![0, 4]);
     }
 }

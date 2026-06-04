@@ -185,8 +185,11 @@ fn run_auto(db: &mut MasterDb, args: AutoArgs) -> Result<()> {
 
     db::safety_preflight(args.safety)?;
 
-    for plan in &plans {
-        analysis::apply_plan(db, plan)?;
+    for (i, plan) in plans.iter().enumerate() {
+        let backup = analysis::apply_plan(db, plan)?;
+        if i == 0 {
+            eprintln!("backed up to: {}", backup.display());
+        }
         eprintln!("applied: {} → {}", plan.src.id, plan.dst.id);
     }
     Ok(())
@@ -217,8 +220,11 @@ fn run_cp(
 
     db::safety_preflight(safety)?;
 
-    for plan in &plans {
-        analysis::apply_plan(db, plan)?;
+    for (i, plan) in plans.iter().enumerate() {
+        let backup = analysis::apply_plan(db, plan)?;
+        if i == 0 {
+            eprintln!("backed up to: {}", backup.display());
+        }
         eprintln!("applied: {} → {}", plan.src.id, plan.dst.id);
     }
     Ok(())

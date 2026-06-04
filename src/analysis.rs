@@ -461,13 +461,12 @@ fn build_active_censor_json(
 // Plan application
 // ----------------------------------------------------------------------------
 
-pub fn apply_plan(db: &mut MasterDb, plan: &Plan) -> Result<()> {
+pub fn apply_plan(db: &mut MasterDb, plan: &Plan) -> Result<PathBuf> {
     // Count total USN-allocated actions for the global counter bump.
     let action_count = plan_action_count(plan) as i64;
 
     // Take a backup of master.db before any mutation.
     let backup_path = db.backup()?;
-    eprintln!("{} {}", "Backed up to:".dimmed(), backup_path.display());
 
     let tx = db.conn.transaction()?;
 
@@ -690,7 +689,7 @@ pub fn apply_plan(db: &mut MasterDb, plan: &Plan) -> Result<()> {
             .map_err(|e| anyhow!("copy {} -> {}: {e}", fc.src.display(), fc.dst.display()))?;
     }
 
-    Ok(())
+    Ok(backup_path)
 }
 
 fn plan_action_count(plan: &Plan) -> u32 {

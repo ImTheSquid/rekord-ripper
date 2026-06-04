@@ -71,13 +71,17 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
         (KeyCode::Up, _) | (KeyCode::Char('k'), _) => {
             app.focused_column_mut().move_by(-1);
             // Fuzzy-from-src depends on the src cursor.
-            if matches!(app.focus, Focus::Src) && app.dst_filters.fuzzy_from_src {
+            if matches!(app.focus, Focus::Src) {
+                // Moving the src cursor changes which row is hidden from dst
+                // (the exclude-self predicate) — also nudges the fuzzy match.
                 app.recompute_visible();
             }
         }
         (KeyCode::Down, _) | (KeyCode::Char('j'), _) => {
             app.focused_column_mut().move_by(1);
-            if matches!(app.focus, Focus::Src) && app.dst_filters.fuzzy_from_src {
+            if matches!(app.focus, Focus::Src) {
+                // Moving the src cursor changes which row is hidden from dst
+                // (the exclude-self predicate) — also nudges the fuzzy match.
                 app.recompute_visible();
             }
         }
@@ -174,7 +178,7 @@ fn handle_search(app: &mut App, key: KeyEvent, focus: Focus) {
                 Focus::Src => app.src.move_by(-1),
                 Focus::Dst => app.dst.move_by(-1),
             }
-            if matches!(focus, Focus::Src) && app.dst_filters.fuzzy_from_src {
+            if matches!(focus, Focus::Src) {
                 app.recompute_visible();
             }
         }
@@ -183,7 +187,7 @@ fn handle_search(app: &mut App, key: KeyEvent, focus: Focus) {
                 Focus::Src => app.src.move_by(1),
                 Focus::Dst => app.dst.move_by(1),
             }
-            if matches!(focus, Focus::Src) && app.dst_filters.fuzzy_from_src {
+            if matches!(focus, Focus::Src) {
                 app.recompute_visible();
             }
         }
@@ -254,9 +258,13 @@ fn apply_pending(app: &mut App) {
 
     let total = batch.plans.len();
     let mut errs: Vec<String> = Vec::new();
+    let mut backup_path = None;
     for plan in &batch.plans {
-        if let Err(e) = analysis::apply_plan(&mut app.db, plan) {
-            errs.push(format!("{} → {}: {e}", plan.src.id, plan.dst.id));
+        match analysis::apply_plan(&mut app.db, plan) {
+            Ok(path) => {
+                backup_path.get_or_insert(path);
+            }
+            Err(e) => errs.push(format!("{} → {}: {e}", plan.src.id, plan.dst.id)),
         }
     }
     let ok = total - errs.len();
@@ -269,12 +277,16 @@ fn apply_pending(app: &mut App) {
         Err(e) => app.status.warn(format!("reload after apply failed: {e}")),
     }
 
+    let backup_hint = backup_path
+        .map(|p| format!(" Backup: {}", p.display()))
+        .unwrap_or_default();
     if errs.is_empty() {
-        app.status.ok(format!("Applied {ok}/{total}."));
+        app.status.ok(format!("Applied {ok}/{total}.{backup_hint}"));
     } else {
         app.unresolved_errors = true;
-        app.status
-            .err(format!("Applied {ok}/{total}. {} failed.", errs.len()));
+        app.status.err(format!(
+            "Applied {ok}/{total}. {} failed.{backup_hint}",
+            errs.len()
+        ));
     }
-
 }
