@@ -138,11 +138,7 @@ fn print_track(db: &MasterDb, t: &Track) -> Result<()> {
         t.file_type.map(|v| v.to_string()).unwrap_or("-".into()),
         file_type_name(t.file_type)
     );
-    println!(
-        "  {} {}",
-        "BPM           ".dimmed(),
-        format_bpm(t.bpm)
-    );
+    println!("  {} {}", "BPM           ".dimmed(), format_bpm(t.bpm));
     println!(
         "  {} {}",
         "Length        ".dimmed(),
@@ -200,27 +196,24 @@ fn print_track(db: &MasterDb, t: &Track) -> Result<()> {
         format!("({})", cues.len()).bold()
     );
     for c in &cues {
-        let pos = c
-            .in_msec
-            .map(format_msec)
-            .unwrap_or_else(|| "-".into());
+        let pos = c.in_msec.map(format_msec).unwrap_or_else(|| "-".into());
         let kind = c.kind.map(|k| k.to_string()).unwrap_or("-".into());
         let kind_label = kind_label(c.kind);
         let mut extras = Vec::new();
-        if let Some(o) = c.out_msec {
-            if o >= 0 {
-                extras.push(format!("out={}", format_msec(o)));
-            }
+        if let Some(o) = c.out_msec
+            && o >= 0
+        {
+            extras.push(format!("out={}", format_msec(o)));
         }
-        if let Some(bls) = c.beat_loop_size {
-            if bls > 0 {
-                extras.push(format!("loop={bls}b"));
-            }
+        if let Some(bls) = c.beat_loop_size
+            && bls > 0
+        {
+            extras.push(format!("loop={bls}b"));
         }
-        if let Some(color) = c.color {
-            if color >= 0 {
-                extras.push(format!("color={color}"));
-            }
+        if let Some(color) = c.color
+            && color >= 0
+        {
+            extras.push(format!("color={color}"));
         }
         if let Some(cmt) = c.comment.as_deref().filter(|s| !s.is_empty()) {
             extras.push(format!("\"{cmt}\""));
@@ -230,9 +223,7 @@ fn print_track(db: &MasterDb, t: &Track) -> Result<()> {
         } else {
             format!("  {}", extras.join(" "))
         };
-        println!(
-            "    {pos:>10}  kind={kind} ({kind_label}){extras_str}"
-        );
+        println!("    {pos:>10}  kind={kind} ({kind_label}){extras_str}");
     }
 
     if let Some(mp) = fetch_mixer_param(db, &t.id)? {
@@ -253,10 +244,7 @@ fn print_track(db: &MasterDb, t: &Track) -> Result<()> {
         params![t.id],
         |r| r.get(0),
     )?;
-    println!(
-        "  {} {censor_count}",
-        "ActiveCensors ".dimmed()
-    );
+    println!("  {} {censor_count}", "ActiveCensors ".dimmed());
 
     Ok(())
 }

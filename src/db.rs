@@ -1,10 +1,11 @@
 use std::env::var;
 use std::io::Read;
 use std::path::PathBuf;
+use std::process::Command;
 
 use anyhow::{Result, anyhow, bail};
 use flate2::read::ZlibDecoder;
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 
 // Obfuscated SQLCipher key for rekordbox 6.x and 7.x `master.db`, byte-identical
 // to the constants pyrekordbox ships. Deobfuscation: base85-decode -> XOR with
@@ -92,4 +93,121 @@ impl MasterDb {
         let stripped = rel.trim_start_matches('/');
         self.app_dir.join("share").join(stripped)
     }
+
+    /// Read the global USN counter from `agentRegistry`.
+    pub fn read_local_usn(&self) -> Result<i64> {
+        self.conn
+            .query_row(
+                "SELECT int_1 FROM agentRegistry WHERE registry_id = 'localUpdateCount'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .map_err(|e| anyhow!("read localUpdateCount: {e}"))
+    }
+
+    /// Write the global USN counter into `agentRegistry`. Must be inside the
+    /// caller's transaction.
+    pub fn write_local_usn(&self, usn: i64) -> Result<()> {
+        let ts = now_db_string();
+        let n = self.conn.execute(
+            "UPDATE agentRegistry SET int_1 = ?1, updated_at = ?2
+             WHERE registry_id = 'localUpdateCount'",
+            params![usn, ts],
+        )?;
+        if n != 1 {
+            bail!("localUpdateCount row missing or updated {n} rows");
+        }
+        Ok(())
+    }
+
+    /// Copy `master.db` (+ wal/shm sidecars if present) into our data dir.
+    /// Returns the path of the primary backup file.
+    pub fn backup(&self) -> Result<PathBuf> {
+        let backup_dir = backup_dir()?;
+        std::fs::create_dir_all(&backup_dir)?;
+        let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+
+        let live = self.app_dir.join("master.db");
+        let target = backup_dir.join(format!("master.db.{stamp}.bak"));
+        std::fs::copy(&live, &target)?;
+
+        for sidecar in ["master.db-wal", "master.db-shm"] {
+            let src = self.app_dir.join(sidecar);
+            if src.exists() {
+                let dst = backup_dir.join(format!("{sidecar}.{stamp}.bak"));
+                std::fs::copy(&src, &dst)?;
+            }
+        }
+        Ok(target)
+    }
 }
+
+/// Where backups live. Created on first use.
+fn backup_dir() -> Result<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        var("LOCALAPPDATA")
+            .map(|d| PathBuf::from(d).join("rekord-ripper").join("backups"))
+            .map_err(|_| anyhow!("LOCALAPPDATA env var not found"))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        var("HOME")
+            .map(|h| {
+                PathBuf::from(h)
+                    .join("Library/Application Support/rekord-ripper/backups")
+            })
+            .map_err(|_| anyhow!("HOME env var not found"))
+    }
+}
+
+/// True if a `rekordbox` process is currently running.
+pub fn rekordbox_running() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("pgrep")
+            .args(["-x", "rekordbox"])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // tasklist prints a header even with /NH unless filter matches nothing.
+        let out = Command::new("tasklist")
+            .args(["/FI", "IMAGENAME eq rekordbox.exe", "/NH"])
+            .output();
+        match out {
+            Ok(o) => String::from_utf8_lossy(&o.stdout).contains("rekordbox.exe"),
+            Err(_) => false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct SafetyOpts {
+    /// Bypass the "rekordbox is running" hard refuse. Mapped to the explicit
+    /// `--i-know-rekordbox-is-open-and-may-corrupt-my-data` flag.
+    pub bypass_rekordbox_check: bool,
+}
+
+/// Pre-flight checks every mutating run must pass.
+pub fn safety_preflight(opts: SafetyOpts) -> Result<()> {
+    if rekordbox_running() && !opts.bypass_rekordbox_check {
+        bail!(
+            "rekordbox is running — refusing to write to master.db. \
+             Close rekordbox, or pass \
+             --i-know-rekordbox-is-open-and-may-corrupt-my-data to proceed."
+        );
+    }
+    Ok(())
+}
+
+/// Timestamp string in the format master.db already uses, e.g.
+/// `2026-06-03 01:02:54.026 +00:00`.
+pub fn now_db_string() -> String {
+    chrono::Utc::now()
+        .format("%Y-%m-%d %H:%M:%S%.3f +00:00")
+        .to_string()
+}
+
