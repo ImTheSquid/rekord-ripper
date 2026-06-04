@@ -252,15 +252,14 @@ fn apply_pending(app: &mut App) {
         return;
     }
 
-    let mut ok = 0usize;
-    let mut errs: Vec<String> = Vec::new();
     let total = batch.plans.len();
+    let mut errs: Vec<String> = Vec::new();
     for plan in &batch.plans {
-        match analysis::apply_plan(&mut app.db, plan) {
-            Ok(()) => ok += 1,
-            Err(e) => errs.push(format!("{} → {}: {e}", plan.src.id, plan.dst.id)),
+        if let Err(e) = analysis::apply_plan(&mut app.db, plan) {
+            errs.push(format!("{} → {}: {e}", plan.src.id, plan.dst.id));
         }
     }
+    let ok = total - errs.len();
 
     app.dst.selected.clear();
     app.mode = InputMode::Normal;

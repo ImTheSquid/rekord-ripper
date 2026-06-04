@@ -78,12 +78,6 @@ impl ColumnState {
             self.cursor = self.visible.len() - 1;
         }
     }
-    pub fn current_row_id<'a>(&self, rows: &'a [TrackRow]) -> Option<&'a str> {
-        self.visible
-            .get(self.cursor)
-            .and_then(|&i| rows.get(i))
-            .map(|r| r.id.as_str())
-    }
 }
 
 #[derive(Default)]

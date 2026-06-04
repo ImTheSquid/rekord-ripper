@@ -10,20 +10,6 @@ use uuid::Uuid;
 use crate::db::{MasterDb, now_db_string};
 use crate::format::{file_type_name, format_bpm, format_length};
 
-fn format_header_line(h: &TrackHeader) -> String {
-    let title = h.title.as_deref().unwrap_or("?");
-    let artist = h.artist.as_deref().unwrap_or("?");
-    let ft = file_type_name(h.file_type);
-    let len = format_length(h.length);
-    let bpm = format_bpm(h.bpm);
-    let cues = h.cue_count;
-    let lock = match h.analysed {
-        Some(a) if a & 0x80 != 0 => "🔒",
-        _ => "  ",
-    };
-    format!("\"{title}\" — {artist}   {ft}   {len}   {bpm} BPM   {cues} cues   {lock}")
-}
-
 const ANLZ_EXTENSIONS: &[&str] = &["DAT", "EXT", "2EX", "3EX"];
 
 #[derive(Clone, Copy, Default)]
@@ -744,6 +730,22 @@ impl UsnAllocator {
 // ----------------------------------------------------------------------------
 // Display
 // ----------------------------------------------------------------------------
+
+fn format_header_line(h: &TrackHeader) -> String {
+    let title = h.title.as_deref().unwrap_or("?");
+    let artist = h.artist.as_deref().unwrap_or("?");
+    let lock = match h.analysed {
+        Some(a) if a & 0x80 != 0 => "🔒",
+        _ => "  ",
+    };
+    format!(
+        "\"{title}\" — {artist}   {ft}   {len}   {bpm} BPM   {cues} cues   {lock}",
+        ft = file_type_name(h.file_type),
+        len = format_length(h.length),
+        bpm = format_bpm(h.bpm),
+        cues = h.cue_count,
+    )
+}
 
 impl Plan {
     pub fn render(&self) -> String {
