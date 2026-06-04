@@ -2,7 +2,7 @@
 
 A utility to transfer Rekordbox analysis data across songs.
 
-<video src="demo.mp4" controls muted playsinline width="100%"></video>
+https://github.com/user-attachments/assets/0c9d8a70-0058-4870-9988-0bb712931234
 
 ## Installation
 
