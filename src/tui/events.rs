@@ -264,7 +264,15 @@ fn apply_pending(app: &mut App) {
             Ok(path) => {
                 backup_path.get_or_insert(path);
             }
-            Err(e) => errs.push(format!("{} → {}: {e}", plan.src.id, plan.dst.id)),
+            Err(e) => {
+                let dst_label = plan
+                    .dst
+                    .title
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(&plan.dst.id);
+                errs.push(format!("\"{dst_label}\": {e}"));
+            }
         }
     }
     let ok = total - errs.len();
@@ -284,9 +292,14 @@ fn apply_pending(app: &mut App) {
         app.status.ok(format!("Applied {ok}/{total}.{backup_hint}"));
     } else {
         app.unresolved_errors = true;
+        let extra = if errs.len() > 1 {
+            format!(" (+{} more)", errs.len() - 1)
+        } else {
+            String::new()
+        };
         app.status.err(format!(
-            "Applied {ok}/{total}. {} failed.{backup_hint}",
-            errs.len()
+            "Applied {ok}/{total}. Failed → {first}{extra}{backup_hint}",
+            first = errs[0],
         ));
     }
 }
