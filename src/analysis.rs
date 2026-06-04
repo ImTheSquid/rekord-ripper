@@ -479,14 +479,13 @@ pub fn apply_plan(db: &mut MasterDb, plan: &Plan) -> Result<PathBuf> {
 
     let now = now_db_string();
 
-    // 1. Delete pre-existing rows (only when --replace and target had rows).
+    // 1. Delete pre-existing rows.
+    //
+    // djmdCue / djmdActiveCensor are random-keyed multi-row tables; only
+    // touch them under --replace when the dst actually has live rows.
     if plan.delete_existing_cues {
         tx.execute(
             "DELETE FROM djmdCue WHERE ContentID = ?1",
-            params![plan.dst.id],
-        )?;
-        tx.execute(
-            "DELETE FROM contentCue WHERE ContentID = ?1",
             params![plan.dst.id],
         )?;
     }
@@ -495,12 +494,23 @@ pub fn apply_plan(db: &mut MasterDb, plan: &Plan) -> Result<PathBuf> {
             "DELETE FROM djmdActiveCensor WHERE ContentID = ?1",
             params![plan.dst.id],
         )?;
+    }
+    // contentCue, contentActiveCensor, and djmdMixerParam are single-row-per-dst
+    // tables keyed by dst.UUID (and/or ContentID). Always clear any existing row
+    // — including soft-deleted or empty-blob orphans — before INSERT so a
+    // re-apply doesn't hit a UNIQUE constraint on the row's ID column.
+    if plan.new_content_cue.is_some() {
         tx.execute(
-            "DELETE FROM contentActiveCensor WHERE ContentID = ?1",
-            params![plan.dst.id],
+            "DELETE FROM contentCue WHERE ContentID = ?1 OR ID = ?2",
+            params![plan.dst.id, plan.dst.uuid],
         )?;
     }
-    // mixerParam is always replaced via DELETE + INSERT.
+    if plan.new_content_active_censor.is_some() {
+        tx.execute(
+            "DELETE FROM contentActiveCensor WHERE ContentID = ?1 OR ID = ?2",
+            params![plan.dst.id, plan.dst.uuid],
+        )?;
+    }
     if plan.new_mixer_param.is_some() {
         tx.execute(
             "DELETE FROM djmdMixerParam WHERE ContentID = ?1",

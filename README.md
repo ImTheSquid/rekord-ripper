@@ -2,6 +2,8 @@
 
 A utility to transfer Rekordbox analysis data across songs.
 
+<video src="demo.mp4" controls muted playsinline width="100%"></video>
+
 ## Installation
 
 ```bash
