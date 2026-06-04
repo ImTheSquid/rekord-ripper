@@ -1,0 +1,13 @@
+[package]
+name = "rekord-ripper"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+base85 = "2"
+clap = { version = "4.6.1", features = ["derive"] }
+flate2 = "1"
+owo-colors = { version = "4.3.0", features = ["alloc", "supports-colors"] }
+rusqlite = { version = "0.40.0", features = ["bundled-sqlcipher-vendored-openssl"] }
+ureq = "3.3.0"
