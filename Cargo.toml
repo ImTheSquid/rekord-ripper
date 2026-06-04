@@ -2,9 +2,10 @@
 name = "rekord-ripper"
 version = "0.1.0"
 edition = "2024"
-license = "MIT OR Apache 2.0"
+license = "MIT OR Apache-2.0"
 authors = ["Jack Hogan <jackhogan11@gmail.com>"]
 description = "Rekordbox analysis utilities"
+repository = "https://github.com/ImTheSquid/rekord-ripper"
 
 [dependencies]
 anyhow = "1.0.102"
