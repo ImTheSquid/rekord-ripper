@@ -3,6 +3,7 @@ use owo_colors::OwoColorize;
 use rusqlite::{Row, params};
 
 use crate::db::MasterDb;
+use crate::format::{file_type_name, format_bpm, format_length, format_msec, kind_label};
 
 struct Track {
     id: String,
@@ -119,54 +120,54 @@ fn print_track(db: &MasterDb, t: &Track) -> Result<()> {
     println!("{}", header.bold().cyan());
     println!(
         "  {} {}",
-        "Title         ".dimmed(),
+        "Title           ".dimmed(),
         t.title.as_deref().unwrap_or("-")
     );
     println!(
         "  {} {}",
-        "Artist        ".dimmed(),
+        "Artist          ".dimmed(),
         t.artist.as_deref().unwrap_or("-")
     );
     println!(
         "  {} {}",
-        "FolderPath    ".dimmed(),
+        "FolderPath      ".dimmed(),
         t.folder_path.as_deref().unwrap_or("-")
     );
     println!(
         "  {} {} ({})",
-        "FileType      ".dimmed(),
+        "FileType        ".dimmed(),
         t.file_type.map(|v| v.to_string()).unwrap_or("-".into()),
         file_type_name(t.file_type)
     );
-    println!("  {} {}", "BPM           ".dimmed(), format_bpm(t.bpm));
+    println!("  {} {}", "BPM             ".dimmed(), format_bpm(t.bpm));
     println!(
         "  {} {}",
-        "Length        ".dimmed(),
+        "Length          ".dimmed(),
         format_length(t.length)
     );
     println!(
         "  {} {}",
-        "Analysed      ".dimmed(),
+        "Analysed        ".dimmed(),
         t.analysed.map(|v| v.to_string()).unwrap_or("-".into())
     );
     println!(
         "  {} {}",
-        "AnalysisUpdated".dimmed(),
+        "AnalysisUpdated ".dimmed(),
         t.analysis_updated.as_deref().unwrap_or("-")
     );
     println!(
         "  {} {}",
-        "CueUpdated    ".dimmed(),
+        "CueUpdated      ".dimmed(),
         t.cue_updated.as_deref().unwrap_or("-")
     );
     println!(
         "  {} {}",
-        "ContentLink   ".dimmed(),
+        "ContentLink     ".dimmed(),
         t.content_link.map(|v| v.to_string()).unwrap_or("-".into())
     );
     println!(
         "  {} {}",
-        "UUID          ".dimmed(),
+        "UUID            ".dimmed(),
         t.uuid.as_deref().unwrap_or("-")
     );
 
@@ -182,7 +183,7 @@ fn print_track(db: &MasterDb, t: &Track) -> Result<()> {
             println!("  {} {rel}", "AnalysisDataPath".dimmed());
             println!(
                 "  {} {} {exists_marker}",
-                "  -> resolved ".dimmed(),
+                "  -> resolved   ".dimmed(),
                 abs.display()
             );
         }
@@ -192,7 +193,7 @@ fn print_track(db: &MasterDb, t: &Track) -> Result<()> {
     let cues = fetch_cues(db, &t.id)?;
     println!(
         "  {} {}",
-        "Cues          ".dimmed(),
+        "Cues            ".dimmed(),
         format!("({})", cues.len()).bold()
     );
     for c in &cues {
@@ -229,14 +230,14 @@ fn print_track(db: &MasterDb, t: &Track) -> Result<()> {
     if let Some(mp) = fetch_mixer_param(db, &t.id)? {
         println!(
             "  {} GainHigh={} GainLow={} PeakHigh={} PeakLow={}",
-            "MixerParam    ".dimmed(),
+            "MixerParam      ".dimmed(),
             mp.gain_high.map(|v| v.to_string()).unwrap_or("-".into()),
             mp.gain_low.map(|v| v.to_string()).unwrap_or("-".into()),
             mp.peak_high.map(|v| v.to_string()).unwrap_or("-".into()),
             mp.peak_low.map(|v| v.to_string()).unwrap_or("-".into()),
         );
     } else {
-        println!("  {} -", "MixerParam    ".dimmed());
+        println!("  {} -", "MixerParam      ".dimmed());
     }
 
     let censor_count: i64 = db.conn.query_row(
@@ -244,7 +245,7 @@ fn print_track(db: &MasterDb, t: &Track) -> Result<()> {
         params![t.id],
         |r| r.get(0),
     )?;
-    println!("  {} {censor_count}", "ActiveCensors ".dimmed());
+    println!("  {} {censor_count}", "ActiveCensors   ".dimmed());
 
     Ok(())
 }
@@ -285,66 +286,4 @@ fn fetch_mixer_param(db: &MasterDb, content_id: &str) -> Result<Option<MixerPara
         })
     })?;
     Ok(rows.next().transpose()?)
-}
-
-fn file_type_name(ft: Option<i64>) -> &'static str {
-    // Mapping observed in master.db dumps; see also pyrekordbox tables.py.
-    match ft {
-        Some(0) => "MP3",
-        Some(1) => "M4A",
-        Some(4) => "WAV",
-        Some(5) => "FLAC",
-        Some(11) => "AIFF",
-        Some(19) => "streaming",
-        Some(_) => "unknown",
-        None => "-",
-    }
-}
-
-fn format_bpm(bpm: Option<i64>) -> String {
-    // BPM is stored as integer * 100 (e.g. 12800 = 128.00).
-    match bpm {
-        Some(v) => format!("{:.2}", v as f64 / 100.0),
-        None => "-".into(),
-    }
-}
-
-fn format_length(secs: Option<i64>) -> String {
-    match secs {
-        Some(s) => format!("{}:{:02} ({s}s)", s / 60, s % 60),
-        None => "-".into(),
-    }
-}
-
-fn format_msec(ms: i64) -> String {
-    let total_secs = ms / 1000;
-    let frac = ms % 1000;
-    format!("{}:{:02}.{:03}", total_secs / 60, total_secs % 60, frac)
-}
-
-fn kind_label(kind: Option<i64>) -> &'static str {
-    // djmdCue.Kind: 0 = memory cue; 1..=16 = hot cue slots A..P.
-    match kind {
-        Some(0) => "memory",
-        Some(k) if (1..=16).contains(&k) => match k {
-            1 => "hot A",
-            2 => "hot B",
-            3 => "hot C",
-            4 => "hot D",
-            5 => "hot E",
-            6 => "hot F",
-            7 => "hot G",
-            8 => "hot H",
-            9 => "hot I",
-            10 => "hot J",
-            11 => "hot K",
-            12 => "hot L",
-            13 => "hot M",
-            14 => "hot N",
-            15 => "hot O",
-            16 => "hot P",
-            _ => unreachable!(),
-        },
-        _ => "?",
-    }
 }

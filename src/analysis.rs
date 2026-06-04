@@ -8,6 +8,21 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::db::{MasterDb, now_db_string};
+use crate::format::{file_type_name, format_bpm, format_length};
+
+fn format_header_line(h: &TrackHeader) -> String {
+    let title = h.title.as_deref().unwrap_or("?");
+    let artist = h.artist.as_deref().unwrap_or("?");
+    let ft = file_type_name(h.file_type);
+    let len = format_length(h.length);
+    let bpm = format_bpm(h.bpm);
+    let cues = h.cue_count;
+    let lock = match h.analysed {
+        Some(a) if a & 0x80 != 0 => "🔒",
+        _ => "  ",
+    };
+    format!("\"{title}\" — {artist}   {ft}   {len}   {bpm} BPM   {cues} cues   {lock}")
+}
 
 const ANLZ_EXTENSIONS: &[&str] = &["DAT", "EXT", "2EX", "3EX"];
 
@@ -51,6 +66,8 @@ pub struct TrackHeader {
     pub length: Option<i64>,
     pub analysed: Option<i64>,
     pub analysis_data_path: Option<String>,
+    pub file_type: Option<i64>,
+    pub cue_count: i64,
 }
 
 pub struct FileCopy {
@@ -66,8 +83,8 @@ struct TrackSnapshot {
 }
 
 struct NewCue {
-    id: String,                       // 10-digit uint32 string, fresh
-    uuid: String,                     // v4
+    id: String,   // 10-digit uint32 string, fresh
+    uuid: String, // v4
     in_msec: Option<i64>,
     in_frame: Option<i64>,
     in_mpeg_frame: Option<i64>,
@@ -121,23 +138,21 @@ struct NewContentActiveCensor {
 // Plan-building
 // ----------------------------------------------------------------------------
 
-pub fn build_plan(
-    db: &MasterDb,
-    src_id: &str,
-    dst_id: &str,
-    opts: &CopyOpts,
-) -> Result<Plan> {
+pub fn build_plan(db: &MasterDb, src_id: &str, dst_id: &str, opts: &CopyOpts) -> Result<Plan> {
     if src_id == dst_id {
         bail!("source and destination are the same track ({src_id})");
     }
 
-    let src = load_snapshot(db, src_id)
-        .map_err(|e| anyhow!("source {src_id}: {e}"))?;
-    let dst = load_snapshot(db, dst_id)
-        .map_err(|e| anyhow!("destination {dst_id}: {e}"))?;
+    let src = load_snapshot(db, src_id).map_err(|e| anyhow!("source {src_id}: {e}"))?;
+    let dst = load_snapshot(db, dst_id).map_err(|e| anyhow!("destination {dst_id}: {e}"))?;
 
-    let src_has_analysis_path =
-        src.header.analysis_data_path.as_deref().unwrap_or("").is_empty() == false;
+    let src_has_analysis_path = src
+        .header
+        .analysis_data_path
+        .as_deref()
+        .unwrap_or("")
+        .is_empty()
+        == false;
     if src.cue_count == 0 && !src_has_analysis_path {
         bail!(
             "source {src_id} ({}) has no analysis to copy",
@@ -231,7 +246,11 @@ pub fn build_plan(
         Some(NewContentActiveCensor {
             id: dst.header.uuid.clone(),
             uuid: Uuid::new_v4().to_string(),
-            active_censors_json: build_active_censor_json(&new_censors, &dst.header.id, &dst.header.uuid),
+            active_censors_json: build_active_censor_json(
+                &new_censors,
+                &dst.header.id,
+                &dst.header.uuid,
+            ),
         })
     } else {
         None
@@ -260,11 +279,17 @@ pub fn build_plan(
 }
 
 fn load_snapshot(db: &MasterDb, id: &str) -> Result<TrackSnapshot> {
+    let cue_count: i64 = db.conn.query_row(
+        "SELECT COUNT(*) FROM djmdCue WHERE ContentID = ?1 AND (rb_local_deleted = 0 OR rb_local_deleted IS NULL)",
+        params![id],
+        |r| r.get(0),
+    )?;
+
     let header: TrackHeader = db
         .conn
         .query_row(
             "SELECT c.ID, c.UUID, c.Title, c.BPM, c.Length, c.Analysed,
-                    c.AnalysisDataPath, a.Name AS Artist
+                    c.AnalysisDataPath, c.FileType, a.Name AS Artist
              FROM djmdContent c
              LEFT JOIN djmdArtist a ON a.ID = c.ArtistID
              WHERE c.ID = ?1",
@@ -279,6 +304,8 @@ fn load_snapshot(db: &MasterDb, id: &str) -> Result<TrackSnapshot> {
                     length: r.get("Length")?,
                     analysed: r.get("Analysed")?,
                     analysis_data_path: r.get("AnalysisDataPath")?,
+                    file_type: r.get("FileType")?,
+                    cue_count,
                 })
             },
         )
@@ -289,12 +316,6 @@ fn load_snapshot(db: &MasterDb, id: &str) -> Result<TrackSnapshot> {
 
     let key_id: Option<String> = db.conn.query_row(
         "SELECT KeyID FROM djmdContent WHERE ID = ?1",
-        params![id],
-        |r| r.get(0),
-    )?;
-
-    let cue_count: i64 = db.conn.query_row(
-        "SELECT COUNT(*) FROM djmdCue WHERE ContentID = ?1 AND (rb_local_deleted = 0 OR rb_local_deleted IS NULL)",
         params![id],
         |r| r.get(0),
     )?;
@@ -313,11 +334,7 @@ fn load_snapshot(db: &MasterDb, id: &str) -> Result<TrackSnapshot> {
     })
 }
 
-fn load_new_cues_from_src(
-    db: &MasterDb,
-    src_id: &str,
-    _dst_uuid: &str,
-) -> Result<Vec<NewCue>> {
+fn load_new_cues_from_src(db: &MasterDb, src_id: &str, _dst_uuid: &str) -> Result<Vec<NewCue>> {
     let mut stmt = db.conn.prepare(
         "SELECT InMsec, InFrame, InMpegFrame, InMpegAbs,
                 OutMsec, OutFrame, OutMpegFrame, OutMpegAbs,
@@ -378,10 +395,7 @@ fn load_new_censors_from_src(
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-fn load_new_mixer_param_from_src(
-    db: &MasterDb,
-    src_id: &str,
-) -> Result<Option<NewMixerParam>> {
+fn load_new_mixer_param_from_src(db: &MasterDb, src_id: &str) -> Result<Option<NewMixerParam>> {
     let mut stmt = db.conn.prepare(
         "SELECT GainHigh, GainLow, PeakHigh, PeakLow
          FROM djmdMixerParam
@@ -467,11 +481,7 @@ pub fn apply_plan(db: &mut MasterDb, plan: &Plan) -> Result<()> {
 
     // Take a backup of master.db before any mutation.
     let backup_path = db.backup()?;
-    eprintln!(
-        "{} {}",
-        "Backed up to:".dimmed(),
-        backup_path.display()
-    );
+    eprintln!("{} {}", "Backed up to:".dimmed(), backup_path.display());
 
     let tx = db.conn.transaction()?;
 
@@ -690,13 +700,8 @@ pub fn apply_plan(db: &mut MasterDb, plan: &Plan) -> Result<()> {
         if let Some(parent) = fc.dst.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::copy(&fc.src, &fc.dst).map_err(|e| {
-            anyhow!(
-                "copy {} -> {}: {e}",
-                fc.src.display(),
-                fc.dst.display()
-            )
-        })?;
+        fs::copy(&fc.src, &fc.dst)
+            .map_err(|e| anyhow!("copy {} -> {}: {e}", fc.src.display(), fc.dst.display()))?;
     }
 
     Ok(())
@@ -746,19 +751,22 @@ impl Plan {
         let mut s = String::new();
         let _ = writeln!(
             s,
-            "{} {} → {} {}",
+            "{} {} → {}",
             "copy".cyan().bold(),
             self.src.id.bold(),
             self.dst.id.bold(),
-            format!(
-                "  ({} → {})",
-                self.src.title.as_deref().unwrap_or("?"),
-                self.dst.title.as_deref().unwrap_or("?")
-            )
-            .dimmed(),
         );
-        let _ = writeln!(s, "  {}", format!("opts: replace={} lock={}",
-            self.opts.replace, self.opts.lock).dimmed());
+        let _ = writeln!(s, "  {} {}", "src".dimmed(), format_header_line(&self.src));
+        let _ = writeln!(s, "  {} {}", "dst".dimmed(), format_header_line(&self.dst));
+        let _ = writeln!(
+            s,
+            "  {}",
+            format!(
+                "opts: replace={} lock={}",
+                self.opts.replace, self.opts.lock
+            )
+            .dimmed()
+        );
 
         if !self.warnings.is_empty() {
             for w in &self.warnings {
@@ -768,12 +776,7 @@ impl Plan {
 
         let _ = writeln!(s, "  {}", "files:".dimmed());
         for fc in &self.file_copies {
-            let _ = writeln!(
-                s,
-                "    {} → {}",
-                fc.src.display(),
-                fc.dst.display()
-            );
+            let _ = writeln!(s, "    {} → {}", fc.src.display(), fc.dst.display());
         }
         if self.file_copies.is_empty() {
             let _ = writeln!(s, "    (none)");
@@ -781,16 +784,19 @@ impl Plan {
 
         let _ = writeln!(s, "  {}", "djmdContent updates:".dimmed());
         if let Some(v) = self.set_bpm {
-            let _ = writeln!(s, "    BPM             = {:.2}", v as f64 / 100.0);
+            let _ = writeln!(s, "    BPM              = {:.2}", v as f64 / 100.0);
         }
         if let Some(v) = &self.set_key_id {
-            let _ = writeln!(s, "    KeyID           = {v}");
+            let _ = writeln!(s, "    KeyID            = {v}");
         }
         if let Some(v) = self.set_length {
-            let _ = writeln!(s, "    Length          = {v}");
+            let _ = writeln!(s, "    Length           = {v}");
         }
-        let _ = writeln!(s, "    Analysed        = {} (0x{:02x})",
-            self.set_analysed, self.set_analysed);
+        let _ = writeln!(
+            s,
+            "    Analysed         = {} (0x{:02x})",
+            self.set_analysed, self.set_analysed
+        );
         let _ = writeln!(s, "    AnalysisDataPath = {}", self.new_analysis_data_path);
 
         let _ = writeln!(s, "  {}", "row writes:".dimmed());
@@ -798,10 +804,21 @@ impl Plan {
             let _ = writeln!(s, "    DELETE djmdCue / contentCue for dst");
         }
         if self.delete_existing_censors {
-            let _ = writeln!(s, "    DELETE djmdActiveCensor / contentActiveCensor for dst");
+            let _ = writeln!(
+                s,
+                "    DELETE djmdActiveCensor / contentActiveCensor for dst"
+            );
         }
-        let _ = writeln!(s, "    INSERT djmdCue              x{}", self.new_cues.len());
-        let _ = writeln!(s, "    INSERT djmdActiveCensor     x{}", self.new_censors.len());
+        let _ = writeln!(
+            s,
+            "    INSERT djmdCue              x{}",
+            self.new_cues.len()
+        );
+        let _ = writeln!(
+            s,
+            "    INSERT djmdActiveCensor     x{}",
+            self.new_censors.len()
+        );
         let _ = writeln!(
             s,
             "    INSERT contentCue           x{}",
@@ -810,7 +827,11 @@ impl Plan {
         let _ = writeln!(
             s,
             "    INSERT contentActiveCensor  x{}",
-            if self.new_content_active_censor.is_some() { 1 } else { 0 }
+            if self.new_content_active_censor.is_some() {
+                1
+            } else {
+                0
+            }
         );
         let _ = writeln!(
             s,
@@ -940,10 +961,7 @@ fn load_candidates(
     let mut stmt = db.conn.prepare(sql)?;
     let rows = stmt.query_map(params, |r| {
         let title: Option<String> = r.get("Title")?;
-        let norm = title
-            .as_deref()
-            .map(normalize_title)
-            .unwrap_or_default();
+        let norm = title.as_deref().map(normalize_title).unwrap_or_default();
         Ok(Candidate {
             id: r.get("ID")?,
             title,
@@ -959,7 +977,7 @@ fn load_candidates(
         .collect())
 }
 
-fn artist_matches(a: Option<&str>, b: Option<&str>) -> bool {
+pub(crate) fn artist_matches(a: Option<&str>, b: Option<&str>) -> bool {
     match (a, b) {
         (Some(a), Some(b)) => {
             let a = a.to_lowercase();
@@ -1064,20 +1082,11 @@ mod tests {
     #[test]
     fn normalize_title_strips_parens_and_lowercases() {
         assert_eq!(normalize_title("Hello World"), "hello world");
-        assert_eq!(
-            normalize_title("Track (Extended Mix)"),
-            "track"
-        );
-        assert_eq!(
-            normalize_title("  Mix  (feat. X)  [Remix]  "),
-            "mix"
-        );
+        assert_eq!(normalize_title("Track (Extended Mix)"), "track");
+        assert_eq!(normalize_title("  Mix  (feat. X)  [Remix]  "), "mix");
         assert_eq!(normalize_title("UPPER CASE"), "upper case");
         assert_eq!(normalize_title(""), "");
-        assert_eq!(
-            normalize_title("Track (Part 1) (Part 2)"),
-            "track"
-        );
+        assert_eq!(normalize_title("Track (Part 1) (Part 2)"), "track");
         // Unicode case-folding.
         assert_eq!(normalize_title("СТРАНА"), "страна");
     }

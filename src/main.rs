@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 use rekord_ripper::analysis::{self, CopyOpts};
 use rekord_ripper::db::{self, MasterDb, SafetyOpts};
 use rekord_ripper::dump;
+use rekord_ripper::tui;
 
 #[derive(Parser)]
 #[command(name = "rekord-ripper", version, about = "Rekordbox analysis utility")]
@@ -54,6 +55,11 @@ enum Cmd {
         dry_run: bool,
     },
 
+    /// Interactive two-column TUI. Source on the left, destinations on the
+    /// right, with search bars, multi-select, fuzzy-match-from-source toggle,
+    /// and an auto-mode filter for unanalyzed destinations.
+    Tui,
+
     /// Batch-match unanalyzed (or unlocked) tracks to a similar analyzed source
     /// by normalized title + artist + duration, then copy. Default = dry-run;
     /// pass --apply to write.
@@ -87,6 +93,7 @@ fn main() -> Result<()> {
     };
     match cli.cmd {
         Cmd::Dump { query, limit } => dump::run(&db, query.as_deref(), limit)?,
+        Cmd::Tui => tui::run(db, safety)?,
         Cmd::Cp {
             src,
             dst,
