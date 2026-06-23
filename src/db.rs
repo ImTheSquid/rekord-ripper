@@ -1,7 +1,7 @@
 use std::env::var;
 use std::io::Read;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{Result, anyhow, bail};
 use flate2::read::ZlibDecoder;
@@ -165,8 +165,12 @@ fn backup_dir() -> Result<PathBuf> {
 pub fn rekordbox_running() -> bool {
     #[cfg(target_os = "macos")]
     {
+        // pgrep prints matching PIDs to stdout; with status() that inherits the
+        // terminal and leaks the PID into the TUI. We only need the exit status.
         Command::new("pgrep")
             .args(["-x", "rekordbox"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status()
             .map(|s| s.success())
             .unwrap_or(false)
