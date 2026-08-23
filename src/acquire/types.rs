@@ -135,6 +135,8 @@ pub enum AudioFormat {
     Alac,
     /// `None` when the bitrate is unknown rather than unspecified.
     Mp3(Option<u16>),
+    /// LAME V0 — variable bitrate, so it has no honest single number.
+    Mp3V0,
     Aac(Option<u16>),
     Ogg,
     Opus,
@@ -149,7 +151,7 @@ impl AudioFormat {
     /// `crate::format::file_type_name`. `None` means rekordbox cannot read it.
     pub fn rekordbox_file_type(self) -> Option<i64> {
         match self {
-            Self::Mp3(_) => Some(0),
+            Self::Mp3(_) | Self::Mp3V0 => Some(0),
             Self::Alac | Self::Aac(_) => Some(1),
             Self::Wav => Some(4),
             Self::Flac => Some(5),
@@ -169,7 +171,7 @@ impl AudioFormat {
             Self::Aiff => "aiff",
             Self::Wav => "wav",
             Self::Alac => "m4a",
-            Self::Mp3(_) => "mp3",
+            Self::Mp3(_) | Self::Mp3V0 => "mp3",
             Self::Aac(_) => "m4a",
             Self::Ogg => "ogg",
             Self::Opus => "opus",
@@ -182,6 +184,8 @@ impl AudioFormat {
         match self {
             Self::Flac | Self::Wav | Self::Aiff | Self::Alac => 1000,
             Self::Mp3(Some(k)) | Self::Aac(Some(k)) => k,
+            // V0 averages around 245kbps; used only for ordering, never shown.
+            Self::Mp3V0 => 245,
             Self::Mp3(None) | Self::Aac(None) => 1,
             Self::Ogg | Self::Opus => 0,
         }
@@ -199,6 +203,7 @@ impl std::fmt::Display for AudioFormat {
             Self::Opus => f.write_str("OPUS"),
             Self::Mp3(Some(k)) => write!(f, "MP3-{k}"),
             Self::Mp3(None) => f.write_str("MP3"),
+            Self::Mp3V0 => f.write_str("MP3-V0"),
             Self::Aac(Some(k)) => write!(f, "AAC-{k}"),
             Self::Aac(None) => f.write_str("AAC"),
         }
@@ -219,7 +224,7 @@ impl FromStr for AudioFormat {
             "alac" => Self::Alac,
             "mp3" => Self::Mp3(None),
             "mp3-320" => Self::Mp3(Some(320)),
-            "mp3-v0" => Self::Mp3(Some(245)), // V0 is ~245kbps VBR
+            "mp3-v0" => Self::Mp3V0,
             "mp3-128" => Self::Mp3(Some(128)),
             "aac" => Self::Aac(None),
             "aac-hi" => Self::Aac(Some(256)),
@@ -614,6 +619,9 @@ mod tests {
         assert_eq!("aiff-lossless".parse::<AudioFormat>().unwrap(), AudioFormat::Aiff);
         assert_eq!("mp3-320".parse::<AudioFormat>().unwrap(), AudioFormat::Mp3(Some(320)));
         assert_eq!("aac-hi".parse::<AudioFormat>().unwrap(), AudioFormat::Aac(Some(256)));
+        // V0 is variable-bitrate, so it must not render as a fixed number.
+        assert_eq!("mp3-v0".parse::<AudioFormat>().unwrap(), AudioFormat::Mp3V0);
+        assert_eq!(AudioFormat::Mp3V0.to_string(), "MP3-V0");
         assert_eq!("vorbis".parse::<AudioFormat>().unwrap(), AudioFormat::Ogg);
         // An unseen bitrate should degrade gracefully, not fail the parse.
         assert_eq!("mp3-192".parse::<AudioFormat>().unwrap(), AudioFormat::Mp3(Some(192)));
