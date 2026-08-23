@@ -3,6 +3,7 @@ pub mod analysis;
 pub mod config;
 pub mod db;
 pub mod dump;
+pub mod fingerprint;
 pub(crate) mod format;
 pub mod paths;
 pub(crate) mod proc;
