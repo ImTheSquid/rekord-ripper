@@ -6,5 +6,7 @@ pub mod dump;
 pub mod fingerprint;
 pub(crate) mod format;
 pub mod paths;
+pub mod pending;
 pub(crate) mod proc;
+pub mod transfer;
 pub mod tui;

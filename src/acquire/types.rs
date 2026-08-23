@@ -226,7 +226,9 @@ impl FromStr for AudioFormat {
             "mp3-320" => Self::Mp3(Some(320)),
             "mp3-v0" => Self::Mp3V0,
             "mp3-128" => Self::Mp3(Some(128)),
-            "aac" => Self::Aac(None),
+            // Container extensions, so a downloaded file's own extension parses
+            // rather than falling back to a guess and misreporting the format.
+            "aac" | "m4a" | "mp4" | "alac-m4a" => Self::Aac(None),
             "aac-hi" => Self::Aac(Some(256)),
             "vorbis" | "ogg" => Self::Ogg,
             "opus" => Self::Opus,
