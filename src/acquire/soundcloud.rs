@@ -279,6 +279,159 @@ impl super::AcquisitionBackend for SoundCloud {
     fn purchase(&self, _item: &ItemRef) -> Result<PurchaseFlow> {
         Ok(PurchaseFlow::NotRequired)
     }
+
+    fn fetch(&self, item: &ItemRef, opts: &FetchOpts) -> Result<Vec<AcquiredFile>> {
+        let target = fetch_target(item).ok_or_else(|| BackendError::NotFound {
+            backend: BackendId::SoundCloud,
+            item: item.key.clone(),
+        })?;
+
+        std::fs::create_dir_all(&opts.dest_dir)?;
+        // Download into its own directory so the finished file can be identified
+        // without guessing at yt-dlp's output template.
+        let staging = opts.dest_dir.join(format!(".rr-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&staging)?;
+        let staging = StagingDir(staging);
+
+        // yt-dlp names and sanitises the file, so it lands in rekordbox with a
+        // readable name instead of a bare track id.
+        let out_template = staging.0.join("%(uploader)s - %(title)s.%(ext)s");
+        let mut args: Vec<String> = vec![
+            "--no-playlist".into(),
+            "--no-progress".into(),
+            "--no-warnings".into(),
+            // Prefer an artist-enabled original over any transcode; that is the
+            // only case where a soundcloud rip beats what you already have.
+            "-f".into(),
+            "download/bestaudio/best".into(),
+            // Metadata on stdout after the download, so tagging the acquired file
+            // costs no extra request.
+            "--print-json".into(),
+            "-o".into(),
+            out_template.to_string_lossy().into_owned(),
+            target.clone(),
+        ];
+        // The deadline matters here too: a stalled download inside a scoped
+        // thread would otherwise hang the caller.
+        let remaining = opts
+            .deadline
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_secs(1));
+
+        let mut cmd = proc::capture(&self.yt_dlp);
+        cmd.args(args.drain(..)).args(&self.extra_args);
+        let out = proc::run_with_deadline(cmd, Instant::now() + remaining).map_err(|e| {
+            BackendError::ToolFailed {
+                tool: self.yt_dlp.clone(),
+                detail: e.to_string(),
+            }
+        })?;
+        if !out.status.success() {
+            return Err(classify_ytdlp_failure(&self.yt_dlp, &out.stderr));
+        }
+
+        let produced = newest_audio_file(&staging.0)?;
+        let format = produced
+            .extension()
+            .and_then(|e| e.to_str())
+            .and_then(|e| e.parse::<AudioFormat>().ok())
+            .unwrap_or(STREAM_FORMAT);
+
+        let bytes = std::fs::metadata(&produced)?.len();
+        if bytes == 0 {
+            return Err(BackendError::ToolFailed {
+                tool: self.yt_dlp.clone(),
+                detail: "produced an empty file".into(),
+            });
+        }
+
+        let (artist, title) = parse_download_metadata(&String::from_utf8_lossy(&out.stdout));
+        let final_path = super::fs::place(&produced, &opts.dest_dir, opts.overwrite)?;
+        Ok(vec![AcquiredFile {
+            path: final_path,
+            format,
+            bytes,
+            retention: opts.retention,
+            source: item.clone(),
+            source_url: target,
+            artist,
+            title,
+            album: None,
+            track_number: None,
+        }])
+    }
+}
+
+/// A staging directory removed when the fetch finishes or fails.
+struct StagingDir(std::path::PathBuf);
+
+impl Drop for StagingDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Artist and title from the info JSON yt-dlp prints after a download.
+///
+/// Best-effort: missing metadata leaves the acquired file untagged rather than
+/// failing a download that otherwise succeeded.
+fn parse_download_metadata(stdout: &str) -> (Option<String>, Option<String>) {
+    for line in stdout.lines().rev() {
+        let line = line.trim();
+        if !line.starts_with('{') {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            let artist = ["artist", "uploader", "creator"]
+                .iter()
+                .find_map(|k| v[*k].as_str())
+                .map(str::to_string);
+            // `track` is the bare title where soundcloud has it; `title` often
+            // carries an "Artist - Title" prefix instead.
+            let title = ["track", "title"]
+                .iter()
+                .find_map(|k| v[*k].as_str())
+                .map(str::to_string);
+            return (artist, title);
+        }
+    }
+    (None, None)
+}
+
+/// What to hand yt-dlp for an item ref.
+fn fetch_target(item: &ItemRef) -> Option<String> {
+    if let Some(url) = item.key.strip_prefix("url/") {
+        return Some(url.to_string());
+    }
+    track_id(&item.key).map(|id| api_url(&id))
+}
+
+/// The audio file yt-dlp just wrote.
+///
+/// Picks the newest, ignoring the `.part` and `.ytdl` files yt-dlp leaves while
+/// working, so an interrupted attempt is never mistaken for a finished download.
+fn newest_audio_file(dir: &std::path::Path) -> Result<std::path::PathBuf> {
+    let mut best: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if ext.is_empty() || matches!(ext.as_str(), "part" | "ytdl" | "temp" | "json") {
+            continue;
+        }
+        let modified = entry.metadata().and_then(|m| m.modified())?;
+        if best.as_ref().map(|(t, _)| modified > *t).unwrap_or(true) {
+            best = Some((modified, path));
+        }
+    }
+    best.map(|(_, p)| p).ok_or_else(|| BackendError::ToolFailed {
+        tool: "yt-dlp".into(),
+        detail: "finished without writing an audio file".into(),
+    })
 }
 
 #[cfg(test)]

@@ -134,6 +134,81 @@ enum Cmd {
         strict: bool,
     },
 
+    /// Pick an offer and open its purchase page in your browser.
+    ///
+    /// Payment happens in the browser — there is no API for Bandcamp checkout and
+    /// nothing here automates it. This gets you to the right page and tells you
+    /// what to run afterwards.
+    Buy {
+        /// Search terms.
+        query: Vec<String>,
+        /// Build the query from a track already in your library.
+        #[arg(long, value_name = "ID", conflicts_with = "query")]
+        track_id: Option<String>,
+        /// Buy this exact offer, skipping the search. The scriptable form.
+        #[arg(long, value_name = "REF")]
+        offer: Option<acquire::ItemRef>,
+        /// Auto-pick the top-ranked offer from this backend.
+        #[arg(long, value_name = "BACKEND")]
+        from: Option<acquire::BackendId>,
+        /// Auto-pick this printed row. NOT stable between runs — use --offer in
+        /// scripts.
+        #[arg(long, value_name = "N")]
+        pick: Option<usize>,
+        /// Print the purchase URL instead of launching a browser.
+        #[arg(long)]
+        print_url: bool,
+        /// Raw hits requested per backend.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Top offers per backend to price-probe.
+        #[arg(long, value_name = "N")]
+        enrich: Option<usize>,
+        /// Skip the confirmation prompt.
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+
+    /// Download a free track, or one you already own, and optionally queue its
+    /// analysis transfer.
+    Fetch {
+        /// A backend URL or an item ref.
+        target: Option<String>,
+        /// The offer to fetch, instead of a URL.
+        #[arg(long, value_name = "REF")]
+        offer: Option<acquire::ItemRef>,
+        /// Where to put it. Defaults to the configured download directory.
+        #[arg(long, value_name = "DIR")]
+        out: Option<PathBuf>,
+        /// Queue an analysis transfer from this track onto the downloaded file,
+        /// to run once rekordbox has imported it.
+        #[arg(long, value_name = "ID")]
+        src_track_id: Option<String>,
+        /// Override the configured format preference for this run.
+        #[arg(long, value_name = "LIST", value_delimiter = ',')]
+        format: Option<Vec<acquire::AudioFormat>>,
+        /// Overwrite an existing file of the same name.
+        #[arg(long)]
+        overwrite: bool,
+        /// Set the lock bit on the destination after the transfer.
+        #[arg(long)]
+        lock: bool,
+    },
+
+    /// Inspect and apply queued analysis transfers.
+    Pending {
+        /// Just list what is queued, without checking imports or fingerprinting.
+        #[arg(long, conflicts_with_all = ["apply", "clear"])]
+        list: bool,
+        /// Apply the transfers whose files have been imported and which pass the
+        /// fingerprint gate. Without this, prints proposals only.
+        #[arg(long)]
+        apply: bool,
+        /// Forget a queued transfer.
+        #[arg(long, value_name = "ID")]
+        clear: Option<i64>,
+    },
+
     /// Compare two audio files by fingerprint and print the raw numbers.
     ///
     /// This is the calibration tool. The accept thresholds shipped in config are
@@ -193,6 +268,74 @@ fn main() -> Result<()> {
         Cmd::Fp { a, b, secs } => {
             let cfg = Config::load(&config_path)?;
             run_fp(&a, &b, secs.unwrap_or(cfg.fingerprint.window_secs), &cfg)?
+        }
+        Cmd::Buy {
+            query,
+            track_id,
+            offer,
+            from,
+            pick,
+            print_url,
+            limit,
+            enrich,
+            yes,
+        } => {
+            let cfg = Config::load(&config_path)?;
+            let creds = Credentials::load(&paths::credentials_path()?)?;
+            acquire::cmd::buy(
+                db.as_ref(),
+                &cfg,
+                &creds,
+                acquire::cmd::BuyArgs {
+                    query: query.join(" "),
+                    track_id,
+                    selector: acquire::pick::Selector { offer, from, row: pick },
+                    print_url,
+                    limit,
+                    enrich,
+                    yes,
+                },
+            )?
+        }
+        Cmd::Fetch {
+            target,
+            offer,
+            out,
+            src_track_id,
+            format,
+            overwrite,
+            lock,
+        } => {
+            let cfg = Config::load(&config_path)?;
+            let creds = Credentials::load(&paths::credentials_path()?)?;
+            acquire::cmd::fetch(
+                db.as_ref(),
+                &cfg,
+                &creds,
+                acquire::cmd::FetchArgs {
+                    target,
+                    offer,
+                    out,
+                    src_track_id,
+                    format_pref: format,
+                    overwrite,
+                    lock,
+                },
+            )?
+        }
+        Cmd::Pending { list, apply, clear } => {
+            let cfg = Config::load(&config_path)?;
+            let action = match (clear, list) {
+                (Some(id), _) => acquire::cmd::PendingAction::Clear { id },
+                (None, true) => acquire::cmd::PendingAction::List,
+                (None, false) => acquire::cmd::PendingAction::Apply { dry_run: !apply },
+            };
+            acquire::cmd::pending(
+                db.as_mut().expect("pending needs the db"),
+                &cfg,
+                safety,
+                action,
+            )?
         }
         Cmd::Shop {
             query,
@@ -323,8 +466,14 @@ fn needs_database(cmd: &Cmd) -> bool {
     match cmd {
         Cmd::Backends | Cmd::Config { .. } | Cmd::Fp { .. } => false,
         // Only needed to seed the query from an existing track.
-        Cmd::Shop { track_id, .. } => track_id.is_some(),
-        Cmd::Dump { .. } | Cmd::Tui | Cmd::Cp { .. } | Cmd::Auto { .. } => true,
+        Cmd::Shop { track_id, .. } | Cmd::Buy { track_id, .. } => track_id.is_some(),
+        // Only needed to queue a transfer against an existing track.
+        Cmd::Fetch { src_track_id, .. } => src_track_id.is_some(),
+        Cmd::Dump { .. }
+        | Cmd::Tui
+        | Cmd::Cp { .. }
+        | Cmd::Auto { .. }
+        | Cmd::Pending { .. } => true,
     }
 }
 

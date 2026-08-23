@@ -29,6 +29,7 @@ use crate::config::{CredentialSource, Credentials, Secret};
 
 const SEARCH_URL: &str = "https://bandcamp.com/api/bcsearch_public_api/1/autocomplete_elastic";
 const COLLECTION_SUMMARY_URL: &str = "https://bandcamp.com/api/fan/2/collection_summary";
+const COLLECTION_ITEMS_URL: &str = "https://bandcamp.com/api/fancollection/1/collection_items";
 
 /// `current.download_pref` constants, named in the page blob as `FREE`/`PAID`.
 const DOWNLOAD_PREF_FREE: i64 = 1;
@@ -114,6 +115,169 @@ fn parse_collection_summary(body: &str) -> Result<std::collections::HashSet<Stri
     Ok(map.keys().cloned().collect())
 }
 
+/// One page of `/api/fancollection/1/collection_items`.
+#[derive(Debug, Default)]
+pub struct CollectionPage {
+    /// `(kind, tralbum_id, sale_item_key)` per item.
+    items: Vec<(ItemKind, i64, String)>,
+    /// `sale_item_key` → redownload URL.
+    redownload_urls: std::collections::HashMap<String, String>,
+    pub more_available: bool,
+    pub last_token: Option<String>,
+}
+
+impl CollectionPage {
+    /// The redownload URL for a tralbum, joining `items` to `redownload_urls`.
+    pub fn redownload_for(&self, kind: ItemKind, id: i64) -> Option<String> {
+        self.items
+            .iter()
+            .find(|(k, i, _)| *k == kind && *i == id)
+            .and_then(|(_, _, sale_key)| self.redownload_urls.get(sale_key))
+            .cloned()
+    }
+}
+
+/// Parse the collection-items response. Shape confirmed against the live API.
+pub fn parse_collection_items(body: &str) -> Result<CollectionPage> {
+    let v: serde_json::Value = serde_json::from_str(body).map_err(|e| {
+        BackendError::parse(BackendId::Bandcamp, "collection_items", e.to_string())
+    })?;
+    if v["error"].as_bool().unwrap_or(false) {
+        return Err(BackendError::AuthExpired {
+            backend: BackendId::Bandcamp,
+            detail: v["error_message"]
+                .as_str()
+                .unwrap_or("unknown error")
+                .to_string(),
+            reauth: Some("https://bandcamp.com/login".into()),
+        });
+    }
+
+    let mut page = CollectionPage {
+        more_available: v["more_available"].as_bool().unwrap_or(false),
+        last_token: v["last_token"].as_str().map(str::to_string),
+        ..Default::default()
+    };
+
+    for item in v["items"].as_array().unwrap_or(&Vec::new()) {
+        let kind = match item["tralbum_type"].as_str() {
+            Some("t") => ItemKind::Track,
+            Some("a") => ItemKind::Album,
+            _ => continue,
+        };
+        let Some(id) = item["tralbum_id"].as_i64() else {
+            continue;
+        };
+        // Bandcamp keys redownload_urls by sale-item, not tralbum, so the join
+        // key is built from the sale item's own type and id.
+        let Some(sale_id) = item["sale_item_id"].as_i64() else {
+            continue;
+        };
+        let sale_type = item["sale_item_type"].as_str().unwrap_or("p");
+        page.items
+            .push((kind, id, format!("{sale_type}{sale_id}")));
+    }
+
+    if let Some(map) = v["redownload_urls"].as_object() {
+        for (k, val) in map {
+            if let Some(url) = val.as_str() {
+                page.redownload_urls.insert(k.clone(), url.to_string());
+            }
+        }
+    }
+    Ok(page)
+}
+
+/// `fan_id` from a collection summary.
+fn parse_fan_id(body: &str) -> Result<i64> {
+    let v: serde_json::Value = serde_json::from_str(body).map_err(|e| {
+        BackendError::parse(BackendId::Bandcamp, "collection_summary", e.to_string())
+    })?;
+    if v["error"].as_bool().unwrap_or(false) {
+        return Err(BackendError::AuthExpired {
+            backend: BackendId::Bandcamp,
+            detail: v["error_message"]
+                .as_str()
+                .unwrap_or("unknown error")
+                .to_string(),
+            reauth: Some("https://bandcamp.com/login".into()),
+        });
+    }
+    v["fan_id"]
+        .as_i64()
+        .or_else(|| v["collection_summary"]["fan_id"].as_i64())
+        .ok_or_else(|| {
+            BackendError::parse(BackendId::Bandcamp, "collection_summary", "no fan_id")
+        })
+}
+
+/// Per-format download links from a `redownload_url` page.
+///
+/// Chain: the page's `<div id="pagedata" data-blob="…">` →
+/// `download_items[0].downloads[<slug>]` → `{ url, size_mb }`.
+pub fn parse_download_page(
+    html: &str,
+) -> Result<std::collections::HashMap<AudioFormat, String>> {
+    let blob = blob::id_attr_json(html, "pagedata", "data-blob")
+        .or_else(|_| blob::attr_json(html, "data-blob"))
+        .map_err(|e| BackendError::parse(BackendId::Bandcamp, "download pagedata", e.to_string()))?;
+
+    let items = blob["download_items"].as_array().ok_or_else(|| {
+        BackendError::parse(
+            BackendId::Bandcamp,
+            "download pagedata",
+            "no download_items",
+        )
+    })?;
+    let first = items.first().ok_or_else(|| {
+        BackendError::parse(
+            BackendId::Bandcamp,
+            "download pagedata",
+            "download_items was empty",
+        )
+    })?;
+    let downloads = first["downloads"].as_object().ok_or_else(|| {
+        BackendError::parse(BackendId::Bandcamp, "download pagedata", "no downloads map")
+    })?;
+
+    let mut out = std::collections::HashMap::new();
+    for (slug, entry) in downloads {
+        // An unrecognised slug is skipped rather than failing the whole page —
+        // bandcamp adding a format must not break downloading the others.
+        let Ok(format) = slug.parse::<AudioFormat>() else {
+            continue;
+        };
+        if let Some(url) = entry["url"].as_str() {
+            out.insert(format, url.to_string());
+        }
+    }
+    if out.is_empty() {
+        return Err(BackendError::parse(
+            BackendId::Bandcamp,
+            "download pagedata",
+            "no usable download links",
+        ));
+    }
+    Ok(out)
+}
+
+/// Artist and title from a download page, for naming the file.
+fn item_artist(html: &str) -> Option<String> {
+    blob::id_attr_json(html, "pagedata", "data-blob")
+        .ok()?
+        .pointer("/download_items/0/artist")?
+        .as_str()
+        .map(str::to_string)
+}
+
+fn item_title(html: &str) -> Option<String> {
+    blob::id_attr_json(html, "pagedata", "data-blob")
+        .ok()?
+        .pointer("/download_items/0/title")?
+        .as_str()
+        .map(str::to_string)
+}
+
 /// Item keys are `<t|a>:<id>:<url>`.
 ///
 /// The URL is carried in the key rather than looked up because Bandcamp gives no
@@ -182,6 +346,58 @@ impl Bandcamp {
                 }
             }
         })
+    }
+
+    /// The `redownload_url` for an owned item, or `None` if it is not owned.
+    ///
+    /// Walks the collection in pages: the API returns `redownload_urls` keyed by
+    /// `"<p|t|a><sale_item_id>"`, alongside `items` that carry the tralbum id, so
+    /// the two have to be joined.
+    fn redownload_url(&self, secret: &Secret, kind: ItemKind, id: i64) -> Result<Option<String>> {
+        let agent = http::agent(self.budget);
+        let cookie = format!("identity={}", secret.expose());
+
+        let fan_id = {
+            let body = agent
+                .get(COLLECTION_SUMMARY_URL)
+                .header("Cookie", &cookie)
+                .call()
+                .map_err(|e| http::map_err(BackendId::Bandcamp, COLLECTION_SUMMARY_URL, e))?
+                .body_mut()
+                .read_to_string()
+                .map_err(|e| http::map_err(BackendId::Bandcamp, COLLECTION_SUMMARY_URL, e))?;
+            parse_fan_id(&body)?
+        };
+
+        // A newer-than token pages backwards through the collection; this start
+        // value is far enough in the future to begin at the most recent item.
+        let mut token = String::from("9999999999::a::");
+        for _ in 0..40 {
+            let body = http::with_retries(3, || {
+                agent
+                    .post(COLLECTION_ITEMS_URL)
+                    .header("Cookie", &cookie)
+                    .send_json(serde_json::json!({
+                        "fan_id": fan_id,
+                        "older_than_token": token,
+                        "count": 100,
+                    }))
+                    .map_err(|e| http::map_err(BackendId::Bandcamp, COLLECTION_ITEMS_URL, e))?
+                    .body_mut()
+                    .read_to_string()
+                    .map_err(|e| http::map_err(BackendId::Bandcamp, COLLECTION_ITEMS_URL, e))
+            })?;
+
+            let page = parse_collection_items(&body)?;
+            if let Some(url) = page.redownload_for(kind, id) {
+                return Ok(Some(url));
+            }
+            match (page.more_available, page.last_token) {
+                (true, Some(next)) if next != token => token = next,
+                _ => break,
+            }
+        }
+        Ok(None)
     }
 
     /// Read one item page and fold its facts into the offer.
@@ -491,6 +707,86 @@ impl super::AcquisitionBackend for Bandcamp {
         Ok(())
     }
 
+    fn fetch(&self, item: &ItemRef, opts: &FetchOpts) -> Result<Vec<AcquiredFile>> {
+        let Some((secret, _)) = &self.identity else {
+            return Err(BackendError::NoCredentials {
+                backend: BackendId::Bandcamp,
+                how_to_fix: "put your bandcamp `identity` cookie in credentials.toml".into(),
+            });
+        };
+        let (kind, id) = parse_item_key(&item.key)
+            .ok_or_else(|| self.err_parse("item ref", "not a bandcamp item key"))?;
+
+        // Only things you own can be downloaded, so say which it is rather than
+        // reporting a generic failure.
+        let redownload = self
+            .redownload_url(secret, kind, id)?
+            .ok_or_else(|| BackendError::NotOwned {
+                backend: BackendId::Bandcamp,
+                item: item.clone(),
+            })?;
+
+        let cookie = format!("identity={}", secret.expose());
+        let agent = http::download_agent(
+            opts.deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .max(Duration::from_secs(30)),
+        );
+
+        // The download page carries the per-format links, and is the
+        // authoritative format list — the search-time list is only bandcamp's
+        // standard menu.
+        let page = http::with_retries(4, || {
+            agent
+                .get(&redownload)
+                .header("Cookie", &cookie)
+                .call()
+                .map_err(|e| http::map_err(BackendId::Bandcamp, &redownload, e))?
+                .body_mut()
+                .read_to_string()
+                .map_err(|e| http::map_err(BackendId::Bandcamp, &redownload, e))
+        })?;
+
+        let available = parse_download_page(&page)?;
+        let chosen = opts
+            .format_pref
+            .iter()
+            .find(|f| available.contains_key(f))
+            .copied()
+            .ok_or_else(|| BackendError::NoAcceptableFormat {
+                available: available.keys().copied().collect(),
+                wanted: opts.format_pref.clone(),
+            })?;
+        let url = available[&chosen].clone();
+
+        let name = super::fs::track_filename(
+            Some(&item_artist(&page).unwrap_or_default()),
+            item_title(&page).as_deref(),
+            chosen.extension(),
+        );
+        let target = super::fs::unique_path(&opts.dest_dir.join(name));
+
+        let mut resp = agent
+            .get(&url)
+            .header("Cookie", &cookie)
+            .call()
+            .map_err(|e| http::map_err(BackendId::Bandcamp, &url, e))?;
+        let bytes = super::fs::write_atomically(&target, &mut resp.body_mut().as_reader())?;
+
+        Ok(vec![AcquiredFile {
+            path: target,
+            format: chosen,
+            bytes,
+            retention: opts.retention,
+            source: item.clone(),
+            source_url: url,
+            artist: item_artist(&page),
+            title: item_title(&page),
+            album: None,
+            track_number: None,
+        }])
+    }
+
     fn purchase(&self, item: &ItemRef) -> Result<PurchaseFlow> {
         // The buy page is the item page — Bandcamp's checkout lives there. There
         // is no automated purchase path and this tool will not pretend otherwise.
@@ -625,6 +921,156 @@ mod tests {
         let body = r#"{"error":true,"error_message":"must be logged in"}"#;
         let err = parse_collection_summary(body).unwrap_err();
         assert!(matches!(err, BackendError::AuthExpired { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn joins_collection_items_to_their_redownload_urls() {
+        // The join is the whole subtlety: redownload_urls is keyed by sale item,
+        // items carry the tralbum id, and the two are different numbers.
+        let body = r#"{"items":[
+            {"tralbum_type":"a","tralbum_id":856850876,"sale_item_id":111,"sale_item_type":"p"},
+            {"tralbum_type":"t","tralbum_id":42,"sale_item_id":222,"sale_item_type":"t"}],
+          "redownload_urls":{"p111":"https://bandcamp.com/download?id=1",
+                             "t222":"https://bandcamp.com/download?id=2"},
+          "more_available":false,"last_token":null}"#;
+        let page = parse_collection_items(body).unwrap();
+        assert_eq!(
+            page.redownload_for(ItemKind::Album, 856850876).as_deref(),
+            Some("https://bandcamp.com/download?id=1")
+        );
+        assert_eq!(
+            page.redownload_for(ItemKind::Track, 42).as_deref(),
+            Some("https://bandcamp.com/download?id=2")
+        );
+        // Same id, wrong kind must not match.
+        assert_eq!(page.redownload_for(ItemKind::Track, 856850876), None);
+        assert_eq!(page.redownload_for(ItemKind::Album, 999), None);
+    }
+
+    #[test]
+    fn paging_state_is_read_so_a_large_collection_can_be_walked() {
+        let body = r#"{"items":[],"redownload_urls":{},
+                       "more_available":true,"last_token":"1700000000::a::"}"#;
+        let page = parse_collection_items(body).unwrap();
+        assert!(page.more_available);
+        assert_eq!(page.last_token.as_deref(), Some("1700000000::a::"));
+    }
+
+    #[test]
+    fn an_empty_collection_page_is_valid() {
+        // Verified live: this is what the endpoint returns unauthenticated.
+        let body = r#"{"items":[],"more_available":false,"tracklists":{},
+                       "redownload_urls":{},"item_lookup":{},"last_token":null}"#;
+        let page = parse_collection_items(body).unwrap();
+        assert!(!page.more_available);
+        assert_eq!(page.redownload_for(ItemKind::Album, 1), None);
+    }
+
+    #[test]
+    fn a_logged_out_collection_page_is_an_auth_error() {
+        let err = parse_collection_items(r#"{"error":true,"error_message":"must be logged in"}"#)
+            .unwrap_err();
+        assert!(matches!(err, BackendError::AuthExpired { .. }));
+    }
+
+    #[test]
+    fn reads_the_fan_id_from_either_shape() {
+        assert_eq!(parse_fan_id(r#"{"fan_id":123}"#).unwrap(), 123);
+        assert_eq!(
+            parse_fan_id(r#"{"collection_summary":{"fan_id":456}}"#).unwrap(),
+            456
+        );
+        assert!(parse_fan_id(r#"{"something_else":1}"#).is_err());
+    }
+
+    const DOWNLOAD_PAGE: &str = r#"<html><div id="pagedata" data-blob="{
+        &quot;download_items&quot;:[{&quot;artist&quot;:&quot;Burial&quot;,
+        &quot;title&quot;:&quot;Untrue&quot;,
+        &quot;downloads&quot;:{
+          &quot;flac&quot;:{&quot;url&quot;:&quot;https://popplers.bcbits.com/flac&quot;,&quot;size_mb&quot;:&quot;280MB&quot;},
+          &quot;aiff-lossless&quot;:{&quot;url&quot;:&quot;https://popplers.bcbits.com/aiff&quot;},
+          &quot;mp3-320&quot;:{&quot;url&quot;:&quot;https://popplers.bcbits.com/mp3&quot;},
+          &quot;vorbis&quot;:{&quot;url&quot;:&quot;https://popplers.bcbits.com/ogg&quot;},
+          &quot;some-new-format&quot;:{&quot;url&quot;:&quot;https://popplers.bcbits.com/new&quot;}}}]}"></div></html>"#;
+
+    #[test]
+    fn parses_the_per_format_download_links() {
+        let links = parse_download_page(DOWNLOAD_PAGE).unwrap();
+        assert_eq!(
+            links[&AudioFormat::Flac],
+            "https://popplers.bcbits.com/flac"
+        );
+        assert_eq!(
+            links[&AudioFormat::Aiff],
+            "https://popplers.bcbits.com/aiff"
+        );
+        assert!(links.contains_key(&AudioFormat::Mp3(Some(320))));
+    }
+
+    #[test]
+    fn an_unknown_format_slug_does_not_break_the_other_links() {
+        // Bandcamp adding a format must not stop you downloading FLAC.
+        let links = parse_download_page(DOWNLOAD_PAGE).unwrap();
+        assert!(links.contains_key(&AudioFormat::Flac));
+        assert_eq!(links.len(), 4, "the unrecognised slug is skipped, not fatal");
+    }
+
+    #[test]
+    fn the_download_page_is_authoritative_and_can_report_ogg() {
+        // The search-time format list is bandcamp's standard menu; this page is
+        // the truth, including formats rekordbox cannot use.
+        let links = parse_download_page(DOWNLOAD_PAGE).unwrap();
+        assert!(links.contains_key(&AudioFormat::Ogg));
+        assert!(!AudioFormat::Ogg.usable_in_rekordbox());
+    }
+
+    #[test]
+    fn format_preference_picks_flac_over_mp3_from_a_real_page() {
+        let links = parse_download_page(DOWNLOAD_PAGE).unwrap();
+        let pref = vec![AudioFormat::Flac, AudioFormat::Aiff, AudioFormat::Mp3(Some(320))];
+        let chosen = pref.iter().find(|f| links.contains_key(f)).unwrap();
+        assert_eq!(*chosen, AudioFormat::Flac);
+    }
+
+    #[test]
+    fn a_page_with_no_usable_links_reports_a_shape_change() {
+        let html = r#"<div id="pagedata" data-blob="{&quot;download_items&quot;:[{&quot;downloads&quot;:{}}]}"></div>"#;
+        assert!(matches!(
+            parse_download_page(html).unwrap_err(),
+            BackendError::Parse { .. }
+        ));
+        let html2 = r#"<div id="pagedata" data-blob="{}"></div>"#;
+        assert!(parse_download_page(html2).is_err());
+        assert!(parse_download_page("<html>redesigned</html>").is_err());
+    }
+
+    #[test]
+    fn reads_artist_and_title_for_naming_the_file() {
+        assert_eq!(item_artist(DOWNLOAD_PAGE).as_deref(), Some("Burial"));
+        assert_eq!(item_title(DOWNLOAD_PAGE).as_deref(), Some("Untrue"));
+    }
+
+    #[test]
+    fn fetching_without_a_cookie_says_what_to_do_rather_than_failing_opaquely() {
+        use super::super::AcquisitionBackend;
+        let bc = Bandcamp::new(&Credentials::default(), Duration::from_secs(5));
+        if bc.identity.is_some() {
+            return; // developer has a real cookie configured
+        }
+        let err = bc
+            .fetch(
+                &ItemRef::new(BackendId::Bandcamp, "a:1:https://x/album/y"),
+                &FetchOpts {
+                    dest_dir: std::env::temp_dir(),
+                    format_pref: vec![AudioFormat::Flac],
+                    retention: Retention::Keep,
+                    overwrite: false,
+                    deadline: std::time::Instant::now() + Duration::from_secs(5),
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, BackendError::NoCredentials { .. }), "got {err:?}");
+        assert!(err.needs_user_action());
     }
 
     #[test]
