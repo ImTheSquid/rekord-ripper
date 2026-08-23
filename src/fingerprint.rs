@@ -288,6 +288,9 @@ pub enum RejectReason {
     },
     /// Too little audio to judge.
     TooShort { items: usize },
+    /// Rejected by the cheap pre-filter, before any audio was decoded. Distinct
+    /// from `Coverage` so the message names the actual cause.
+    DurationMismatch { a: i64, b: i64, tol: i64 },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -356,6 +359,11 @@ impl Verdict {
                 RejectReason::TooShort { items } => {
                     format!("only {items} fingerprint items — too little audio to judge")
                 }
+                RejectReason::DurationMismatch { a, b, tol } => format!(
+                    "lengths differ by {}s ({a}s vs {b}s, tolerance {tol}s) — \
+                     not the same cut, so no audio was compared",
+                    (a - b).abs()
+                ),
             },
         }
     }
@@ -930,6 +938,30 @@ mod tests {
                 }
             )
             .is_accept()
+        );
+    }
+
+    #[test]
+    fn a_duration_prefilter_rejection_names_the_lengths_not_coverage() {
+        // This fires before any audio is decoded, so blaming coverage would send
+        // the user looking for an edit difference that was never measured.
+        let v = Verdict::Reject {
+            reason: RejectReason::DurationMismatch {
+                a: 150,
+                b: 205,
+                tol: 2,
+            },
+            score: f64::NAN,
+            coverage: 0.0,
+            shift_ms: -55_000,
+        };
+        let s = v.summary();
+        assert!(s.contains("lengths differ by 55s"), "got: {s}");
+        assert!(s.contains("150s vs 205s"), "got: {s}");
+        assert!(s.contains("no audio was compared"), "got: {s}");
+        assert!(
+            !s.contains("longer mix"),
+            "must not reuse the coverage wording"
         );
     }
 

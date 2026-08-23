@@ -209,6 +209,41 @@ enum Cmd {
         clear: Option<i64>,
     },
 
+    /// Create rekordbox track rows for audio files, so you don't have to drag
+    /// them in by hand.
+    ///
+    /// This is the one command that adds tracks to your library, so it is
+    /// default-dry-run, needs `insert_content_rows = true` in config, and prints
+    /// every value it would write before asking. With --src-track-id it also
+    /// performs the fingerprint-gated analysis transfer in the same run.
+    Import {
+        /// Audio files to add.
+        files: Vec<PathBuf>,
+        /// Override the track title. Only valid with a single file.
+        #[arg(long)]
+        title: Option<String>,
+        /// Override the artist. Only valid with a single file.
+        #[arg(long)]
+        artist: Option<String>,
+        /// Copy this track's analysis onto the imported file, gated on a
+        /// fingerprint match. Only valid with a single file.
+        #[arg(long, value_name = "ID")]
+        src_track_id: Option<String>,
+        /// Set the lock bit on the imported track after the transfer.
+        #[arg(long)]
+        lock: bool,
+        /// Actually write to master.db. Without this, prints what it would do.
+        #[arg(long)]
+        apply: bool,
+        /// Skip the confirmation prompt.
+        #[arg(short = 'y', long)]
+        yes: bool,
+        /// Remove a row this tool inserted, by marking it deleted the way
+        /// rekordbox does so the removal syncs.
+        #[arg(long, value_name = "ID", conflicts_with_all = ["files", "src_track_id"])]
+        undo: Option<String>,
+    },
+
     /// Compare two audio files by fingerprint and print the raw numbers.
     ///
     /// This is the calibration tool. The accept thresholds shipped in config are
@@ -265,6 +300,33 @@ fn main() -> Result<()> {
             acquire::report::run(&cfg, &creds, &config_path)?
         }
         Cmd::Config { init, force } => run_config(&config_path, init, force)?,
+        Cmd::Import {
+            files,
+            title,
+            artist,
+            src_track_id,
+            lock,
+            apply,
+            yes,
+            undo,
+        } => {
+            let cfg = Config::load(&config_path)?;
+            run_import(
+                db.as_mut().expect("import needs the db"),
+                &cfg,
+                safety,
+                ImportArgs {
+                    files,
+                    title,
+                    artist,
+                    src_track_id,
+                    lock,
+                    apply,
+                    yes,
+                    undo,
+                },
+            )?
+        }
         Cmd::Fp { a, b, secs } => {
             let cfg = Config::load(&config_path)?;
             run_fp(&a, &b, secs.unwrap_or(cfg.fingerprint.window_secs), &cfg)?
@@ -409,6 +471,214 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+struct ImportArgs {
+    files: Vec<PathBuf>,
+    title: Option<String>,
+    artist: Option<String>,
+    src_track_id: Option<String>,
+    lock: bool,
+    apply: bool,
+    yes: bool,
+    undo: Option<String>,
+}
+
+fn run_import(
+    db: &mut MasterDb,
+    cfg: &Config,
+    safety: SafetyOpts,
+    args: ImportArgs,
+) -> Result<()> {
+    use owo_colors::OwoColorize;
+    use rekord_ripper::{audio, import};
+
+    if let Some(id) = &args.undo {
+        return undo_import(db, cfg, safety, id, args.apply, args.yes);
+    }
+    if args.files.is_empty() {
+        anyhow::bail!("give me at least one audio file to import");
+    }
+    let single = args.files.len() == 1;
+    if !single && (args.title.is_some() || args.artist.is_some() || args.src_track_id.is_some()) {
+        anyhow::bail!("--title, --artist and --src-track-id only make sense with one file");
+    }
+
+    // Gate 1: the config opt-in. Checked before anything is probed so a user who
+    // has not opted in gets told, not a wall of output.
+    if args.apply && !cfg.import.insert_content_rows {
+        anyhow::bail!(
+            "creating rekordbox rows is off. Set `insert_content_rows = true` under \
+             [import] in {} first — see `rekord-ripper config`.",
+            paths::config_path(None)?.display()
+        );
+    }
+
+    let mut planned = Vec::new();
+    for path in &args.files {
+        let info = audio::probe(path)?;
+        let new = import::plan_insert(
+            db,
+            path,
+            &info,
+            args.title.as_deref(),
+            args.artist.as_deref(),
+        )?;
+        println!("{}", import::render(&new));
+        println!(
+            "  {:<18} {}",
+            "AnalysisDataPath",
+            format!("{} (after the transfer)", import::anlz_path_for(&new)).dimmed()
+        );
+        println!();
+        planned.push(new);
+    }
+
+    if !args.apply {
+        eprintln!(
+            "{} plan for {} file(s). Dry-run; pass --apply to write.",
+            "ok:".green(),
+            planned.len()
+        );
+        return Ok(());
+    }
+
+    // Gate 2: an explicit yes, having seen the rows.
+    if !args.yes && !confirm_stdin(&format!("insert {} row(s) into master.db?", planned.len()))? {
+        println!("cancelled.");
+        return Ok(());
+    }
+
+    // Gate 3: the same refusal and backup discipline as cp and auto.
+    db::safety_preflight(safety)?;
+    let backup = db.backup()?;
+    eprintln!("backed up to: {}", backup.display());
+
+    for new in &planned {
+        let mut note = rekord_ripper::import::insert(db, new)?;
+        note.backup = Some(backup.to_string_lossy().into_owned());
+        let note_path = note.write_beside(&backup)?;
+        eprintln!(
+            "{} track {} — {}",
+            "inserted:".green(),
+            new.id,
+            new.title
+        );
+        eprintln!(
+            "  undo with: {}",
+            format!("rekord-ripper import --undo {} --apply", new.id).bold()
+        );
+        eprintln!("  {}", format!("note: {}", note_path.display()).dimmed());
+    }
+
+    // The payoff: the row exists now, so the transfer can run immediately
+    // instead of waiting for a manual drag.
+    if let (Some(src_id), Some(new)) = (&args.src_track_id, planned.first()) {
+        transfer_onto_import(db, cfg, safety, src_id, new, args.lock)?;
+    }
+    Ok(())
+}
+
+/// Fingerprint-gate and apply an analysis transfer onto a freshly imported row.
+fn transfer_onto_import(
+    db: &mut MasterDb,
+    cfg: &Config,
+    safety: SafetyOpts,
+    src_id: &str,
+    new: &rekord_ripper::import::NewContent,
+    lock: bool,
+) -> Result<()> {
+    use owo_colors::OwoColorize;
+    use rekord_ripper::transfer;
+
+    let src = analysis::load_track(db, src_id)?;
+    let dst_path = std::path::Path::new(&new.folder_path);
+
+    eprintln!();
+    eprintln!("checking the fingerprint before transferring …");
+    // BPM is NULL on a fresh row, so only duration evidence is available.
+    let outcome = transfer::gate(&src, dst_path, Some(new.length), None, cfg)?;
+    if !outcome.verdict.is_accept() {
+        eprintln!("{} {}", "fp REJECT".red(), outcome.verdict.summary());
+        eprintln!(
+            "the track was imported, but no analysis was copied. \
+             Transfer by hand with `cp` if you disagree."
+        );
+        // Non-zero: the import succeeded, the transfer did not.
+        std::process::exit(2);
+    }
+
+    let plan = analysis::build_plan(
+        db,
+        src_id,
+        &new.id,
+        &CopyOpts {
+            // A brand-new row has no cues, so there is nothing to replace.
+            replace: false,
+            lock,
+        },
+    )?;
+    println!("{}", transfer::report(&plan, &outcome.verdict));
+
+    db::safety_preflight(safety)?;
+    let backup = analysis::apply_plan(db, &plan)?;
+    eprintln!("backed up to: {}", backup.display());
+    eprintln!("applied: {} → {}", plan.src.id, plan.dst.id);
+    Ok(())
+}
+
+fn undo_import(
+    db: &mut MasterDb,
+    _cfg: &Config,
+    safety: SafetyOpts,
+    id: &str,
+    apply: bool,
+    yes: bool,
+) -> Result<()> {
+    use owo_colors::OwoColorize;
+
+    let track = analysis::load_track(db, id)?;
+    println!(
+        "would mark track {id} deleted: {} — {}",
+        track.artist.as_deref().unwrap_or("?"),
+        track.title.as_deref().unwrap_or("?")
+    );
+    println!(
+        "  {}",
+        "sets rb_local_deleted = 1 with a fresh USN, so the removal syncs to your \
+         other devices rather than leaving them a row for a file they lack."
+            .dimmed()
+    );
+    if !apply {
+        eprintln!("dry-run; pass --apply to write.");
+        return Ok(());
+    }
+    if !yes && !confirm_stdin(&format!("mark track {id} deleted?"))? {
+        println!("cancelled.");
+        return Ok(());
+    }
+
+    db::safety_preflight(safety)?;
+    let backup = db.backup()?;
+    eprintln!("backed up to: {}", backup.display());
+    rekord_ripper::import::tombstone(db, id, Some(&track.uuid))?;
+    eprintln!("{} track {id} marked deleted.", "ok:".green());
+    Ok(())
+}
+
+fn confirm_stdin(question: &str) -> Result<bool> {
+    use std::io::{BufRead, Write};
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        anyhow::bail!("not a terminal — pass --yes to confirm non-interactively");
+    }
+    print!("{question} [y/N] ");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)?;
+    Ok(matches!(
+        line.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
 fn run_fp(a: &std::path::Path, b: &std::path::Path, secs: u32, cfg: &Config) -> Result<()> {
     use rekord_ripper::fingerprint as fp;
 
@@ -473,7 +743,8 @@ fn needs_database(cmd: &Cmd) -> bool {
         | Cmd::Tui
         | Cmd::Cp { .. }
         | Cmd::Auto { .. }
-        | Cmd::Pending { .. } => true,
+        | Cmd::Pending { .. }
+        | Cmd::Import { .. } => true,
     }
 }
 
