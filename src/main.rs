@@ -134,6 +134,23 @@ enum Cmd {
         strict: bool,
     },
 
+    /// Compare two audio files by fingerprint and print the raw numbers.
+    ///
+    /// This is the calibration tool. The accept thresholds shipped in config are
+    /// uncalibrated guesses chosen to fail closed; run this over pairs you know
+    /// are the same track and pairs you know are not, then set the thresholds
+    /// from the gap between them.
+    Fp {
+        /// First audio file.
+        a: PathBuf,
+        /// Second audio file.
+        b: PathBuf,
+        /// Seconds of audio to fingerprint from the start of each file. Both
+        /// sides always use the same window.
+        #[arg(long, value_name = "N")]
+        secs: Option<u32>,
+    },
+
     /// Report which acquisition backends are enabled, whether their credentials
     /// are configured, and whether the external tools they need are installed.
     ///
@@ -173,6 +190,10 @@ fn main() -> Result<()> {
             acquire::report::run(&cfg, &creds, &config_path)?
         }
         Cmd::Config { init, force } => run_config(&config_path, init, force)?,
+        Cmd::Fp { a, b, secs } => {
+            let cfg = Config::load(&config_path)?;
+            run_fp(&a, &b, secs.unwrap_or(cfg.fingerprint.window_secs), &cfg)?
+        }
         Cmd::Shop {
             query,
             track_id,
@@ -245,10 +266,62 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn run_fp(a: &std::path::Path, b: &std::path::Path, secs: u32, cfg: &Config) -> Result<()> {
+    use rekord_ripper::fingerprint as fp;
+
+    let t = fp::Thresholds {
+        score_max: cfg.fingerprint.score_max,
+        coverage_min: cfg.fingerprint.coverage_min,
+        shift_items_max: cfg.fingerprint.shift_items_max,
+        speed_ratio_tol: cfg.fingerprint.speed_ratio_tol,
+    };
+
+    eprintln!("fingerprinting {} ...", a.display());
+    let fa = fp::fingerprint_file(a, secs)?;
+    eprintln!("fingerprinting {} ...", b.display());
+    let fb = fp::fingerprint_file(b, secs)?;
+
+    // ffprobe durations are the cheap, independent speed check — much finer than
+    // the whole-second Length rekordbox stores.
+    let durations = match (fp::probe_duration_secs(a), fp::probe_duration_secs(b)) {
+        (Ok(x), Ok(y)) => {
+            println!("ffprobe    A {x:.3}s   B {y:.3}s   ratio {:.5}", x / y);
+            Some((x, y))
+        }
+        _ => {
+            eprintln!("warning: ffprobe gave no duration; the speed check is skipped");
+            None
+        }
+    };
+
+    print!("{}", fp::debug_report(&fa, &fb)?);
+
+    let speed = fp::SpeedEvidence {
+        durations,
+        bpms: None,
+    };
+    let verdict = fp::compare(&fa, &fb, speed, &t)?;
+    println!();
+    println!(
+        "thresholds score_max {:.2}  coverage_min {:.2}  shift_items_max {}  speed_tol {:.4}",
+        t.score_max, t.coverage_min, t.shift_items_max, t.speed_ratio_tol
+    );
+    println!(
+        "VERDICT    {}  {}",
+        if verdict.is_accept() { "ACCEPT" } else { "REJECT" },
+        verdict.summary()
+    );
+    if !verdict.is_accept() {
+        // Non-zero so a calibration script can tell the outcomes apart.
+        std::process::exit(2);
+    }
+    Ok(())
+}
+
 /// True when this command reads `master.db`.
 fn needs_database(cmd: &Cmd) -> bool {
     match cmd {
-        Cmd::Backends | Cmd::Config { .. } => false,
+        Cmd::Backends | Cmd::Config { .. } | Cmd::Fp { .. } => false,
         // Only needed to seed the query from an existing track.
         Cmd::Shop { track_id, .. } => track_id.is_some(),
         Cmd::Dump { .. } | Cmd::Tui | Cmd::Cp { .. } | Cmd::Auto { .. } => true,
