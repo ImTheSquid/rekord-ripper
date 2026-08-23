@@ -216,11 +216,13 @@ mod tests {
     #[test]
     fn an_empty_selector_is_recognised_as_needing_a_prompt() {
         assert!(Selector::default().is_empty());
-        assert!(!Selector {
-            row: Some(1),
-            ..Default::default()
-        }
-        .is_empty());
+        assert!(
+            !Selector {
+                row: Some(1),
+                ..Default::default()
+            }
+            .is_empty()
+        );
     }
 
     #[test]

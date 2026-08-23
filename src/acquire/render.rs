@@ -33,7 +33,11 @@ pub fn price_cell(o: &Offer) -> String {
         Pricing::NameYourPrice { minimum: None } => "name your price".into(),
         Pricing::NameYourPrice { minimum: Some(p) } => format!("{p}+"),
         Pricing::Flat(p) => p.to_string(),
-        Pricing::PerFormat(offers) => match offers.iter().filter_map(|f| f.price.as_ref()).min_by_key(|p| p.amount_minor) {
+        Pricing::PerFormat(offers) => match offers
+            .iter()
+            .filter_map(|f| f.price.as_ref())
+            .min_by_key(|p| p.amount_minor)
+        {
             Some(p) => format!("from {p}"),
             None => "?".into(),
         },
@@ -133,19 +137,21 @@ fn backend_footer(out: &SearchOutcome) -> String {
     for r in &out.per_backend {
         match &r.error {
             Some(e) if e.is_silently_skippable() => {}
-            Some(e) => s.push_str(&format!(
-                "{} {}: {}\n",
-                "degraded:".yellow(),
-                r.backend,
-                e
-            )),
+            Some(e) => s.push_str(&format!("{} {}: {}\n", "degraded:".yellow(), r.backend, e)),
             None => {}
         }
     }
     let timings: Vec<String> = out
         .per_backend
         .iter()
-        .map(|r| format!("{} {}ms/{} hits", r.backend, r.elapsed.as_millis(), r.raw_hits))
+        .map(|r| {
+            format!(
+                "{} {}ms/{} hits",
+                r.backend,
+                r.elapsed.as_millis(),
+                r.raw_hits
+            )
+        })
         .collect();
     if !timings.is_empty() {
         s.push_str(&format!("{}\n", timings.join("   ").dimmed()));
@@ -159,10 +165,7 @@ fn currency_footer(offers: &[RankedOffer]) -> String {
     if cheap.is_empty() {
         return String::new();
     }
-    let parts: Vec<String> = cheap
-        .iter()
-        .map(|(p, b)| format!("{p} ({b})"))
-        .collect();
+    let parts: Vec<String> = cheap.iter().map(|(p, b)| format!("{p} ({b})")).collect();
     let mut s = format!("cheapest per currency: {}\n", parts.join("   "));
     if has_mixed_currencies(offers) {
         s.push_str(&format!(
@@ -178,8 +181,8 @@ fn currency_footer(offers: &[RankedOffer]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acquire::shop::{BackendReport, RankedOffer, SearchOutcome};
     use crate::acquire::error::BackendError;
+    use crate::acquire::shop::{BackendReport, RankedOffer, SearchOutcome};
     use std::time::Duration;
 
     fn ranked(o: Offer, row: usize) -> RankedOffer {
@@ -259,7 +262,11 @@ mod tests {
         let mut o = offer();
         assert_eq!(format_cell(&o), "?");
         o.formats = Some(vec![AudioFormat::Mp3(Some(320)), AudioFormat::Flac]);
-        assert!(format_cell(&o).starts_with("FLAC"), "got {}", format_cell(&o));
+        assert!(
+            format_cell(&o).starts_with("FLAC"),
+            "got {}",
+            format_cell(&o)
+        );
         o.formats = Some(vec![]);
         assert_eq!(format_cell(&o), "none", "probed but nothing usable");
     }
@@ -270,7 +277,9 @@ mod tests {
         assert_eq!(ownership_cell(&o), "?");
         o.ownership = Ownership::No;
         assert_eq!(ownership_cell(&o), "no");
-        o.ownership = Ownership::Yes { redownloadable: true };
+        o.ownership = Ownership::Yes {
+            redownloadable: true,
+        };
         assert_eq!(ownership_cell(&o), "yes");
         o.ownership = Ownership::NotApplicable;
         assert_eq!(ownership_cell(&o), "n/a");

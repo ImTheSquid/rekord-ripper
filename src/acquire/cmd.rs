@@ -5,10 +5,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow, bail};
 use owo_colors::OwoColorize;
 
+use super::Registry;
 use super::pick::{self, Choice, Selector};
 use super::shop::{self, SearchOpts, SearchOutcome};
 use super::types::*;
-use super::Registry;
 use crate::config::{Config, Credentials};
 use crate::db::{self, MasterDb, SafetyOpts};
 use crate::pending::{PendingStore, State};
@@ -29,12 +29,7 @@ pub struct BuyArgs {
     pub yes: bool,
 }
 
-pub fn buy(
-    db: Option<&MasterDb>,
-    cfg: &Config,
-    creds: &Credentials,
-    args: BuyArgs,
-) -> Result<()> {
+pub fn buy(db: Option<&MasterDb>, cfg: &Config, creds: &Credentials, args: BuyArgs) -> Result<()> {
     let reg = Registry::from_config(cfg, creds);
     let query = build_query(db, cfg, &args.query, args.track_id.as_deref(), args.limit)?;
     let opts = SearchOpts {
@@ -60,8 +55,7 @@ pub fn buy(
         PurchaseFlow::NotRequired => {
             println!(
                 "{} — nothing to buy. Use `rekord-ripper rip {}` instead.",
-                offer.title,
-                offer.item_ref
+                offer.title, offer.item_ref
             );
         }
         PurchaseFlow::AlreadyOwned => {
@@ -316,10 +310,7 @@ fn apply_pending(
         return Ok(());
     }
     if dry_run {
-        eprintln!(
-            "{} ready. Dry-run; pass --apply to write.",
-            ready.len()
-        );
+        eprintln!("{} ready. Dry-run; pass --apply to write.", ready.len());
         return Ok(());
     }
 
@@ -372,11 +363,11 @@ fn choose<'a>(out: &'a SearchOutcome, sel: &Selector) -> Result<&'a shop::Ranked
         return pick::resolve(out, sel);
     }
     match pick::prompt(out)? {
-        Some(Choice::Row(n)) => out
-            .by_row(n)
-            .ok_or_else(|| anyhow!("there is no row {n}")),
+        Some(Choice::Row(n)) => out.by_row(n).ok_or_else(|| anyhow!("there is no row {n}")),
         Some(Choice::Open(n)) => {
-            let r = out.by_row(n).ok_or_else(|| anyhow!("there is no row {n}"))?;
+            let r = out
+                .by_row(n)
+                .ok_or_else(|| anyhow!("there is no row {n}"))?;
             proc::open_url(&r.offer.url)?;
             bail!("opened row {n} in your browser; run the command again to buy it")
         }
@@ -394,7 +385,10 @@ fn confirm(question: &str) -> Result<bool> {
     std::io::stdout().flush()?;
     let mut line = String::new();
     std::io::stdin().lock().read_line(&mut line)?;
-    Ok(matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
+    Ok(matches!(
+        line.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
 }
 
 fn clip(s: &str, max: usize) -> String {

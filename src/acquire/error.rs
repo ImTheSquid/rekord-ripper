@@ -242,9 +242,7 @@ mod tests {
 
     #[test]
     fn unsupported_is_skipped_quietly_in_a_fan_out() {
-        assert!(
-            BackendError::unsupported(BackendId::SoundCloud, "enrich").is_silently_skippable()
-        );
+        assert!(BackendError::unsupported(BackendId::SoundCloud, "enrich").is_silently_skippable());
         assert!(
             !BackendError::AuthExpired {
                 backend: BackendId::Bandcamp,

@@ -162,8 +162,8 @@ impl PendingStore {
         lock: bool,
         ttl_days: i64,
     ) -> Result<i64> {
-        let meta = std::fs::metadata(acquired)
-            .with_context(|| format!("stat {}", acquired.display()))?;
+        let meta =
+            std::fs::metadata(acquired).with_context(|| format!("stat {}", acquired.display()))?;
         let now = chrono::Utc::now();
         let expires = now + chrono::Duration::days(ttl_days.max(1));
 
@@ -218,8 +218,7 @@ impl PendingStore {
                 provider: r.get("provider")?,
                 replace: r.get::<_, i64>("copy_replace")? != 0,
                 lock: r.get::<_, i64>("copy_lock")? != 0,
-                state: State::parse(&r.get::<_, String>("state")?)
-                    .unwrap_or(State::Cancelled),
+                state: State::parse(&r.get::<_, String>("state")?).unwrap_or(State::Cancelled),
                 dst_content_id: r.get("dst_content_id")?,
                 verdict: r.get("verdict")?,
                 created_at: r.get("created_at")?,
@@ -284,16 +283,16 @@ impl PendingStore {
             }
             // The file changed since we recorded it, so it is no longer the file
             // this pairing was reasoned about.
-            if let Ok(meta) = std::fs::metadata(&e.acquired_path) {
-                if meta.len() != e.acquired_size || mtime_ns(&meta) != e.acquired_mtime_ns {
-                    self.set_state(e.id, State::Expired)?;
-                    changed.push((
-                        e.id,
-                        State::Expired,
-                        "the downloaded file changed on disk".into(),
-                    ));
-                    continue;
-                }
+            if let Ok(meta) = std::fs::metadata(&e.acquired_path)
+                && (meta.len() != e.acquired_size || mtime_ns(&meta) != e.acquired_mtime_ns)
+            {
+                self.set_state(e.id, State::Expired)?;
+                changed.push((
+                    e.id,
+                    State::Expired,
+                    "the downloaded file changed on disk".into(),
+                ));
+                continue;
             }
             // The source track was deleted, or its ID was recycled onto another
             // track — the UUID check is what catches the second case.
@@ -309,7 +308,10 @@ impl PendingStore {
                     continue;
                 }
             }
-            if parse_db_time(&e.expires_at).map(|t| now > t).unwrap_or(false) {
+            if parse_db_time(&e.expires_at)
+                .map(|t| now > t)
+                .unwrap_or(false)
+            {
                 self.set_state(e.id, State::Expired)?;
                 changed.push((
                     e.id,
@@ -385,7 +387,9 @@ pub fn find_imported_row(db: &MasterDb, path: &Path) -> Result<Option<String>> {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return Ok(None);
     };
-    let size = std::fs::metadata(path).map(|m| m.len() as i64).unwrap_or(-1);
+    let size = std::fs::metadata(path)
+        .map(|m| m.len() as i64)
+        .unwrap_or(-1);
     Ok(db
         .conn
         .query_row(
@@ -426,10 +430,10 @@ fn parse_db_time(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     if let Ok(dt) = chrono::DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.3f %:z") {
         return Some(dt.with_timezone(&chrono::Utc));
     }
-    if s.len() >= 19 {
-        if let Ok(n) = chrono::NaiveDateTime::parse_from_str(&s[..19], "%Y-%m-%d %H:%M:%S") {
-            return Some(n.and_utc());
-        }
+    if s.len() >= 19
+        && let Ok(n) = chrono::NaiveDateTime::parse_from_str(&s[..19], "%Y-%m-%d %H:%M:%S")
+    {
+        return Some(n.and_utc());
     }
     None
 }
@@ -473,7 +477,16 @@ mod tests {
     fn records_and_reads_back_a_pairing() {
         let (s, dir) = store();
         let f = a_file(&dir, "new.flac");
-        let id = s.add(&header("101", "u-101"), &f, Some("bandcamp"), true, false, 14).unwrap();
+        let id = s
+            .add(
+                &header("101", "u-101"),
+                &f,
+                Some("bandcamp"),
+                true,
+                false,
+                14,
+            )
+            .unwrap();
 
         let entries = s.all().unwrap();
         assert_eq!(entries.len(), 1);
@@ -492,7 +505,8 @@ mod tests {
         // Without this, build_plan refuses with "destination has N existing cues".
         let (s, dir) = store();
         let f = a_file(&dir, "new.flac");
-        s.add(&header("1", "u1"), &f, None, true, false, 14).unwrap();
+        s.add(&header("1", "u1"), &f, None, true, false, 14)
+            .unwrap();
         assert!(s.all().unwrap()[0].replace);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -501,7 +515,9 @@ mod tests {
     fn state_transitions_are_recorded() {
         let (s, dir) = store();
         let f = a_file(&dir, "new.flac");
-        let id = s.add(&header("1", "u1"), &f, None, true, false, 14).unwrap();
+        let id = s
+            .add(&header("1", "u1"), &f, None, true, false, 14)
+            .unwrap();
 
         s.set_matched(id, "202", "score 1.2, shift 0ms").unwrap();
         let e = &s.all().unwrap()[0];
@@ -518,7 +534,9 @@ mod tests {
     fn a_rejection_is_remembered_so_watch_does_not_retry_forever() {
         let (s, dir) = store();
         let f = a_file(&dir, "new.flac");
-        let id = s.add(&header("1", "u1"), &f, None, true, false, 14).unwrap();
+        let id = s
+            .add(&header("1", "u1"), &f, None, true, false, 14)
+            .unwrap();
         s.set_rejected(id, "time-shifted by 3220ms").unwrap();
 
         let e = &s.all().unwrap()[0];
@@ -533,9 +551,11 @@ mod tests {
     fn the_same_file_cannot_be_queued_twice_while_awaiting_import() {
         let (s, dir) = store();
         let f = a_file(&dir, "new.flac");
-        s.add(&header("1", "u1"), &f, None, true, false, 14).unwrap();
+        s.add(&header("1", "u1"), &f, None, true, false, 14)
+            .unwrap();
         assert!(
-            s.add(&header("2", "u2"), &f, None, true, false, 14).is_err(),
+            s.add(&header("2", "u2"), &f, None, true, false, 14)
+                .is_err(),
             "the partial unique index should prevent a duplicate"
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -545,7 +565,9 @@ mod tests {
     fn the_same_file_can_be_requeued_once_the_first_attempt_is_done() {
         let (s, dir) = store();
         let f = a_file(&dir, "new.flac");
-        let id = s.add(&header("1", "u1"), &f, None, true, false, 14).unwrap();
+        let id = s
+            .add(&header("1", "u1"), &f, None, true, false, 14)
+            .unwrap();
         s.set_state(id, State::Rejected).unwrap();
         // The index is partial on awaiting_import, so a retry is allowed.
         assert!(s.add(&header("2", "u2"), &f, None, true, false, 14).is_ok());
@@ -581,7 +603,10 @@ mod tests {
     #[test]
     fn parses_the_timestamp_format_the_database_uses() {
         let t = parse_db_time("2026-08-23 14:05:06.789 +00:00").expect("should parse");
-        assert_eq!(t.format("%Y-%m-%d %H:%M:%S").to_string(), "2026-08-23 14:05:06");
+        assert_eq!(
+            t.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-08-23 14:05:06"
+        );
         assert!(parse_db_time("not a time").is_none());
     }
 
@@ -589,7 +614,8 @@ mod tests {
     fn mtime_is_captured_so_a_changed_file_can_be_detected() {
         let (s, dir) = store();
         let f = a_file(&dir, "new.flac");
-        s.add(&header("1", "u1"), &f, None, true, false, 14).unwrap();
+        s.add(&header("1", "u1"), &f, None, true, false, 14)
+            .unwrap();
         let before = s.all().unwrap()[0].acquired_mtime_ns;
         assert!(before > 0, "mtime should have been recorded");
 
@@ -604,7 +630,9 @@ mod tests {
     fn removing_an_entry_works() {
         let (s, dir) = store();
         let f = a_file(&dir, "new.flac");
-        let id = s.add(&header("1", "u1"), &f, None, true, false, 14).unwrap();
+        let id = s
+            .add(&header("1", "u1"), &f, None, true, false, 14)
+            .unwrap();
         s.remove(id).unwrap();
         assert!(s.all().unwrap().is_empty());
         std::fs::remove_dir_all(&dir).ok();
@@ -618,7 +646,8 @@ mod tests {
         let f = a_file(&dir, "new.flac");
         {
             let s = PendingStore::open_at(&db_path).unwrap();
-            s.add(&header("1", "u1"), &f, None, true, false, 14).unwrap();
+            s.add(&header("1", "u1"), &f, None, true, false, 14)
+                .unwrap();
         }
         let s = PendingStore::open_at(&db_path).unwrap();
         assert_eq!(s.all().unwrap().len(), 1, "state must survive a restart");

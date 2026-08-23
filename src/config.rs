@@ -103,6 +103,7 @@ pub struct Pending {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct Import {
     /// Create the rekordbox `djmdContent` row ourselves instead of waiting for
     /// you to drag the folder in.
@@ -186,15 +187,6 @@ impl Default for Pending {
     }
 }
 
-impl Default for Import {
-    fn default() -> Self {
-        Self {
-            insert_content_rows: false,
-            allow_insert_when_cloud_sync: false,
-        }
-    }
-}
-
 impl Default for Bandcamp {
     fn default() -> Self {
         Self { enabled: true }
@@ -222,8 +214,8 @@ impl Config {
         }
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
-        let cfg: Config = toml::from_str(&text)
-            .with_context(|| format!("parsing config {}", path.display()))?;
+        let cfg: Config =
+            toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))?;
         for key in cfg.unknown.keys() {
             eprintln!(
                 "warning: unrecognised config key '{key}' in {} — ignoring",
@@ -328,27 +320,26 @@ impl Credentials {
         warn_if_world_readable(path);
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading credentials {}", path.display()))?;
-        toml::from_str(&text)
-            .with_context(|| format!("parsing credentials {}", path.display()))
+        toml::from_str(&text).with_context(|| format!("parsing credentials {}", path.display()))
     }
 
     /// The Bandcamp identity cookie, in precedence order:
     /// `BANDCAMP_IDENTITY` env var, then `identity_cookie_file`, then the
     /// inline value. Mirrors how `REKORDBOX_KEY` overrides the built-in key.
     pub fn bandcamp_identity(&self) -> Result<Option<(Secret, CredentialSource)>> {
-        if let Ok(v) = std::env::var("BANDCAMP_IDENTITY") {
-            if !v.trim().is_empty() {
-                return Ok(Some((Secret::new(v), CredentialSource::Env)));
-            }
+        if let Ok(v) = std::env::var("BANDCAMP_IDENTITY")
+            && !v.trim().is_empty()
+        {
+            return Ok(Some((Secret::new(v), CredentialSource::Env)));
         }
-        if let Some(f) = self.bandcamp.identity_cookie_file.as_deref() {
-            if !f.trim().is_empty() {
-                let p = paths::expand_tilde(f.trim())?;
-                let v = std::fs::read_to_string(&p)
-                    .with_context(|| format!("reading identity_cookie_file {}", p.display()))?;
-                if !v.trim().is_empty() {
-                    return Ok(Some((Secret::new(v), CredentialSource::File)));
-                }
+        if let Some(f) = self.bandcamp.identity_cookie_file.as_deref()
+            && !f.trim().is_empty()
+        {
+            let p = paths::expand_tilde(f.trim())?;
+            let v = std::fs::read_to_string(&p)
+                .with_context(|| format!("reading identity_cookie_file {}", p.display()))?;
+            if !v.trim().is_empty() {
+                return Ok(Some((Secret::new(v), CredentialSource::File)));
             }
         }
         if !self.bandcamp.identity_cookie.is_empty() {
@@ -468,7 +459,12 @@ mod tests {
         if std::env::var("BANDCAMP_IDENTITY").is_ok() {
             return;
         }
-        assert!(Credentials::default().bandcamp_identity().unwrap().is_none());
+        assert!(
+            Credentials::default()
+                .bandcamp_identity()
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

@@ -139,9 +139,8 @@ impl CollectionPage {
 
 /// Parse the collection-items response. Shape confirmed against the live API.
 pub fn parse_collection_items(body: &str) -> Result<CollectionPage> {
-    let v: serde_json::Value = serde_json::from_str(body).map_err(|e| {
-        BackendError::parse(BackendId::Bandcamp, "collection_items", e.to_string())
-    })?;
+    let v: serde_json::Value = serde_json::from_str(body)
+        .map_err(|e| BackendError::parse(BackendId::Bandcamp, "collection_items", e.to_string()))?;
     if v["error"].as_bool().unwrap_or(false) {
         return Err(BackendError::AuthExpired {
             backend: BackendId::Bandcamp,
@@ -174,8 +173,7 @@ pub fn parse_collection_items(body: &str) -> Result<CollectionPage> {
             continue;
         };
         let sale_type = item["sale_item_type"].as_str().unwrap_or("p");
-        page.items
-            .push((kind, id, format!("{sale_type}{sale_id}")));
+        page.items.push((kind, id, format!("{sale_type}{sale_id}")));
     }
 
     if let Some(map) = v["redownload_urls"].as_object() {
@@ -206,21 +204,19 @@ fn parse_fan_id(body: &str) -> Result<i64> {
     v["fan_id"]
         .as_i64()
         .or_else(|| v["collection_summary"]["fan_id"].as_i64())
-        .ok_or_else(|| {
-            BackendError::parse(BackendId::Bandcamp, "collection_summary", "no fan_id")
-        })
+        .ok_or_else(|| BackendError::parse(BackendId::Bandcamp, "collection_summary", "no fan_id"))
 }
 
 /// Per-format download links from a `redownload_url` page.
 ///
 /// Chain: the page's `<div id="pagedata" data-blob="…">` →
 /// `download_items[0].downloads[<slug>]` → `{ url, size_mb }`.
-pub fn parse_download_page(
-    html: &str,
-) -> Result<std::collections::HashMap<AudioFormat, String>> {
+pub fn parse_download_page(html: &str) -> Result<std::collections::HashMap<AudioFormat, String>> {
     let blob = blob::id_attr_json(html, "pagedata", "data-blob")
         .or_else(|_| blob::attr_json(html, "data-blob"))
-        .map_err(|e| BackendError::parse(BackendId::Bandcamp, "download pagedata", e.to_string()))?;
+        .map_err(|e| {
+            BackendError::parse(BackendId::Bandcamp, "download pagedata", e.to_string())
+        })?;
 
     let items = blob["download_items"].as_array().ok_or_else(|| {
         BackendError::parse(
@@ -329,9 +325,9 @@ impl Bandcamp {
                 .call()
                 .map_err(|e| http::map_err(BackendId::Bandcamp, COLLECTION_SUMMARY_URL, e))
                 .and_then(|mut r| {
-                    r.body_mut().read_to_string().map_err(|e| {
-                        http::map_err(BackendId::Bandcamp, COLLECTION_SUMMARY_URL, e)
-                    })
+                    r.body_mut()
+                        .read_to_string()
+                        .map_err(|e| http::map_err(BackendId::Bandcamp, COLLECTION_SUMMARY_URL, e))
                 })
                 .and_then(|body| parse_collection_summary(&body));
 
@@ -466,9 +462,8 @@ struct SearchHit {
 ///
 /// Split out from the request so it can be tested against a captured response.
 fn parse_search(body: &str, limit: usize) -> Result<Vec<Offer>> {
-    let resp: SearchResponse = serde_json::from_str(body).map_err(|e| {
-        BackendError::parse(BackendId::Bandcamp, "search response", e.to_string())
-    })?;
+    let resp: SearchResponse = serde_json::from_str(body)
+        .map_err(|e| BackendError::parse(BackendId::Bandcamp, "search response", e.to_string()))?;
 
     // Bandcamp answers 200 on failure, so the body is the only signal.
     if resp.error {
@@ -553,9 +548,9 @@ pub fn parse_item_page(html: &str) -> Result<ItemFacts> {
                     (None, _) => Pricing::Unprobed,
                 }
             } else {
-                let minimum = minimum.filter(|m| *m > 0.0).map(|m| {
-                    Price::from_major(m, currency.as_deref().unwrap_or(UNKNOWN_CURRENCY))
-                });
+                let minimum = minimum
+                    .filter(|m| *m > 0.0)
+                    .map(|m| Price::from_major(m, currency.as_deref().unwrap_or(UNKNOWN_CURRENCY)));
                 Pricing::NameYourPrice { minimum }
             }
         }
@@ -582,14 +577,13 @@ pub const UNKNOWN_CURRENCY: &str = "???";
 /// Deliberately never `data-cart.currency`, which is the viewer's cart currency
 /// and is wrong for any seller who doesn't price in it.
 fn seller_currency(tralbum: &serde_json::Value, html: &str) -> Option<String> {
-    if let Some(packages) = tralbum["packages"].as_array() {
-        if let Some(c) = packages
+    if let Some(packages) = tralbum["packages"].as_array()
+        && let Some(c) = packages
             .iter()
             .filter_map(|p| p["currency"].as_str())
             .find(|c| !c.trim().is_empty())
-        {
-            return Some(c.trim().to_ascii_uppercase());
-        }
+    {
+        return Some(c.trim().to_ascii_uppercase());
     }
     // Fall back to the ISO code rendered beside the price.
     rendered_currency(html)
@@ -601,7 +595,10 @@ fn rendered_currency(html: &str) -> Option<String> {
     let marker = "buyItemExtra secondaryText\">";
     let at = html.find(marker)? + marker.len();
     let rest = html[at..].trim_start();
-    let code: String = rest.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
+    let code: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .collect();
     (code.len() == 3).then(|| code.to_ascii_uppercase())
 }
 
@@ -655,10 +652,7 @@ impl super::AcquisitionBackend for Bandcamp {
         } else {
             return None;
         };
-        Some(ItemRef::new(
-            BackendId::Bandcamp,
-            format!("{kind}:{url}"),
-        ))
+        Some(ItemRef::new(BackendId::Bandcamp, format!("{kind}:{url}")))
     }
 
     fn search(&self, query: &SearchQuery) -> Result<Vec<Offer>> {
@@ -719,12 +713,12 @@ impl super::AcquisitionBackend for Bandcamp {
 
         // Only things you own can be downloaded, so say which it is rather than
         // reporting a generic failure.
-        let redownload = self
-            .redownload_url(secret, kind, id)?
-            .ok_or_else(|| BackendError::NotOwned {
-                backend: BackendId::Bandcamp,
-                item: item.clone(),
-            })?;
+        let redownload =
+            self.redownload_url(secret, kind, id)?
+                .ok_or_else(|| BackendError::NotOwned {
+                    backend: BackendId::Bandcamp,
+                    item: item.clone(),
+                })?;
 
         let cookie = format!("identity={}", secret.expose());
         let agent = http::download_agent(
@@ -812,7 +806,10 @@ pub fn item_url(item: &ItemRef) -> Option<String> {
     let mut parts = item.key.splitn(3, ':');
     let _kind = parts.next()?;
     let _id = parts.next()?;
-    parts.next().map(|s| s.to_string()).filter(|s| !s.is_empty())
+    parts
+        .next()
+        .map(|s| s.to_string())
+        .filter(|s| !s.is_empty())
 }
 
 #[cfg(test)]
@@ -866,8 +863,14 @@ mod tests {
         let o = &parse_search(SEARCH_FIXTURE, 1).unwrap()[0];
         let s = o.item_ref.to_string();
         let back: ItemRef = s.parse().unwrap();
-        assert_eq!(back, o.item_ref, "a ref printed for --offer must parse back");
-        assert_eq!(parse_item_key(&back.key), Some((ItemKind::Album, 856850876)));
+        assert_eq!(
+            back, o.item_ref,
+            "a ref printed for --offer must parse back"
+        );
+        assert_eq!(
+            parse_item_key(&back.key),
+            Some((ItemKind::Album, 856850876))
+        );
     }
 
     #[test]
@@ -875,8 +878,10 @@ mod tests {
         // The url has its own "https:" colon, so naive splitting would break.
         let key = item_key(ItemKind::Track, 42, "https://x.bandcamp.com/track/y");
         assert_eq!(parse_item_key(&key), Some((ItemKind::Track, 42)));
-        assert_eq!(item_url(&ItemRef::new(BackendId::Bandcamp, key)).as_deref(),
-                   Some("https://x.bandcamp.com/track/y"));
+        assert_eq!(
+            item_url(&ItemRef::new(BackendId::Bandcamp, key)).as_deref(),
+            Some("https://x.bandcamp.com/track/y")
+        );
     }
 
     #[test]
@@ -900,7 +905,9 @@ mod tests {
         };
         assert_eq!(
             owned.contains(ItemKind::Album, 856850876),
-            Ownership::Yes { redownloadable: true }
+            Ownership::Yes {
+                redownloadable: true
+            }
         );
         // Same number, different kind — must not be treated as owned.
         assert_eq!(owned.contains(ItemKind::Track, 856850876), Ownership::No);
@@ -920,7 +927,10 @@ mod tests {
         // Verified live: this endpoint answers HTTP 200 with this body.
         let body = r#"{"error":true,"error_message":"must be logged in"}"#;
         let err = parse_collection_summary(body).unwrap_err();
-        assert!(matches!(err, BackendError::AuthExpired { .. }), "got {err:?}");
+        assert!(
+            matches!(err, BackendError::AuthExpired { .. }),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -1012,7 +1022,11 @@ mod tests {
         // Bandcamp adding a format must not stop you downloading FLAC.
         let links = parse_download_page(DOWNLOAD_PAGE).unwrap();
         assert!(links.contains_key(&AudioFormat::Flac));
-        assert_eq!(links.len(), 4, "the unrecognised slug is skipped, not fatal");
+        assert_eq!(
+            links.len(),
+            4,
+            "the unrecognised slug is skipped, not fatal"
+        );
     }
 
     #[test]
@@ -1027,7 +1041,11 @@ mod tests {
     #[test]
     fn format_preference_picks_flac_over_mp3_from_a_real_page() {
         let links = parse_download_page(DOWNLOAD_PAGE).unwrap();
-        let pref = vec![AudioFormat::Flac, AudioFormat::Aiff, AudioFormat::Mp3(Some(320))];
+        let pref = vec![
+            AudioFormat::Flac,
+            AudioFormat::Aiff,
+            AudioFormat::Mp3(Some(320)),
+        ];
         let chosen = pref.iter().find(|f| links.contains_key(f)).unwrap();
         assert_eq!(*chosen, AudioFormat::Flac);
     }
@@ -1069,13 +1087,17 @@ mod tests {
                 },
             )
             .unwrap_err();
-        assert!(matches!(err, BackendError::NoCredentials { .. }), "got {err:?}");
+        assert!(
+            matches!(err, BackendError::NoCredentials { .. }),
+            "got {err:?}"
+        );
         assert!(err.needs_user_action());
     }
 
     #[test]
     fn an_empty_collection_is_valid_not_an_error() {
-        let keys = parse_collection_summary(r#"{"collection_summary":{"tralbum_lookup":{}}}"#).unwrap();
+        let keys =
+            parse_collection_summary(r#"{"collection_summary":{"tralbum_lookup":{}}}"#).unwrap();
         assert!(keys.is_empty());
     }
 
@@ -1106,13 +1128,20 @@ mod tests {
         // So the message can say "re-paste your cookie" instead of "parse error".
         let err =
             parse_search(r#"{"error":true,"error_message":"must be logged in"}"#, 5).unwrap_err();
-        assert!(matches!(err, BackendError::AuthExpired { .. }), "got {err:?}");
+        assert!(
+            matches!(err, BackendError::AuthExpired { .. }),
+            "got {err:?}"
+        );
         assert!(err.needs_user_action());
     }
 
     #[test]
     fn an_empty_result_set_is_success_not_failure() {
-        assert!(parse_search(r#"{"auto":{"results":[]}}"#, 5).unwrap().is_empty());
+        assert!(
+            parse_search(r#"{"auto":{"results":[]}}"#, 5)
+                .unwrap()
+                .is_empty()
+        );
         assert!(parse_search(r#"{}"#, 5).unwrap().is_empty());
     }
 
@@ -1177,22 +1206,27 @@ mod tests {
 
     #[test]
     fn sums_track_durations_for_an_album() {
-        assert_eq!(parse_item_page(ALBUM_FIXTURE).unwrap().duration_secs, Some(146));
+        assert_eq!(
+            parse_item_page(ALBUM_FIXTURE).unwrap().duration_secs,
+            Some(146)
+        );
     }
 
     #[test]
     fn download_pref_one_is_free() {
-        let html = ALBUM_FIXTURE.replace(
-            "&quot;download_pref&quot;:2",
-            "&quot;download_pref&quot;:1",
-        );
-        assert!(matches!(parse_item_page(&html).unwrap().pricing, Pricing::Free));
+        let html =
+            ALBUM_FIXTURE.replace("&quot;download_pref&quot;:2", "&quot;download_pref&quot;:1");
+        assert!(matches!(
+            parse_item_page(&html).unwrap().pricing,
+            Pricing::Free
+        ));
     }
 
     #[test]
     fn no_download_pref_means_not_acquirable() {
         // Streaming-only or physical-only: listed, but there is nothing to fetch.
-        let html = r#"<script data-tralbum="{&quot;current&quot;:{},&quot;packages&quot;:[]}"></script>"#;
+        let html =
+            r#"<script data-tralbum="{&quot;current&quot;:{},&quot;packages&quot;:[]}"></script>"#;
         let facts = parse_item_page(html).unwrap();
         assert!(matches!(facts.pricing, Pricing::Unavailable { .. }));
         // And it must not be presented as something you can buy.
@@ -1266,8 +1300,14 @@ mod tests {
 
     #[test]
     fn rendered_currency_ignores_anything_that_is_not_a_three_letter_code() {
-        assert_eq!(rendered_currency("class=\"buyItemExtra secondaryText\">GBP<"), Some("GBP".into()));
-        assert_eq!(rendered_currency("class=\"buyItemExtra secondaryText\">or more<"), None);
+        assert_eq!(
+            rendered_currency("class=\"buyItemExtra secondaryText\">GBP<"),
+            Some("GBP".into())
+        );
+        assert_eq!(
+            rendered_currency("class=\"buyItemExtra secondaryText\">or more<"),
+            None
+        );
         assert_eq!(rendered_currency("nothing here"), None);
     }
 
@@ -1280,7 +1320,10 @@ mod tests {
             assert!(c.search, "search must work without credentials");
             assert!(!c.fetch, "fetching a purchase needs a session");
             assert!(!c.ownership_check);
-            assert!(matches!(anon.credentials(), CredentialState::Missing { .. }));
+            assert!(matches!(
+                anon.credentials(),
+                CredentialState::Missing { .. }
+            ));
         }
     }
 
@@ -1288,7 +1331,10 @@ mod tests {
     fn claims_only_bandcamp_item_urls() {
         use super::super::AcquisitionBackend;
         let bc = Bandcamp::new(&Credentials::default(), Duration::from_secs(5));
-        assert!(bc.claim_url("https://burial.bandcamp.com/album/untrue").is_some());
+        assert!(
+            bc.claim_url("https://burial.bandcamp.com/album/untrue")
+                .is_some()
+        );
         assert!(bc.claim_url("https://x.bandcamp.com/track/y").is_some());
         // A band's landing page is not an acquirable item.
         assert!(bc.claim_url("https://burial.bandcamp.com").is_none());

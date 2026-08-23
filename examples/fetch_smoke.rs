@@ -48,8 +48,17 @@ fn main() -> anyhow::Result<()> {
 
         // A file we just downloaded must fingerprint, and must match itself.
         let a = fp::fingerprint_file(&f.path, 60)?;
-        println!("  fingerprint: {} items, {:.1}s", a.items.len(), a.scanned_secs);
-        let v = fp::compare(&a, &a, fp::SpeedEvidence::default(), &fp::Thresholds::default())?;
+        println!(
+            "  fingerprint: {} items, {:.1}s",
+            a.items.len(),
+            a.scanned_secs
+        );
+        let v = fp::compare(
+            &a,
+            &a,
+            fp::SpeedEvidence::default(),
+            &fp::Thresholds::default(),
+        )?;
         println!("  self-compare: {}", v.summary());
         assert!(v.is_accept(), "a file must match itself");
     }

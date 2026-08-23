@@ -186,9 +186,8 @@ fn parse_formats(json: &str) -> Result<Vec<AudioFormat>> {
 /// and yt-dlp accepts `api.soundcloud.com/tracks/<id>` — so a streaming row that
 /// has no local audio can still be fetched for a fingerprint comparison.
 pub fn track_id(s: &str) -> Option<String> {
-    let digits = |v: &str| {
-        (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit())).then(|| v.to_string())
-    };
+    let digits =
+        |v: &str| (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit())).then(|| v.to_string());
     if let Some(rest) = s.strip_prefix("soundcloud:tracks:") {
         return digits(rest);
     }
@@ -428,10 +427,11 @@ fn newest_audio_file(dir: &std::path::Path) -> Result<std::path::PathBuf> {
             best = Some((modified, path));
         }
     }
-    best.map(|(_, p)| p).ok_or_else(|| BackendError::ToolFailed {
-        tool: "yt-dlp".into(),
-        detail: "finished without writing an audio file".into(),
-    })
+    best.map(|(_, p)| p)
+        .ok_or_else(|| BackendError::ToolFailed {
+            tool: "yt-dlp".into(),
+            detail: "finished without writing an audio file".into(),
+        })
 }
 
 #[cfg(test)]
@@ -511,7 +511,10 @@ mod tests {
           {"format_id":"hls_opus_0_0","ext":"opus","abr":64.0}]}"#;
         let f = parse_formats(json).unwrap();
         assert!(f.contains(&AudioFormat::Mp3(Some(128))));
-        assert!(!f.iter().any(|x| x.is_lossless()), "a transcode is never lossless");
+        assert!(
+            !f.iter().any(|x| x.is_lossless()),
+            "a transcode is never lossless"
+        );
     }
 
     #[test]
@@ -528,7 +531,10 @@ mod tests {
     #[test]
     fn unreadable_formats_fall_back_to_the_streaming_baseline() {
         // Better to report soundcloud's floor than to claim we know nothing.
-        assert_eq!(parse_formats(r#"{"formats":[]}"#).unwrap(), vec![STREAM_FORMAT]);
+        assert_eq!(
+            parse_formats(r#"{"formats":[]}"#).unwrap(),
+            vec![STREAM_FORMAT]
+        );
         assert_eq!(parse_formats(r#"{}"#).unwrap(), vec![STREAM_FORMAT]);
     }
 
@@ -554,7 +560,10 @@ mod tests {
         ));
         let rl = classify_ytdlp_failure("yt-dlp", b"ERROR: HTTP Error 429: Too Many Requests");
         assert!(matches!(rl, BackendError::RateLimited { .. }));
-        assert!(rl.is_retryable(), "a rate limit should back off, not give up");
+        assert!(
+            rl.is_retryable(),
+            "a rate limit should back off, not give up"
+        );
     }
 
     #[test]
@@ -571,7 +580,10 @@ mod tests {
     fn extracts_track_ids_from_every_form_we_encounter() {
         // The rekordbox streaming-row form is the one that makes FileType 19
         // sources fingerprintable at all.
-        assert_eq!(track_id("soundcloud:tracks:1803453465").as_deref(), Some("1803453465"));
+        assert_eq!(
+            track_id("soundcloud:tracks:1803453465").as_deref(),
+            Some("1803453465")
+        );
         assert_eq!(track_id("track/46289525").as_deref(), Some("46289525"));
         assert_eq!(
             track_id("https://api.soundcloud.com/tracks/46289525").as_deref(),
@@ -608,10 +620,19 @@ mod tests {
                 .to_string(),
             "soundcloud:track/46289525"
         );
-        assert!(sc.claim_url("https://soundcloud.com/four-tet/song").is_some());
+        assert!(
+            sc.claim_url("https://soundcloud.com/four-tet/song")
+                .is_some()
+        );
         // A set is many tracks; that is not this feature.
-        assert!(sc.claim_url("https://soundcloud.com/four-tet/sets/mix").is_none());
-        assert!(sc.claim_url("https://burial.bandcamp.com/album/untrue").is_none());
+        assert!(
+            sc.claim_url("https://soundcloud.com/four-tet/sets/mix")
+                .is_none()
+        );
+        assert!(
+            sc.claim_url("https://burial.bandcamp.com/album/untrue")
+                .is_none()
+        );
     }
 
     #[test]
@@ -626,7 +647,8 @@ mod tests {
     #[test]
     fn nothing_needs_buying() {
         assert!(matches!(
-            sc().purchase(&ItemRef::new(BackendId::SoundCloud, "track/1")).unwrap(),
+            sc().purchase(&ItemRef::new(BackendId::SoundCloud, "track/1"))
+                .unwrap(),
             PurchaseFlow::NotRequired
         ));
         assert!(matches!(sc().credentials(), CredentialState::NotRequired));
@@ -634,17 +656,38 @@ mod tests {
 
     #[test]
     fn a_missing_yt_dlp_is_reported_by_name() {
-        let sc = SoundCloud::new("definitely-not-yt-dlp-xyzzy", vec![], Duration::from_secs(5));
-        let err = sc.search(&SearchQuery::from_text("anything", 1)).unwrap_err();
-        assert!(matches!(err, BackendError::ToolMissing { .. }), "got {err:?}");
+        let sc = SoundCloud::new(
+            "definitely-not-yt-dlp-xyzzy",
+            vec![],
+            Duration::from_secs(5),
+        );
+        let err = sc
+            .search(&SearchQuery::from_text("anything", 1))
+            .unwrap_err();
+        assert!(
+            matches!(err, BackendError::ToolMissing { .. }),
+            "got {err:?}"
+        );
         assert!(err.needs_user_action());
     }
 
     #[test]
     fn an_empty_query_makes_no_subprocess_call() {
         // Guards against spawning yt-dlp with a meaningless search term.
-        let sc = SoundCloud::new("definitely-not-yt-dlp-xyzzy", vec![], Duration::from_secs(5));
-        assert!(sc.search(&SearchQuery::from_text("   ", 5)).unwrap().is_empty());
-        assert!(sc.search(&SearchQuery::from_text("x", 0)).unwrap().is_empty());
+        let sc = SoundCloud::new(
+            "definitely-not-yt-dlp-xyzzy",
+            vec![],
+            Duration::from_secs(5),
+        );
+        assert!(
+            sc.search(&SearchQuery::from_text("   ", 5))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            sc.search(&SearchQuery::from_text("x", 0))
+                .unwrap()
+                .is_empty()
+        );
     }
 }

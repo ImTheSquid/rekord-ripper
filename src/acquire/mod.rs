@@ -145,8 +145,7 @@ mod tests {
     #[test]
     fn unreadable_and_unknown_formats_are_dropped_from_the_preference() {
         let mut cfg = Config::default();
-        cfg.general.format_preference =
-            vec!["vorbis".into(), "not-a-format".into(), "flac".into()];
+        cfg.general.format_preference = vec!["vorbis".into(), "not-a-format".into(), "flac".into()];
         assert_eq!(format_preference(&cfg).unwrap(), vec![AudioFormat::Flac]);
     }
 

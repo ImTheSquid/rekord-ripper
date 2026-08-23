@@ -14,8 +14,7 @@ use anyhow::{Result, anyhow};
 /// Pull the value of `attr` from the first element that has it, HTML-unescape it,
 /// and parse it as JSON.
 pub fn attr_json(html: &str, attr: &str) -> Result<serde_json::Value> {
-    let raw = attr_value(html, attr)
-        .ok_or_else(|| anyhow!("no {attr} attribute in the page"))?;
+    let raw = attr_value(html, attr).ok_or_else(|| anyhow!("no {attr} attribute in the page"))?;
     let text = unescape(&raw);
     serde_json::from_str(&text).map_err(|e| anyhow!("{attr} was not valid JSON: {e}"))
 }
@@ -90,16 +89,16 @@ fn decode_entity(tail: &str) -> (Option<String>, usize) {
         }
     }
     // Numeric: &#123; or &#x1F600;
-    if let Some(body) = tail.strip_prefix("&#") {
-        if let Some(semi) = body.find(';') {
-            let digits = &body[..semi];
-            let parsed = match digits.strip_prefix(['x', 'X']) {
-                Some(hex) => u32::from_str_radix(hex, 16).ok(),
-                None => digits.parse::<u32>().ok(),
-            };
-            if let Some(c) = parsed.and_then(char::from_u32) {
-                return (Some(c.to_string()), 2 + semi + 1);
-            }
+    if let Some(body) = tail.strip_prefix("&#")
+        && let Some(semi) = body.find(';')
+    {
+        let digits = &body[..semi];
+        let parsed = match digits.strip_prefix(['x', 'X']) {
+            Some(hex) => u32::from_str_radix(hex, 16).ok(),
+            None => digits.parse::<u32>().ok(),
+        };
+        if let Some(c) = parsed.and_then(char::from_u32) {
+            return (Some(c.to_string()), 2 + semi + 1);
         }
     }
     (None, 0)
@@ -159,14 +158,19 @@ mod tests {
     fn id_lookup_stops_at_the_end_of_its_own_tag() {
         // pagedata has no data-blob; the attribute belongs to the *next* element,
         // so this must fail rather than silently returning someone else's data.
-        let html = r#"<div id="pagedata" class="x"></div><div data-blob="{&quot;x&quot;:9}"></div>"#;
-        let err = id_attr_json(html, "pagedata", "data-blob").unwrap_err().to_string();
+        let html =
+            r#"<div id="pagedata" class="x"></div><div data-blob="{&quot;x&quot;:9}"></div>"#;
+        let err = id_attr_json(html, "pagedata", "data-blob")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("has no data-blob"), "got: {err}");
     }
 
     #[test]
     fn missing_attribute_says_which_one() {
-        let err = attr_json("<html></html>", "data-tralbum").unwrap_err().to_string();
+        let err = attr_json("<html></html>", "data-tralbum")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("data-tralbum"), "got: {err}");
     }
 
@@ -187,7 +191,10 @@ mod tests {
 
     #[test]
     fn attr_value_returns_the_first_match_verbatim() {
-        assert_eq!(attr_value(r#"<a x="1"><b x="2">"#, "x").as_deref(), Some("1"));
+        assert_eq!(
+            attr_value(r#"<a x="1"><b x="2">"#, "x").as_deref(),
+            Some("1")
+        );
         assert_eq!(attr_value("<a>", "x"), None);
         // An unterminated attribute must not panic or run off the end.
         assert_eq!(attr_value(r#"<a x="unterminated"#, "x"), None);
