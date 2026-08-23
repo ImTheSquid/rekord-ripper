@@ -1074,7 +1074,7 @@ pub fn derive_anlz_path(uuid: &str) -> String {
     format!("/PIONEER/USBANLZ/{prefix}/{rest}/ANLZ0000.DAT")
 }
 
-fn random_numeric_id() -> String {
+pub(crate) fn random_numeric_id() -> String {
     // djmdCue.ID is a uint32 stored as a decimal string. Use a v4 UUID's first
     // 4 bytes for randomness — adequate; collision rate vs the existing 1816
     // cue IDs is on the order of 10^-6 per insertion.

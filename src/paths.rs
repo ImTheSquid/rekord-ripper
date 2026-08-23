@@ -11,7 +11,22 @@ use std::path::PathBuf;
 use anyhow::{Result, anyhow};
 
 /// Rekordbox's application directory, containing `master.db` and `share/`.
+///
+/// `REKORDBOX_DIR` overrides it, in the same spirit as `REKORDBOX_KEY`. That
+/// makes the write paths testable against a copy of the database instead of the
+/// real library — which matters most for row insertion, the one operation that
+/// adds tracks.
 pub fn rekordbox_app_dir() -> Result<PathBuf> {
+    if let Ok(dir) = var("REKORDBOX_DIR") {
+        let dir = dir.trim();
+        if !dir.is_empty() {
+            return Ok(PathBuf::from(dir));
+        }
+    }
+    default_rekordbox_app_dir()
+}
+
+fn default_rekordbox_app_dir() -> Result<PathBuf> {
     #[cfg(target_os = "windows")]
     {
         var("APPDATA")

@@ -102,13 +102,14 @@ pub fn gate(
     {
         return Ok(GateOutcome {
             verdict: Verdict::Reject {
-                reason: fp::RejectReason::Coverage {
-                    got: 0.0,
-                    min: t.coverage_min,
+                reason: fp::RejectReason::DurationMismatch {
+                    a,
+                    b,
+                    tol: cfg.fingerprint.duration_tol_secs,
                 },
                 score: f64::NAN,
                 coverage: 0.0,
-                shift_ms: ((a - b) * 1000),
+                shift_ms: (a - b) * 1000,
             },
             durations: None,
         });
