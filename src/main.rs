@@ -1,9 +1,14 @@
+use std::path::PathBuf;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+use rekord_ripper::acquire;
 use rekord_ripper::analysis::{self, CopyOpts};
+use rekord_ripper::config::{Config, Credentials};
 use rekord_ripper::db::{self, MasterDb, SafetyOpts};
 use rekord_ripper::dump;
+use rekord_ripper::paths;
 use rekord_ripper::tui;
 
 #[derive(Parser)]
@@ -15,6 +20,11 @@ struct Cli {
         global = true
     )]
     bypass_rekordbox_check: bool,
+
+    /// Path to config.toml. Overrides REKORD_RIPPER_CONFIG and the default
+    /// location.
+    #[arg(long, global = true, value_name = "PATH")]
+    config: Option<PathBuf>,
 
     #[command(subcommand)]
     cmd: Cmd,
@@ -83,15 +93,47 @@ enum Cmd {
         #[arg(long)]
         include_cued: bool,
     },
+
+    /// Report which acquisition backends are enabled, whether their credentials
+    /// are configured, and whether the external tools they need are installed.
+    ///
+    /// Makes no network calls and never opens master.db — this is the command
+    /// you run to find out why something else is failing.
+    Backends,
+
+    /// Show where config.toml lives, or write a commented starter file.
+    Config {
+        /// Write a starter config.toml, with every value at its default.
+        #[arg(long)]
+        init: bool,
+        /// Overwrite an existing config.toml.
+        #[arg(long, requires = "init")]
+        force: bool,
+    },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let mut db = MasterDb::open()?;
     let safety = SafetyOpts {
         bypass_rekordbox_check: cli.bypass_rekordbox_check,
     };
+    let config_path = paths::config_path(cli.config.as_deref())?;
+
+    // Commands that need neither the database nor rekordbox installed are
+    // handled first, so a broken rekordbox install cannot stop you diagnosing it.
+    match &cli.cmd {
+        Cmd::Backends => {
+            let cfg = Config::load(&config_path)?;
+            let creds = Credentials::load(&paths::credentials_path()?)?;
+            return acquire::report::run(&cfg, &creds, &config_path);
+        }
+        Cmd::Config { init, force } => return run_config(&config_path, *init, *force),
+        _ => {}
+    }
+
+    let mut db = MasterDb::open()?;
     match cli.cmd {
+        Cmd::Backends | Cmd::Config { .. } => unreachable!("handled above"),
         Cmd::Dump { query, limit } => dump::run(&db, query.as_deref(), limit)?,
         Cmd::Tui => tui::run(db, safety)?,
         Cmd::Cp {
@@ -127,6 +169,34 @@ fn main() -> Result<()> {
             },
         )?,
     }
+    Ok(())
+}
+
+fn run_config(path: &std::path::Path, init: bool, force: bool) -> Result<()> {
+    if !init {
+        println!("{}", path.display());
+        if !path.exists() {
+            eprintln!("(does not exist — run `rekord-ripper config --init` to create it)");
+        }
+        return Ok(());
+    }
+
+    if path.exists() && !force {
+        anyhow::bail!(
+            "{} already exists — pass --force to overwrite it",
+            path.display()
+        );
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let body = Config::default().to_toml()?;
+    std::fs::write(path, &body)?;
+    println!("wrote {}", path.display());
+    eprintln!(
+        "note: the Bandcamp identity cookie goes in {} (mode 600), not here.",
+        paths::credentials_path()?.display()
+    );
     Ok(())
 }
 

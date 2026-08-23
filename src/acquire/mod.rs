@@ -4,6 +4,7 @@
 pub mod backend;
 pub mod error;
 pub mod http;
+pub mod report;
 pub mod types;
 
 pub use backend::AcquisitionBackend;
