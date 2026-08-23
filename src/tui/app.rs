@@ -20,6 +20,54 @@ pub enum InputMode {
     Search(Focus),
     Confirm,
     Help,
+    /// The offer table overlay, driven by the background worker.
+    Shop,
+}
+
+/// Where the shop overlay has got to.
+///
+/// The whole point of the worker is that `Searching` is a real state the UI can
+/// render, rather than a frozen screen.
+pub enum ShopState {
+    Idle,
+    Searching {
+        since: Instant,
+        what: String,
+    },
+    Results {
+        outcome: Box<crate::acquire::shop::SearchOutcome>,
+        cursor: usize,
+    },
+    Failed(String),
+}
+
+impl ShopState {
+    /// Rows currently shown, for cursor clamping.
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Results { outcome, .. } => outcome.offers.len(),
+            _ => 0,
+        }
+    }
+
+    pub fn move_cursor(&mut self, delta: isize) {
+        if let Self::Results { outcome, cursor } = self {
+            let n = outcome.offers.len();
+            if n == 0 {
+                *cursor = 0;
+                return;
+            }
+            let next = (*cursor as isize + delta).clamp(0, n as isize - 1);
+            *cursor = next as usize;
+        }
+    }
+
+    pub fn selected(&self) -> Option<&crate::acquire::shop::RankedOffer> {
+        match self {
+            Self::Results { outcome, cursor } => outcome.offers.get(*cursor),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -135,6 +183,11 @@ pub struct App {
     pub dst_filters: DstFilters,
 
     pub status: StatusLine,
+    /// `None` when the worker thread could not be started; searching is then
+    /// simply unavailable rather than the TUI failing to open.
+    pub worker: Option<super::worker::Worker>,
+    pub shop: ShopState,
+    pub cfg: crate::config::Config,
     pub pending: Option<PendingBatch>,
     pub unresolved_errors: bool,
     /// Set true on the first `q` press when there's unsaved selection state.
@@ -145,6 +198,13 @@ pub struct App {
 
 impl App {
     pub fn new(db: MasterDb, safety: SafetyOpts) -> anyhow::Result<Self> {
+        let cfg_path = crate::paths::config_path(None)?;
+        let cfg = crate::config::Config::load(&cfg_path).unwrap_or_default();
+        let creds = crate::config::Credentials::load(&crate::paths::credentials_path()?)
+            .unwrap_or_default();
+        // A worker that will not start costs us searching, not the whole TUI.
+        let worker = super::worker::Worker::spawn(&cfg, &creds).ok();
+
         let rows = load_rows(&db)?;
         let mut app = App {
             db,
@@ -159,6 +219,9 @@ impl App {
             copy_opts: CopyOpts::default(),
             dst_filters: DstFilters::default(),
             status: StatusLine::default(),
+            worker,
+            shop: ShopState::Idle,
+            cfg,
             pending: None,
             unresolved_errors: false,
             quit_pending: false,
@@ -207,6 +270,100 @@ impl App {
             self.rb_running = rekordbox_running();
             self.rb_last_polled = Instant::now();
         }
+    }
+
+    /// Drain the worker. Called every tick; never blocks.
+    pub fn pump_worker(&mut self) {
+        let Some(worker) = self.worker.as_mut() else {
+            return;
+        };
+        for update in worker.drain() {
+            match update {
+                super::worker::Update::Started => {}
+                super::worker::Update::Finished(outcome) => {
+                    let found = outcome.offers.len();
+                    let failed: Vec<String> = outcome
+                        .failures()
+                        .filter_map(|r| r.error.as_ref().map(|e| format!("{}: {e}", r.backend)))
+                        .collect();
+                    self.shop = ShopState::Results { outcome, cursor: 0 };
+                    match (found, failed.is_empty()) {
+                        (0, true) => self.status.warn("no offers found."),
+                        (0, false) => self.status.err(format!("no offers — {}", failed.join("; "))),
+                        (n, true) => self.status.ok(format!("{n} offers.")),
+                        // A partial table is still useful; say what is missing.
+                        (n, false) => self
+                            .status
+                            .warn(format!("{n} offers, degraded — {}", failed.join("; "))),
+                    }
+                }
+                super::worker::Update::Failed(why) => {
+                    self.status.err(format!("search failed: {why}"));
+                    self.shop = ShopState::Failed(why);
+                }
+            }
+        }
+    }
+
+    /// Start a search for the highlighted source track.
+    ///
+    /// Returns false when it could not be started, so the caller can explain why
+    /// rather than opening an overlay that will never fill in.
+    pub fn start_shop(&mut self) -> bool {
+        let Some(track) = self.current_src() else {
+            self.status.warn("no source track selected to search for.");
+            return false;
+        };
+        let title = track.title.trim().to_string();
+        if title.is_empty() {
+            self.status.warn("that track has no title to search for.");
+            return false;
+        }
+        // TrackRow stores these as plain Strings, with empty meaning absent.
+        let artist = Some(track.artist.trim().to_string()).filter(|a| !a.is_empty());
+        let what = format!("{} — {title}", artist.as_deref().unwrap_or("?"));
+
+        let query = crate::acquire::types::SearchQuery {
+            title,
+            artist,
+            duration_secs: track.length,
+            limit: self.cfg.search.limit,
+            ..Default::default()
+        };
+        let opts = crate::acquire::shop::SearchOpts {
+            timeout: std::time::Duration::from_secs(self.cfg.search.timeout_secs.max(1)),
+            enrich_top_n: self.cfg.search.enrich_top_n,
+            ..Default::default()
+        };
+
+        let Some(worker) = self.worker.as_mut() else {
+            self.status
+                .err("the search thread is not running; restart the TUI.");
+            return false;
+        };
+        if worker.is_busy() {
+            self.status.warn("a search is already running.");
+            return false;
+        }
+        if !worker.submit(super::worker::Job::Shop {
+            query,
+            opts: Box::new(opts),
+        }) {
+            self.status.err("could not start the search.");
+            return false;
+        }
+
+        self.status.info(format!("searching for {what} …"));
+        self.shop = ShopState::Searching {
+            since: Instant::now(),
+            what,
+        };
+        self.mode = InputMode::Shop;
+        true
+    }
+
+    pub fn shop_busy(&self) -> bool {
+        self.worker.as_ref().map(|w| w.is_busy()).unwrap_or(false)
     }
 
     pub fn focused_column_mut(&mut self) -> &mut ColumnState {

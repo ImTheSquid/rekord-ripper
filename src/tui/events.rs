@@ -29,6 +29,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         InputMode::Help => {
             app.mode = InputMode::Normal;
         }
+        InputMode::Shop => handle_shop(app, key),
     }
 }
 
@@ -91,6 +92,11 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
         (KeyCode::Char('G'), _) => app.focused_column_mut().jump_bottom(),
         (KeyCode::Char('/'), _) => {
             app.mode = InputMode::Search(app.focus);
+        }
+        // Search online for a better copy of the highlighted source track. Runs
+        // on the worker thread, so the UI keeps drawing while it waits.
+        (KeyCode::Char('s'), _) => {
+            app.start_shop();
         }
         (KeyCode::Char(' '), _) => {
             if let Focus::Dst = app.focus {
@@ -301,5 +307,56 @@ fn apply_pending(app: &mut App) {
             "Applied {ok}/{total}. Failed → {first}{extra}{backup_hint}",
             first = errs[0],
         ));
+    }
+}
+
+/// The offer-table overlay.
+///
+/// Kept read-only on purpose: browsing offers and opening a buy page cannot touch
+/// `master.db`, so nothing here needs the safety preflight. Actually fetching a
+/// file is left to the CLI, where a multi-minute download can show real progress.
+fn handle_shop(app: &mut App, key: KeyEvent) {
+    match (key.code, key.modifiers) {
+        (KeyCode::Esc, _) | (KeyCode::Char('q'), _) => {
+            app.mode = InputMode::Normal;
+        }
+        (KeyCode::Up, _) | (KeyCode::Char('k'), _) => app.shop.move_cursor(-1),
+        (KeyCode::Down, _) | (KeyCode::Char('j'), _) => app.shop.move_cursor(1),
+        (KeyCode::PageUp, _) => app.shop.move_cursor(-10),
+        (KeyCode::PageDown, _) => app.shop.move_cursor(10),
+        (KeyCode::Char('g'), _) => app.shop.move_cursor(isize::MIN / 2),
+        (KeyCode::Char('G'), _) => app.shop.move_cursor(isize::MAX / 2),
+        // Re-run the search for the current source track.
+        (KeyCode::Char('r'), _) => {
+            app.start_shop();
+        }
+        (KeyCode::Enter, _) | (KeyCode::Char('o'), _) => open_selected_offer(app),
+        (KeyCode::Char('y'), _) => copy_selected_ref(app),
+        _ => {}
+    }
+}
+
+/// Open the highlighted offer's page in a browser.
+fn open_selected_offer(app: &mut App) {
+    let Some(offer) = app.shop.selected().map(|r| r.offer.clone()) else {
+        app.status.warn("no offer selected.");
+        return;
+    };
+    match crate::proc::open_url(&offer.url) {
+        Ok(()) => app
+            .status
+            .ok(format!("opened {} in your browser.", offer.title)),
+        Err(e) => app.status.err(format!("could not open a browser: {e}")),
+    }
+}
+
+/// Show the item ref, which is the stable handle for the CLI's --offer.
+fn copy_selected_ref(app: &mut App) {
+    match app.shop.selected() {
+        Some(r) => {
+            let cmd = format!("rekord-ripper fetch --offer {}", r.offer.item_ref);
+            app.status.info(cmd);
+        }
+        None => app.status.warn("no offer selected."),
     }
 }

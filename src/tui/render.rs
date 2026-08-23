@@ -37,6 +37,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     match app.mode {
         InputMode::Confirm => draw_confirm(f, app),
         InputMode::Help => draw_help(f),
+        InputMode::Shop => draw_shop(f, app),
         _ => {}
     }
 }
@@ -303,6 +304,163 @@ fn draw_confirm(f: &mut Frame, app: &App) {
     f.render_widget(para, area);
 }
 
+/// The offer table, and — the reason the worker exists — a live "searching"
+/// state instead of a frozen screen.
+fn draw_shop(f: &mut Frame, app: &App) {
+    use super::app::ShopState;
+
+    let area = popup_area(f.area(), 88, 76);
+    f.render_widget(Clear, area);
+
+    let (title, body_lines): (String, Vec<Line>) = match &app.shop {
+        ShopState::Idle => (" SHOP ".into(), vec![Line::from("nothing to show.")]),
+
+        ShopState::Searching { since, what } => {
+            // Animated from elapsed time, so it visibly advances on every 300ms
+            // tick and the user can tell the difference between working and hung.
+            const FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
+            let secs = since.elapsed().as_secs();
+            let frame = FRAMES[(since.elapsed().as_millis() / 300) as usize % FRAMES.len()];
+            (
+                " SHOP — searching ".into(),
+                vec![
+                    Line::from(vec![
+                        Span::styled(format!("{frame} "), Style::new().fg(Color::Cyan)),
+                        Span::raw(format!("searching for {what}")),
+                    ]),
+                    Line::from(Span::styled(
+                        format!("  {secs}s elapsed"),
+                        Style::new().fg(Color::DarkGray),
+                    )),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "  the interface stays responsive; Esc to hide this",
+                        Style::new().fg(Color::DarkGray),
+                    )),
+                ],
+            )
+        }
+
+        ShopState::Failed(why) => (
+            " SHOP — failed ".into(),
+            vec![Line::from(Span::styled(
+                why.clone(),
+                Style::new().fg(Color::Red),
+            ))],
+        ),
+
+        ShopState::Results { outcome, cursor } => {
+            let mut lines = vec![Line::from(Span::styled(
+                format!(
+                    "{:<2}{:<11} {:<38} {:<18} {:<16} {:<4}",
+                    "", "backend", "artist / title", "formats", "price", "own"
+                ),
+                Style::new().add_modifier(Modifier::BOLD),
+            ))];
+
+            for (i, r) in outcome.offers.iter().enumerate() {
+                let o = &r.offer;
+                let selected = i == *cursor;
+                let style = if selected {
+                    Style::new()
+                        .bg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::new()
+                };
+                // Lossless is the whole point, so mark it in the row itself.
+                let marker = match o.has_lossless() {
+                    Some(true) => "*",
+                    Some(false) => " ",
+                    None => "?",
+                };
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "{marker} {:<11} {:<38} {:<18} {:<16} {:<4}",
+                        o.backend().as_str(),
+                        clip_cell(&format!("{} — {}", o.artist, o.title), 38),
+                        clip_cell(&crate::acquire::render::format_cell(o), 18),
+                        clip_cell(&crate::acquire::render::price_cell(o), 16),
+                        crate::acquire::render::ownership_cell(o),
+                    ),
+                    style,
+                )));
+            }
+
+            if outcome.offers.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "no offers found.",
+                    Style::new().fg(Color::DarkGray),
+                )));
+            }
+
+            // Per-backend failures, so a partial table looks partial.
+            for r in outcome.failures() {
+                if let Some(e) = &r.error {
+                    if !e.is_silently_skippable() {
+                        lines.push(Line::from(Span::styled(
+                            format!("degraded: {}: {e}", r.backend),
+                            Style::new().fg(Color::Yellow),
+                        )));
+                    }
+                }
+            }
+
+            // Currencies are grouped, never converted — say so here too.
+            let cheap = crate::acquire::shop::cheapest_per_currency(&outcome.offers);
+            if !cheap.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "cheapest per currency: {}",
+                        cheap
+                            .iter()
+                            .map(|(p, b)| format!("{p} ({b})"))
+                            .collect::<Vec<_>>()
+                            .join("   ")
+                    ),
+                    Style::new().fg(Color::DarkGray),
+                )));
+                if crate::acquire::shop::has_mixed_currencies(&outcome.offers) {
+                    lines.push(Line::from(Span::styled(
+                        "different currencies are not compared — no exchange rates available",
+                        Style::new().fg(Color::DarkGray),
+                    )));
+                }
+            }
+
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "* lossless   ? not price-checked (only the top few are, to avoid rate limits)",
+                Style::new().fg(Color::DarkGray),
+            )));
+            lines.push(Line::from(Span::styled(
+                "j/k move   Enter/o open in browser   y show fetch command   r re-search   Esc close",
+                Style::new().fg(Color::DarkGray),
+            )));
+            (format!(" SHOP — {} offers ", outcome.offers.len()), lines)
+        }
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(Color::Cyan))
+        .title(title);
+    f.render_widget(Paragraph::new(body_lines).block(block), area);
+}
+
+/// Pad or truncate to exactly `width` display columns.
+fn clip_cell(s: &str, width: usize) -> String {
+    let n = s.chars().count();
+    if n > width {
+        let mut out: String = s.chars().take(width.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    } else {
+        format!("{s:<width$}")
+    }
+}
+
 fn draw_help(f: &mut Frame) {
     let area = popup_area(f.area(), 70, 70);
     f.render_widget(Clear, area);
@@ -313,6 +471,8 @@ Tab / Shift-Tab    Switch focus between SOURCES and DESTINATIONS
 PgUp / PgDn        Page
 g / G              Jump top / bottom
 /                  Search the focused column (Esc/Enter to leave)
+s                  Shop online for the highlighted source track (runs in the
+                   background; the interface stays responsive)
 Ctrl-U             Clear search query (in search mode)
 Space              Toggle destination selection (multi-select)
 c                  Clear destination selection
@@ -324,6 +484,9 @@ R                  Force-reload tracks from master.db
 Enter              Build plans and open confirm modal
 y / Enter          (Confirm) Apply the batch
 n / Esc / q        (Confirm) Cancel
+Enter / o          (Shop) Open the highlighted offer in a browser
+y                  (Shop) Show the fetch command for the highlighted offer
+r                  (Shop) Re-run the search
 ?                  This help
 q / Esc            Quit
 ";
