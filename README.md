@@ -100,5 +100,36 @@ in `credentials.toml` next to `config.toml` (or `BANDCAMP_IDENTITY` in the
 environment). Keep that file mode 600 — it is a full-account credential, not a
 read-only API key.
 
-Rekordbox has no watch-folder feature, so importing a downloaded file is a manual
-drag of the download directory. That costs one drag per batch, not per file.
+Rekordbox has no watch-folder feature, so by default importing a downloaded file
+is a manual drag of the download directory. That costs one drag per batch, not per
+file — or turn on row insertion below and skip it.
+
+## Creating rekordbox rows directly
+
+`rekord-ripper import` writes the `djmdContent` row itself, so a downloaded file
+appears in your collection without the drag. With `--src-track-id` it also runs
+the fingerprint-gated transfer in the same command:
+
+```bash
+rekord-ripper import "new.flac"                            # dry-run: shows every value
+rekord-ripper import "new.flac" --src-track-id 12345678 --apply
+rekord-ripper import --undo 3052064790 --apply             # changed your mind
+```
+
+It reads the file's embedded tags and reuses existing artist/album/genre rows
+rather than duplicating them. Three gates stand in front of it: the config key
+`insert_content_rows` (off by default), `--apply`, and a confirmation showing the
+full row — plus the same running-rekordbox refusal and automatic backup as `cp`.
+
+Undo is a tombstone (`rb_local_deleted = 1` with a USN bump), not a delete,
+because on a cloud-synced library a hard delete would leave your other devices
+holding a row for a file they don't have. Every insert also writes an
+`<backup>.inserted.json` note next to the backup so it can be undone later.
+
+Worth knowing: this is not as exotic as it sounds. `cp` already inserts rows into
+five tables and clears `rb_local_synced`, so it has always written rows your cloud
+agent pushes. The genuinely new part is that a *track* row points at a file, so
+under Cloud Library Sync rekordbox may upload that audio and rewrite `FolderPath`.
+
+`REKORDBOX_DIR` overrides the rekordbox directory, which is how the write paths
+are tested against a copy of `master.db` rather than the real thing.
