@@ -1,5 +1,9 @@
+pub mod acquire;
 pub mod analysis;
+pub mod config;
 pub mod db;
 pub mod dump;
 pub(crate) mod format;
+pub mod paths;
+pub(crate) mod proc;
 pub mod tui;
