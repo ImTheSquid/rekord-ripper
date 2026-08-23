@@ -19,5 +19,13 @@ ratatui = "0.30"
 rusqlite = { version = "0.40.0", features = [
     "bundled-sqlcipher-vendored-openssl",
 ] }
+rusty-chromaprint = "0.3"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+thiserror = "2"
+toml = "0.9"
+# Blocking by design, so no tokio. rustls default rather than native-tls: the
+# build already pays for vendored OpenSSL via rusqlite, and native-tls would
+# mean debugging schannel on Windows as well.
+ureq = { version = "3.4", features = ["cookies", "json"] }
 uuid = { version = "1", features = ["v4"] }
