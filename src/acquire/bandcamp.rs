@@ -1,0 +1,625 @@
+//! The Bandcamp backend.
+//!
+//! Bandcamp has no usable public API for this: the official one is for labels and
+//! fulfilment partners (sales and merch reports) and exposes neither catalogue
+//! search nor downloads. So search uses the same undocumented endpoint their own
+//! site calls, and pricing comes from the JSON blob their pages embed.
+//!
+//! Two things about their responses drive the code below:
+//!
+//! * **Failures arrive as HTTP 200** with `{"error":true,"error_message":...}`.
+//!   Checking the status code alone reads a failure as success, so every response
+//!   is inspected for that field first.
+//! * **`data-cart.currency` is the *viewer's* currency, not the seller's.** On a
+//!   GBP album it reads `USD` from a US IP. Using it would label a £8.50 price as
+//!   dollars. The seller's currency comes from `packages[].currency`, falling back
+//!   to the ISO code rendered next to the price — and if neither is present we
+//!   report the currency as unknown rather than guessing.
+
+use std::sync::OnceLock;
+use std::time::Duration;
+
+use serde::Deserialize;
+
+use super::blob;
+use super::error::{BackendError, Result};
+use super::http;
+use super::types::*;
+use crate::config::{CredentialSource, Credentials, Secret};
+
+const SEARCH_URL: &str = "https://bandcamp.com/api/bcsearch_public_api/1/autocomplete_elastic";
+
+/// `current.download_pref` constants, named in the page blob as `FREE`/`PAID`.
+const DOWNLOAD_PREF_FREE: i64 = 1;
+const DOWNLOAD_PREF_PAID: i64 = 2;
+
+/// The format menu Bandcamp offers for *any* digital download.
+///
+/// Not read from the item page: the format list only exists on the post-purchase
+/// download page, so it cannot be known before buying. This is Bandcamp's
+/// standard menu, used to populate the comparison table. The download page stays
+/// authoritative at fetch time, and a fetch that finds fewer formats reports
+/// `NoAcceptableFormat` naming what was actually there.
+const DIGITAL_FORMATS: &[AudioFormat] = &[
+    AudioFormat::Flac,
+    AudioFormat::Aiff,
+    AudioFormat::Wav,
+    AudioFormat::Alac,
+    AudioFormat::Mp3(Some(320)),
+    AudioFormat::Mp3V0,
+    AudioFormat::Aac(Some(256)),
+    AudioFormat::Ogg,
+];
+
+pub struct Bandcamp {
+    identity: Option<(Secret, CredentialSource)>,
+    budget: Duration,
+    /// Resolved once per process: the collection summary is a single request that
+    /// answers ownership for everything, so it must not be refetched per offer.
+    owned: OnceLock<OwnedSet>,
+}
+
+/// The set of item ids in the user's collection.
+#[derive(Debug, Default)]
+struct OwnedSet {
+    /// `None` when we have no credentials, so "not owned" can be distinguished
+    /// from "we were never able to look".
+    ids: Option<std::collections::HashSet<i64>>,
+}
+
+impl Bandcamp {
+    pub fn new(creds: &Credentials, budget: Duration) -> Self {
+        Self {
+            identity: creds.bandcamp_identity().unwrap_or(None),
+            budget,
+            owned: OnceLock::new(),
+        }
+    }
+
+    fn err_parse(&self, at: &'static str, detail: impl Into<String>) -> BackendError {
+        BackendError::parse(BackendId::Bandcamp, at, detail)
+    }
+}
+
+/// The search endpoint's response.
+#[derive(Debug, Deserialize)]
+struct SearchResponse {
+    #[serde(default)]
+    auto: Option<AutoBlock>,
+    #[serde(default)]
+    error: bool,
+    #[serde(default)]
+    error_message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AutoBlock {
+    #[serde(default)]
+    results: Vec<SearchHit>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchHit {
+    /// `t` = track, `a` = album, `b` = band, `f` = fan.
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    id: Option<i64>,
+    name: Option<String>,
+    band_name: Option<String>,
+    album_name: Option<String>,
+    item_url_path: Option<String>,
+    img: Option<String>,
+}
+
+/// Turn a search response into offers, dropping hits that aren't buyable items.
+///
+/// Split out from the request so it can be tested against a captured response.
+fn parse_search(body: &str, limit: usize) -> Result<Vec<Offer>> {
+    let resp: SearchResponse = serde_json::from_str(body).map_err(|e| {
+        BackendError::parse(BackendId::Bandcamp, "search response", e.to_string())
+    })?;
+
+    // Bandcamp answers 200 on failure, so the body is the only signal.
+    if resp.error {
+        let msg = resp.error_message.unwrap_or_else(|| "unknown error".into());
+        return Err(if msg.contains("logged in") {
+            BackendError::AuthExpired {
+                backend: BackendId::Bandcamp,
+                detail: msg,
+                reauth: Some("https://bandcamp.com/login".into()),
+            }
+        } else {
+            BackendError::parse(BackendId::Bandcamp, "search response", msg)
+        });
+    }
+
+    let hits = resp.auto.map(|a| a.results).unwrap_or_default();
+    let mut offers = Vec::new();
+    for h in hits {
+        if offers.len() >= limit {
+            break;
+        }
+        // Bands and fans are not acquirable, so they are not offers.
+        let kind = match h.kind.as_deref() {
+            Some("t") => ItemKind::Track,
+            Some("a") => ItemKind::Album,
+            _ => continue,
+        };
+        let (Some(id), Some(name), Some(url)) = (h.id, h.name, h.item_url_path) else {
+            continue;
+        };
+        let key = format!("{}:{id}", if kind == ItemKind::Track { "t" } else { "a" });
+        let mut offer = Offer::new(
+            ItemRef::new(BackendId::Bandcamp, key),
+            kind,
+            h.band_name.unwrap_or_default(),
+            name,
+            url,
+        );
+        offer.album = h.album_name;
+        offer.artwork_url = h.img;
+        offers.push(offer);
+    }
+    Ok(offers)
+}
+
+/// Pricing and duration read off an item page.
+#[derive(Debug, PartialEq)]
+pub struct ItemFacts {
+    pub pricing: Pricing,
+    pub duration_secs: Option<i64>,
+    /// True when the page advertises a free download page.
+    pub free_download: bool,
+}
+
+/// Parse an item page's `data-tralbum` blob.
+///
+/// The numeric price comes from the blob (authoritative); the currency comes from
+/// `packages[].currency`, then the rendered ISO code, then nowhere — in which
+/// case it stays unknown and the offer table shows it as such.
+pub fn parse_item_page(html: &str) -> Result<ItemFacts> {
+    let t = blob::attr_json(html, "data-tralbum")
+        .map_err(|e| BackendError::parse(BackendId::Bandcamp, "data-tralbum", e.to_string()))?;
+
+    let current = &t["current"];
+    let download_pref = current["download_pref"].as_i64();
+    let minimum = current["minimum_price"].as_f64();
+    let set_price = current["set_price"].as_f64();
+    // A JSON null here means "not a set price", i.e. name-your-price.
+    let is_set_price = current["is_set_price"].as_bool().unwrap_or(false);
+    let free_download = !t["freeDownloadPage"].is_null();
+
+    let currency = seller_currency(&t, html);
+
+    let pricing = match download_pref {
+        Some(DOWNLOAD_PREF_FREE) => Pricing::Free,
+        Some(DOWNLOAD_PREF_PAID) => {
+            if is_set_price {
+                match (set_price, &currency) {
+                    (Some(p), Some(c)) => Pricing::Flat(Price::from_major(p, c)),
+                    // A price we cannot label is still a price; carry it with an
+                    // explicit unknown currency rather than inventing one.
+                    (Some(p), None) => Pricing::Flat(Price::from_major(p, UNKNOWN_CURRENCY)),
+                    (None, _) => Pricing::Unprobed,
+                }
+            } else {
+                let minimum = minimum.filter(|m| *m > 0.0).map(|m| {
+                    Price::from_major(m, currency.as_deref().unwrap_or(UNKNOWN_CURRENCY))
+                });
+                Pricing::NameYourPrice { minimum }
+            }
+        }
+        // No download preference at all means it is not offered as a download —
+        // streaming-only, or a physical-media-only release.
+        _ => Pricing::Unavailable {
+            reason: Some("no digital download offered".into()),
+        },
+    };
+
+    Ok(ItemFacts {
+        pricing,
+        duration_secs: total_duration_secs(&t),
+        free_download,
+    })
+}
+
+/// Marker for a price whose currency we could not establish. Rendered as-is, so
+/// it is obvious in the table and can never be compared against a real code.
+pub const UNKNOWN_CURRENCY: &str = "???";
+
+/// The *seller's* currency.
+///
+/// Deliberately never `data-cart.currency`, which is the viewer's cart currency
+/// and is wrong for any seller who doesn't price in it.
+fn seller_currency(tralbum: &serde_json::Value, html: &str) -> Option<String> {
+    if let Some(packages) = tralbum["packages"].as_array() {
+        if let Some(c) = packages
+            .iter()
+            .filter_map(|p| p["currency"].as_str())
+            .find(|c| !c.trim().is_empty())
+        {
+            return Some(c.trim().to_ascii_uppercase());
+        }
+    }
+    // Fall back to the ISO code rendered beside the price.
+    rendered_currency(html)
+}
+
+/// The ISO code Bandcamp prints next to a price, e.g.
+/// `<span class="buyItemExtra secondaryText">GBP</span>`.
+fn rendered_currency(html: &str) -> Option<String> {
+    let marker = "buyItemExtra secondaryText\">";
+    let at = html.find(marker)? + marker.len();
+    let rest = html[at..].trim_start();
+    let code: String = rest.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
+    (code.len() == 3).then(|| code.to_ascii_uppercase())
+}
+
+/// Total playing time from `trackinfo`, rounded to whole seconds.
+fn total_duration_secs(tralbum: &serde_json::Value) -> Option<i64> {
+    let tracks = tralbum["trackinfo"].as_array()?;
+    let total: f64 = tracks.iter().filter_map(|t| t["duration"].as_f64()).sum();
+    (total > 0.0).then(|| total.round() as i64)
+}
+
+impl super::AcquisitionBackend for Bandcamp {
+    fn id(&self) -> BackendId {
+        BackendId::Bandcamp
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            search: true,
+            price_quotes: true,
+            // Needs the identity cookie; without it ownership stays Unknown.
+            ownership_check: self.identity.is_some(),
+            requires_purchase: true,
+            fetch: self.identity.is_some(),
+            lossless_capable: true,
+        }
+    }
+
+    fn credentials(&self) -> CredentialState {
+        match &self.identity {
+            Some((secret, source)) => CredentialState::Present {
+                hint: format!("identity cookie, {} bytes, from {source}", secret.len()),
+            },
+            None => CredentialState::Missing {
+                how_to_fix: "put your bandcamp `identity` cookie in credentials.toml, \
+                             or set BANDCAMP_IDENTITY"
+                    .into(),
+            },
+        }
+    }
+
+    fn claim_url(&self, url: &str) -> Option<ItemRef> {
+        // Bandcamp URLs carry a mutable slug, not a stable id, so a claimed URL
+        // keeps the URL as its key and the id is resolved when the page is read.
+        if !url.contains(".bandcamp.com/") {
+            return None;
+        }
+        let kind = if url.contains("/track/") {
+            "url-t"
+        } else if url.contains("/album/") {
+            "url-a"
+        } else {
+            return None;
+        };
+        Some(ItemRef::new(
+            BackendId::Bandcamp,
+            format!("{kind}:{url}"),
+        ))
+    }
+
+    fn search(&self, query: &SearchQuery) -> Result<Vec<Offer>> {
+        let text = query.search_text();
+        if text.is_empty() {
+            return Ok(Vec::new());
+        }
+        let agent = http::agent(self.budget);
+        let body = http::with_retries(3, || {
+            agent
+                .post(SEARCH_URL)
+                .send_json(serde_json::json!({
+                    "search_text": text,
+                    "search_filter": "",
+                    "full_page": false,
+                }))
+                .map_err(|e| http::map_err(BackendId::Bandcamp, SEARCH_URL, e))?
+                .body_mut()
+                .read_to_string()
+                .map_err(|e| http::map_err(BackendId::Bandcamp, SEARCH_URL, e))
+        })?;
+        parse_search(&body, query.limit)
+    }
+
+    fn purchase(&self, item: &ItemRef) -> Result<PurchaseFlow> {
+        // The buy page is the item page — Bandcamp's checkout lives there. There
+        // is no automated purchase path and this tool will not pretend otherwise.
+        Ok(PurchaseFlow::OpenInBrowser {
+            url: item_url(item).ok_or_else(|| self.err_parse("item ref", "no url in ref"))?,
+            note: Some("pay in the browser, then run `rekord-ripper fetch`".into()),
+        })
+    }
+}
+
+/// Recover a browsable URL from an item ref, for refs that carry one.
+fn item_url(item: &ItemRef) -> Option<String> {
+    item.key
+        .strip_prefix("url-t:")
+        .or_else(|| item.key.strip_prefix("url-a:"))
+        .map(|s| s.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SEARCH_FIXTURE: &str = r#"{"auto":{"results":[
+        {"type":"a","id":856850876,"name":"Untrue","band_name":"Burial","album_name":null,
+         "item_url_path":"https://burial.bandcamp.com/album/untrue","img":"https://f4.bcbits.com/img/a.jpg"},
+        {"type":"t","id":2920211424,"name":"Burial","band_name":"JORDI GANCHITOS","album_name":"UNTRUE",
+         "item_url_path":"https://jordiganchitos.bandcamp.com/track/burial","img":null},
+        {"type":"b","id":999,"name":"Some Band","band_name":"Some Band","album_name":null,
+         "item_url_path":"https://someband.bandcamp.com","img":null}
+    ]}}"#;
+
+    #[test]
+    fn parses_a_real_search_response() {
+        let offers = parse_search(SEARCH_FIXTURE, 10).unwrap();
+        // The band hit is dropped: you cannot acquire a band.
+        assert_eq!(offers.len(), 2);
+
+        assert_eq!(offers[0].kind, ItemKind::Album);
+        assert_eq!(offers[0].artist, "Burial");
+        assert_eq!(offers[0].title, "Untrue");
+        assert_eq!(offers[0].item_ref.to_string(), "bandcamp:a:856850876");
+
+        assert_eq!(offers[1].kind, ItemKind::Track);
+        assert_eq!(offers[1].album.as_deref(), Some("UNTRUE"));
+        assert_eq!(offers[1].item_ref.to_string(), "bandcamp:t:2920211424");
+    }
+
+    #[test]
+    fn search_results_start_unprobed() {
+        // Search must not guess at price, formats, or ownership.
+        let o = &parse_search(SEARCH_FIXTURE, 10).unwrap()[0];
+        assert!(matches!(o.pricing, Pricing::Unprobed));
+        assert_eq!(o.formats, None);
+        assert_eq!(o.ownership, Ownership::Unknown);
+    }
+
+    #[test]
+    fn search_respects_the_limit() {
+        assert_eq!(parse_search(SEARCH_FIXTURE, 1).unwrap().len(), 1);
+        assert_eq!(parse_search(SEARCH_FIXTURE, 0).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn an_error_body_with_http_200_is_still_an_error() {
+        // This is the trap: bandcamp answers 200 and puts the failure in the body.
+        let err = parse_search(r#"{"error":true,"error_message":"bad function"}"#, 5).unwrap_err();
+        assert!(matches!(err, BackendError::Parse { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn a_logged_out_error_body_becomes_auth_expired() {
+        // So the message can say "re-paste your cookie" instead of "parse error".
+        let err =
+            parse_search(r#"{"error":true,"error_message":"must be logged in"}"#, 5).unwrap_err();
+        assert!(matches!(err, BackendError::AuthExpired { .. }), "got {err:?}");
+        assert!(err.needs_user_action());
+    }
+
+    #[test]
+    fn an_empty_result_set_is_success_not_failure() {
+        assert!(parse_search(r#"{"auto":{"results":[]}}"#, 5).unwrap().is_empty());
+        assert!(parse_search(r#"{}"#, 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn malformed_hits_are_skipped_rather_than_failing_the_batch() {
+        // One unusable row must not lose the others.
+        let body = r#"{"auto":{"results":[
+            {"type":"t","id":null,"name":"No Id","item_url_path":"https://x/track/y"},
+            {"type":"t","id":1,"name":"Good","band_name":"B","item_url_path":"https://x/track/z"}
+        ]}}"#;
+        let offers = parse_search(body, 10).unwrap();
+        assert_eq!(offers.len(), 1);
+        assert_eq!(offers[0].title, "Good");
+    }
+
+    /// Shaped like the real Untrue page: GBP seller, viewer's cart in USD.
+    const ALBUM_FIXTURE: &str = r#"<html>
+      <div id="pagedata" data-cart="{&quot;currency&quot;:&quot;USD&quot;}"></div>
+      <script data-tralbum="{&quot;item_type&quot;:&quot;album&quot;,&quot;freeDownloadPage&quot;:null,
+        &quot;current&quot;:{&quot;download_pref&quot;:2,&quot;minimum_price&quot;:8.5,
+        &quot;set_price&quot;:9.0,&quot;is_set_price&quot;:null},
+        &quot;packages&quot;:[{&quot;currency&quot;:&quot;GBP&quot;,&quot;price&quot;:10.99}],
+        &quot;trackinfo&quot;:[{&quot;duration&quot;:46.2133},{&quot;duration&quot;:100.0}]}"></script>
+      <span class="buyItemExtra secondaryText">GBP</span>
+      </html>"#;
+
+    #[test]
+    fn uses_the_seller_currency_not_the_viewers_cart_currency() {
+        // The whole point: the cart says USD, the album sells in GBP. Labelling
+        // £8.50 as dollars would make the comparison table lie.
+        let facts = parse_item_page(ALBUM_FIXTURE).unwrap();
+        match facts.pricing {
+            Pricing::NameYourPrice {
+                minimum: Some(price),
+            } => {
+                assert_eq!(price.currency, "GBP");
+                assert_eq!(price.amount_minor, 850);
+            }
+            other => panic!("expected name-your-price with a minimum, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_null_is_set_price_means_name_your_price() {
+        let facts = parse_item_page(ALBUM_FIXTURE).unwrap();
+        assert!(matches!(facts.pricing, Pricing::NameYourPrice { .. }));
+    }
+
+    #[test]
+    fn a_true_is_set_price_means_a_fixed_price() {
+        let html = ALBUM_FIXTURE.replace(
+            "&quot;is_set_price&quot;:null",
+            "&quot;is_set_price&quot;:true",
+        );
+        match parse_item_page(&html).unwrap().pricing {
+            Pricing::Flat(p) => {
+                assert_eq!(p.to_string(), "9.00 GBP", "the set price, not the minimum");
+            }
+            other => panic!("expected a flat price, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sums_track_durations_for_an_album() {
+        assert_eq!(parse_item_page(ALBUM_FIXTURE).unwrap().duration_secs, Some(146));
+    }
+
+    #[test]
+    fn download_pref_one_is_free() {
+        let html = ALBUM_FIXTURE.replace(
+            "&quot;download_pref&quot;:2",
+            "&quot;download_pref&quot;:1",
+        );
+        assert!(matches!(parse_item_page(&html).unwrap().pricing, Pricing::Free));
+    }
+
+    #[test]
+    fn no_download_pref_means_not_acquirable() {
+        // Streaming-only or physical-only: listed, but there is nothing to fetch.
+        let html = r#"<script data-tralbum="{&quot;current&quot;:{},&quot;packages&quot;:[]}"></script>"#;
+        let facts = parse_item_page(html).unwrap();
+        assert!(matches!(facts.pricing, Pricing::Unavailable { .. }));
+        // And it must not be presented as something you can buy.
+        let mut o = Offer::new(
+            ItemRef::new(BackendId::Bandcamp, "a:1"),
+            ItemKind::Album,
+            "A",
+            "T",
+            "u",
+        );
+        o.pricing = facts.pricing;
+        assert_eq!(o.cost_class(), CostClass::Unavailable);
+    }
+
+    #[test]
+    fn a_digital_only_release_falls_back_to_the_rendered_currency() {
+        // No packages array at all, which is the real shape of a digital-only
+        // release; the code beside the price is then the only source.
+        let html = r#"<script data-tralbum="{&quot;current&quot;:{&quot;download_pref&quot;:2,
+            &quot;minimum_price&quot;:3.0,&quot;is_set_price&quot;:true,&quot;set_price&quot;:3.0}}"></script>
+            <span class="buyItemExtra secondaryText">EUR</span>"#;
+        match parse_item_page(html).unwrap().pricing {
+            Pricing::Flat(p) => assert_eq!(p.to_string(), "3.00 EUR"),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unlabelled_price_is_marked_unknown_rather_than_guessed() {
+        // Neither packages nor a rendered code. Inventing USD here would be the
+        // worst possible outcome, so the currency is explicitly unknown.
+        let html = r#"<script data-tralbum="{&quot;current&quot;:{&quot;download_pref&quot;:2,
+            &quot;set_price&quot;:5.0,&quot;is_set_price&quot;:true}}"></script>"#;
+        match parse_item_page(html).unwrap().pricing {
+            Pricing::Flat(p) => {
+                assert_eq!(p.currency, UNKNOWN_CURRENCY);
+                assert_eq!(p.to_string(), "5.00 ???");
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_zero_minimum_is_name_your_price_with_no_floor() {
+        let html = r#"<script data-tralbum="{&quot;current&quot;:{&quot;download_pref&quot;:2,
+            &quot;minimum_price&quot;:0.0,&quot;is_set_price&quot;:null}}"></script>"#;
+        assert_eq!(
+            parse_item_page(html).unwrap().pricing_variant_name(),
+            "NameYourPrice(None)"
+        );
+    }
+
+    #[test]
+    fn a_free_download_page_is_noticed() {
+        let html = r#"<script data-tralbum="{&quot;freeDownloadPage&quot;:&quot;https://bandcamp.com/download?x=1&quot;,
+            &quot;current&quot;:{&quot;download_pref&quot;:2,&quot;minimum_price&quot;:0.0}}"></script>"#;
+        assert!(parse_item_page(html).unwrap().free_download);
+        assert!(!parse_item_page(ALBUM_FIXTURE).unwrap().free_download);
+    }
+
+    #[test]
+    fn a_page_without_the_blob_reports_a_shape_change() {
+        let err = parse_item_page("<html>redesigned</html>").unwrap_err();
+        match err {
+            BackendError::Parse { at, .. } => assert_eq!(at, "data-tralbum"),
+            other => panic!("expected a Parse error naming the blob, got {other:?}"),
+        }
+        // A changed page shape must not be retried.
+        assert!(!parse_item_page("<html/>").unwrap_err().is_retryable());
+    }
+
+    #[test]
+    fn rendered_currency_ignores_anything_that_is_not_a_three_letter_code() {
+        assert_eq!(rendered_currency("class=\"buyItemExtra secondaryText\">GBP<"), Some("GBP".into()));
+        assert_eq!(rendered_currency("class=\"buyItemExtra secondaryText\">or more<"), None);
+        assert_eq!(rendered_currency("nothing here"), None);
+    }
+
+    #[test]
+    fn capabilities_reflect_whether_a_cookie_is_present() {
+        use super::super::AcquisitionBackend;
+        let anon = Bandcamp::new(&Credentials::default(), Duration::from_secs(5));
+        if anon.identity.is_none() {
+            let c = anon.capabilities();
+            assert!(c.search, "search must work without credentials");
+            assert!(!c.fetch, "fetching a purchase needs a session");
+            assert!(!c.ownership_check);
+            assert!(matches!(anon.credentials(), CredentialState::Missing { .. }));
+        }
+    }
+
+    #[test]
+    fn claims_only_bandcamp_item_urls() {
+        use super::super::AcquisitionBackend;
+        let bc = Bandcamp::new(&Credentials::default(), Duration::from_secs(5));
+        assert!(bc.claim_url("https://burial.bandcamp.com/album/untrue").is_some());
+        assert!(bc.claim_url("https://x.bandcamp.com/track/y").is_some());
+        // A band's landing page is not an acquirable item.
+        assert!(bc.claim_url("https://burial.bandcamp.com").is_none());
+        assert!(bc.claim_url("https://soundcloud.com/a/b").is_none());
+    }
+
+    #[test]
+    fn a_claimed_url_round_trips_back_out_for_the_browser() {
+        use super::super::AcquisitionBackend;
+        let bc = Bandcamp::new(&Credentials::default(), Duration::from_secs(5));
+        let url = "https://burial.bandcamp.com/album/untrue";
+        let r = bc.claim_url(url).unwrap();
+        match bc.purchase(&r).unwrap() {
+            PurchaseFlow::OpenInBrowser { url: u, .. } => assert_eq!(u, url),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    // Small helper so a test can assert on a variant without matching every field.
+    impl ItemFacts {
+        fn pricing_variant_name(&self) -> String {
+            match &self.pricing {
+                Pricing::Unprobed => "Unprobed".into(),
+                Pricing::Free => "Free".into(),
+                Pricing::NameYourPrice { minimum: None } => "NameYourPrice(None)".into(),
+                Pricing::NameYourPrice { minimum: Some(_) } => "NameYourPrice(Some)".into(),
+                Pricing::Flat(_) => "Flat".into(),
+                Pricing::PerFormat(_) => "PerFormat".into(),
+                Pricing::Unavailable { .. } => "Unavailable".into(),
+            }
+        }
+    }
+}
