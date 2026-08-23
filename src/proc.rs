@@ -58,7 +58,10 @@ pub fn tool_available(program: &str, version_arg: &str) -> bool {
 ///
 /// Returns `Ok(None)` on timeout, having killed and reaped the child. The caller
 /// decides what a timeout means; this only guarantees no orphan is left behind.
-pub fn wait_until(child: &mut Child, deadline: Instant) -> Result<Option<std::process::ExitStatus>> {
+pub fn wait_until(
+    child: &mut Child,
+    deadline: Instant,
+) -> Result<Option<std::process::ExitStatus>> {
     loop {
         if let Some(status) = child.try_wait()? {
             return Ok(Some(status));
@@ -200,14 +203,20 @@ mod tests {
         let cmd = capture("definitely-not-a-real-binary-xyzzy");
         let err = run_with_deadline(cmd, Instant::now() + Duration::from_secs(5)).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("definitely-not-a-real-binary-xyzzy"), "got: {msg}");
+        assert!(
+            msg.contains("definitely-not-a-real-binary-xyzzy"),
+            "got: {msg}"
+        );
         assert!(msg.contains("not found"), "got: {msg}");
     }
 
     #[test]
     fn tool_available_agrees_with_reality() {
         assert!(tool_available("echo", "--version") || tool_available("/bin/echo", "--version"));
-        assert!(!tool_available("definitely-not-a-real-binary-xyzzy", "--version"));
+        assert!(!tool_available(
+            "definitely-not-a-real-binary-xyzzy",
+            "--version"
+        ));
     }
 
     #[test]

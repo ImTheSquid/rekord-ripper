@@ -142,10 +142,7 @@ pub fn fingerprint_file(path: &Path, window_secs: u32) -> Result<Fingerprint> {
     let mut cmd = proc::capture("ffmpeg");
     cmd.args([
         // Without -nostdin ffmpeg will happily eat the TUI's stdin.
-        "-nostdin",
-        "-v",
-        "error",
-        "-i",
+        "-nostdin", "-v", "error", "-i",
     ])
     .arg(path)
     .args(["-map", "0:a:0"])
@@ -155,14 +152,12 @@ pub fn fingerprint_file(path: &Path, window_secs: u32) -> Result<Fingerprint> {
     .args(["-ar", &rate.to_string(), "-"])
     .stdin(Stdio::null());
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => {
-                anyhow!("ffmpeg not found — install it, or fingerprinting cannot work")
-            }
-            _ => anyhow!("could not run ffmpeg: {e}"),
-        })?;
+    let mut child = cmd.spawn().map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => {
+            anyhow!("ffmpeg not found — install it, or fingerprinting cannot work")
+        }
+        _ => anyhow!("could not run ffmpeg: {e}"),
+    })?;
 
     let mut fp = Fingerprinter::new(&cfg);
     fp.start(rate, 1)
@@ -189,11 +184,11 @@ pub fn fingerprint_file(path: &Path, window_secs: u32) -> Result<Fingerprint> {
             }
             samples.clear();
             let mut bytes = &buf[..n];
-            if let Some(hi) = carry.take() {
-                if let Some((first, rest)) = bytes.split_first() {
-                    samples.push(i16::from_le_bytes([hi, *first]));
-                    bytes = rest;
-                }
+            if let Some(hi) = carry.take()
+                && let Some((first, rest)) = bytes.split_first()
+            {
+                samples.push(i16::from_le_bytes([hi, *first]));
+                bytes = rest;
             }
             let mut chunks = bytes.chunks_exact(2);
             for c in &mut chunks {
@@ -250,8 +245,15 @@ pub fn fingerprint_file(path: &Path, window_secs: u32) -> Result<Fingerprint> {
 /// a speed change produces on a short track, so the speed check needs this.
 pub fn probe_duration_secs(path: &Path) -> Result<f64> {
     let mut cmd = proc::capture("ffprobe");
-    cmd.args(["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0"])
-        .arg(path);
+    cmd.args([
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "csv=p=0",
+    ])
+    .arg(path);
     let out = proc::run_with_deadline(cmd, Instant::now() + Duration::from_secs(30))?;
     if !out.status.success() {
         bail!(
@@ -325,7 +327,12 @@ impl Verdict {
                 "same recording, aligned (score {score:.2}, coverage {coverage:.2}, \
                  shift {shift_ms}ms ±62ms)"
             ),
-            Self::Reject { reason, score, coverage, shift_ms } => match reason {
+            Self::Reject {
+                reason,
+                score,
+                coverage,
+                shift_ms,
+            } => match reason {
                 RejectReason::NoCommonSegment => {
                     "no audio in common — these are different recordings".into()
                 }
@@ -367,12 +374,13 @@ impl SpeedEvidence {
     /// The first ratio that exceeds `tol`, if any.
     fn violation(&self, tol: f64) -> Option<(f64, &'static str)> {
         for (pair, name) in [(self.durations, "duration"), (self.bpms, "bpm")] {
-            if let Some((a, b)) = pair {
-                if a > 0.0 && b > 0.0 {
-                    let ratio = a / b;
-                    if (ratio - 1.0).abs() > tol {
-                        return Some((ratio, name));
-                    }
+            if let Some((a, b)) = pair
+                && a > 0.0
+                && b > 0.0
+            {
+                let ratio = a / b;
+                if (ratio - 1.0).abs() > tol {
+                    return Some((ratio, name));
                 }
             }
         }
@@ -673,7 +681,11 @@ mod tests {
     #[test]
     fn the_accept_message_admits_its_own_resolution_limit() {
         // Claiming exact alignment would be overstating a 124ms-per-item measure.
-        let v = judge(&[seg(0, 0, items_for(118.0), 1.0)], 120.0, SpeedEvidence::default());
+        let v = judge(
+            &[seg(0, 0, items_for(118.0), 1.0)],
+            120.0,
+            SpeedEvidence::default(),
+        );
         assert!(v.summary().contains("±62ms"), "{}", v.summary());
     }
 
@@ -693,7 +705,10 @@ mod tests {
                 score,
                 ..
             } => {
-                assert!(*shift_ms > 3000 && *shift_ms < 3400, "shift was {shift_ms}ms");
+                assert!(
+                    *shift_ms > 3000 && *shift_ms < 3400,
+                    "shift was {shift_ms}ms"
+                );
                 assert!(*score < 2.0, "the recording itself matched fine");
             }
             other => panic!("a shifted pair must be rejected, got {other:?}"),
@@ -705,8 +720,16 @@ mod tests {
 
     #[test]
     fn shift_direction_is_preserved_in_the_reported_value() {
-        let neg = judge(&[seg(0, 26, items_for(118.0), 1.0)], 120.0, SpeedEvidence::default());
-        let pos = judge(&[seg(26, 0, items_for(118.0), 1.0)], 120.0, SpeedEvidence::default());
+        let neg = judge(
+            &[seg(0, 26, items_for(118.0), 1.0)],
+            120.0,
+            SpeedEvidence::default(),
+        );
+        let pos = judge(
+            &[seg(26, 0, items_for(118.0), 1.0)],
+            120.0,
+            SpeedEvidence::default(),
+        );
         assert!(neg.shift_ms() < 0, "got {}", neg.shift_ms());
         assert!(pos.shift_ms() > 0, "got {}", pos.shift_ms());
         assert_eq!(neg.shift_ms(), -pos.shift_ms());
@@ -714,7 +737,11 @@ mod tests {
 
     #[test]
     fn a_one_item_shift_is_rejected_because_one_item_is_already_124ms() {
-        let v = judge(&[seg(1, 0, items_for(118.0), 1.0)], 120.0, SpeedEvidence::default());
+        let v = judge(
+            &[seg(1, 0, items_for(118.0), 1.0)],
+            120.0,
+            SpeedEvidence::default(),
+        );
         assert!(!v.is_accept(), "a single item is ~124ms of drift");
     }
 
@@ -723,7 +750,11 @@ mod tests {
         // Measured against real shifted audio: a 50ms offset resolves to zero
         // items and is accepted. This is the honest floor of the gate, not a bug,
         // and the accept message carries the ±62ms caveat because of it.
-        let v = judge(&[seg(0, 0, items_for(118.0), 1.15)], 120.0, SpeedEvidence::default());
+        let v = judge(
+            &[seg(0, 0, items_for(118.0), 1.15)],
+            120.0,
+            SpeedEvidence::default(),
+        );
         assert!(v.is_accept());
         assert!(
             v.summary().contains("±62ms"),
@@ -933,7 +964,10 @@ mod tests {
             &Thresholds::default(),
             &config(),
         );
-        assert!(v.is_accept(), "a fully-matched shorter file should pass: {v:?}");
+        assert!(
+            v.is_accept(),
+            "a fully-matched shorter file should pass: {v:?}"
+        );
     }
 
     #[test]

@@ -163,7 +163,10 @@ mod tests {
             track_filename(Some("Burial"), Some("Archangel"), "flac"),
             "Burial - Archangel.flac"
         );
-        assert_eq!(track_filename(None, Some("Archangel"), "mp3"), "Archangel.mp3");
+        assert_eq!(
+            track_filename(None, Some("Archangel"), "mp3"),
+            "Archangel.mp3"
+        );
         assert_eq!(track_filename(None, None, "wav"), "untitled.wav");
     }
 
@@ -200,7 +203,11 @@ mod tests {
     #[test]
     fn long_titles_are_capped_below_the_filesystem_limit() {
         let name = track_filename(Some(&"a".repeat(300)), Some(&"b".repeat(300)), "flac");
-        assert!(name.chars().count() <= 156, "got {} chars", name.chars().count());
+        assert!(
+            name.chars().count() <= 156,
+            "got {} chars",
+            name.chars().count()
+        );
     }
 
     #[test]

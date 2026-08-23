@@ -130,7 +130,11 @@ mod tests {
 
     #[test]
     fn other_statuses_keep_their_code_and_url() {
-        let e = map_err(BackendId::Bandcamp, "https://x/y", ureq::Error::StatusCode(404));
+        let e = map_err(
+            BackendId::Bandcamp,
+            "https://x/y",
+            ureq::Error::StatusCode(404),
+        );
         match e {
             BackendError::Http { status, url, .. } => {
                 assert_eq!(status, 404);

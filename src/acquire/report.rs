@@ -7,8 +7,8 @@
 use anyhow::Result;
 use owo_colors::OwoColorize;
 
-use super::types::{Capabilities, CredentialState};
 use super::Registry;
+use super::types::{Capabilities, CredentialState};
 use crate::config::{Config, Credentials};
 use crate::proc;
 
@@ -16,7 +16,11 @@ use crate::proc;
 const TOOLS: &[(&str, &str, &str)] = &[
     ("yt-dlp", "--version", "soundcloud search and rip"),
     ("ffmpeg", "-version", "audio decode for fingerprinting"),
-    ("ffprobe", "-version", "precise duration for the speed pre-filter"),
+    (
+        "ffprobe",
+        "-version",
+        "precise duration for the speed pre-filter",
+    ),
 ];
 
 pub fn run(cfg: &Config, creds: &Credentials, config_path: &std::path::Path) -> Result<()> {
@@ -49,7 +53,11 @@ pub fn run(cfg: &Config, creds: &Credentials, config_path: &std::path::Path) -> 
     }
     for b in reg.iter() {
         let caps = b.capabilities();
-        println!("  {} {}", b.id().to_string().bold(), caps_summary(&caps).dimmed());
+        println!(
+            "  {} {}",
+            b.id().to_string().bold(),
+            caps_summary(&caps).dimmed()
+        );
         match b.credentials() {
             CredentialState::NotRequired => {
                 println!("    auth: {}", "not required".green())
@@ -77,7 +85,11 @@ pub fn run(cfg: &Config, creds: &Credentials, config_path: &std::path::Path) -> 
             tool
         };
         if proc::tool_available(path, flag) {
-            println!("  {} {path} {}", "ok  ".green(), format!("— {why}").dimmed());
+            println!(
+                "  {} {path} {}",
+                "ok  ".green(),
+                format!("— {why}").dimmed()
+            );
         } else {
             println!("  {} {path} {}", "MISS".red(), format!("— {why}").dimmed());
             missing.push(*tool);

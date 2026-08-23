@@ -136,7 +136,10 @@ mod tests {
 
     #[test]
     fn expand_tilde_leaves_absolute_and_relative_paths_alone() {
-        assert_eq!(expand_tilde("/abs/path").unwrap(), PathBuf::from("/abs/path"));
+        assert_eq!(
+            expand_tilde("/abs/path").unwrap(),
+            PathBuf::from("/abs/path")
+        );
         assert_eq!(expand_tilde("rel/path").unwrap(), PathBuf::from("rel/path"));
         // A bare "~" is not the prefix we expand, and must not be mangled.
         assert_eq!(expand_tilde("~").unwrap(), PathBuf::from("~"));

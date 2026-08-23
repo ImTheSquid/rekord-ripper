@@ -528,11 +528,10 @@ fn run_shop(
 
     // A price threshold across currencies is not computable here, so refuse it
     // rather than silently comparing incomparable numbers.
-    if let Some(c) = &args.currency {
-        if c.trim().len() != 3 {
+    if let Some(c) = &args.currency
+        && c.trim().len() != 3 {
             anyhow::bail!("--currency takes a 3-letter ISO code, e.g. GBP");
         }
-    }
 
     let reg = acquire::Registry::from_config(cfg, creds);
     if reg.is_empty() {
@@ -556,15 +555,14 @@ fn run_shop(
         print!("{}", acquire::render::table(&outcome));
     }
 
-    if args.strict {
-        if let Some(first) = outcome.failures().next() {
+    if args.strict
+        && let Some(first) = outcome.failures().next() {
             anyhow::bail!(
                 "{} failed and --strict was given: {}",
                 first.backend,
                 first.error.as_ref().expect("failures() filters on error")
             );
         }
-    }
     if outcome.total_failure() {
         anyhow::bail!("every backend failed — see the errors above");
     }

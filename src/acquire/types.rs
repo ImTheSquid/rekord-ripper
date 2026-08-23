@@ -234,10 +234,10 @@ impl FromStr for AudioFormat {
             "opus" => Self::Opus,
             other => {
                 // Tolerate an unseen "mp3-NNN" rather than failing the whole parse.
-                if let Some(rest) = other.strip_prefix("mp3-") {
-                    if let Ok(k) = rest.parse::<u16>() {
-                        return Ok(Self::Mp3(Some(k)));
-                    }
+                if let Some(rest) = other.strip_prefix("mp3-")
+                    && let Ok(k) = rest.parse::<u16>()
+                {
+                    return Ok(Self::Mp3(Some(k)));
                 }
                 bail!("unknown audio format '{other}'")
             }
@@ -297,11 +297,15 @@ pub enum Pricing {
     #[default]
     Unprobed,
     Free,
-    NameYourPrice { minimum: Option<Price> },
+    NameYourPrice {
+        minimum: Option<Price>,
+    },
     Flat(Price),
     PerFormat(Vec<FormatOffer>),
     /// Listed but not acquirable: sold out, region-locked, streaming only.
-    Unavailable { reason: Option<String> },
+    Unavailable {
+        reason: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -481,7 +485,10 @@ impl Offer {
 
     /// True when money must change hands before `fetch` can work.
     pub fn requires_purchase(&self) -> bool {
-        if matches!(self.ownership, Ownership::Yes { .. } | Ownership::NotApplicable) {
+        if matches!(
+            self.ownership,
+            Ownership::Yes { .. } | Ownership::NotApplicable
+        ) {
             return false;
         }
         matches!(
@@ -532,10 +539,7 @@ pub struct FetchOpts {
 pub enum PurchaseFlow {
     NotRequired,
     AlreadyOwned,
-    OpenInBrowser {
-        url: String,
-        note: Option<String>,
-    },
+    OpenInBrowser { url: String, note: Option<String> },
 }
 
 /// Whether a backend's credentials are present and well-formed. Offline only —
@@ -611,22 +615,37 @@ mod tests {
     #[test]
     fn backend_id_accepts_short_aliases() {
         assert_eq!("bc".parse::<BackendId>().unwrap(), BackendId::Bandcamp);
-        assert_eq!("SoundCloud".parse::<BackendId>().unwrap(), BackendId::SoundCloud);
+        assert_eq!(
+            "SoundCloud".parse::<BackendId>().unwrap(),
+            BackendId::SoundCloud
+        );
         assert!("beatport".parse::<BackendId>().is_err());
     }
 
     #[test]
     fn bandcamp_download_slugs_parse_to_formats() {
         assert_eq!("flac".parse::<AudioFormat>().unwrap(), AudioFormat::Flac);
-        assert_eq!("aiff-lossless".parse::<AudioFormat>().unwrap(), AudioFormat::Aiff);
-        assert_eq!("mp3-320".parse::<AudioFormat>().unwrap(), AudioFormat::Mp3(Some(320)));
-        assert_eq!("aac-hi".parse::<AudioFormat>().unwrap(), AudioFormat::Aac(Some(256)));
+        assert_eq!(
+            "aiff-lossless".parse::<AudioFormat>().unwrap(),
+            AudioFormat::Aiff
+        );
+        assert_eq!(
+            "mp3-320".parse::<AudioFormat>().unwrap(),
+            AudioFormat::Mp3(Some(320))
+        );
+        assert_eq!(
+            "aac-hi".parse::<AudioFormat>().unwrap(),
+            AudioFormat::Aac(Some(256))
+        );
         // V0 is variable-bitrate, so it must not render as a fixed number.
         assert_eq!("mp3-v0".parse::<AudioFormat>().unwrap(), AudioFormat::Mp3V0);
         assert_eq!(AudioFormat::Mp3V0.to_string(), "MP3-V0");
         assert_eq!("vorbis".parse::<AudioFormat>().unwrap(), AudioFormat::Ogg);
         // An unseen bitrate should degrade gracefully, not fail the parse.
-        assert_eq!("mp3-192".parse::<AudioFormat>().unwrap(), AudioFormat::Mp3(Some(192)));
+        assert_eq!(
+            "mp3-192".parse::<AudioFormat>().unwrap(),
+            AudioFormat::Mp3(Some(192))
+        );
         assert!("wma".parse::<AudioFormat>().is_err());
     }
 
@@ -678,9 +697,14 @@ mod tests {
         let mut o = offer();
         o.pricing = Pricing::Flat(Price::new(700, "GBP"));
         assert_eq!(o.cost_class(), CostClass::Paid);
-        o.ownership = Ownership::Yes { redownloadable: true };
+        o.ownership = Ownership::Yes {
+            redownloadable: true,
+        };
         assert_eq!(o.cost_class(), CostClass::AlreadyOwned);
-        assert!(!o.requires_purchase(), "already bought means nothing to buy");
+        assert!(
+            !o.requires_purchase(),
+            "already bought means nothing to buy"
+        );
     }
 
     #[test]
@@ -691,11 +715,19 @@ mod tests {
         o.pricing = Pricing::NameYourPrice {
             minimum: Some(Price::new(0, "GBP")),
         };
-        assert_eq!(o.cost_class(), CostClass::NameYourPrice, "a zero minimum is still NYP");
+        assert_eq!(
+            o.cost_class(),
+            CostClass::NameYourPrice,
+            "a zero minimum is still NYP"
+        );
         o.pricing = Pricing::NameYourPrice {
             minimum: Some(Price::new(400, "GBP")),
         };
-        assert_eq!(o.cost_class(), CostClass::Paid, "a real minimum means you pay");
+        assert_eq!(
+            o.cost_class(),
+            CostClass::Paid,
+            "a real minimum means you pay"
+        );
     }
 
     #[test]
@@ -713,7 +745,11 @@ mod tests {
             AudioFormat::Flac,
             AudioFormat::Aiff,
         ]);
-        let pref = vec![AudioFormat::Aiff, AudioFormat::Flac, AudioFormat::Mp3(Some(320))];
+        let pref = vec![
+            AudioFormat::Aiff,
+            AudioFormat::Flac,
+            AudioFormat::Mp3(Some(320)),
+        ];
         assert_eq!(o.best_format(&pref), Some(AudioFormat::Aiff));
         assert_eq!(o.has_lossless(), Some(true));
     }

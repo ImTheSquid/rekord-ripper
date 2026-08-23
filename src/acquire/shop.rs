@@ -480,7 +480,9 @@ mod tests {
     fn an_already_owned_offer_outranks_everything_paid() {
         let mut owned = offer(BackendId::Bandcamp, "song", "a");
         owned.formats = Some(vec![AudioFormat::Flac]);
-        owned.ownership = Ownership::Yes { redownloadable: true };
+        owned.ownership = Ownership::Yes {
+            redownloadable: true,
+        };
         owned.pricing = Pricing::Flat(Price::new(900, "GBP"));
 
         let mut paid = offer(BackendId::Bandcamp, "song2", "a");
@@ -630,7 +632,10 @@ mod tests {
 
         assert!(passes_filters(&flac, &opts));
         assert!(!passes_filters(&mp3, &opts));
-        assert!(!passes_filters(&unprobed, &opts), "unknown is not proof of lossless");
+        assert!(
+            !passes_filters(&unprobed, &opts),
+            "unknown is not proof of lossless"
+        );
     }
 
     #[test]

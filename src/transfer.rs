@@ -34,8 +34,13 @@ pub enum AudioSource {
     /// A rekordbox streaming row. `FolderPath` holds a service URI such as
     /// `soundcloud:tracks:123`, and there is no local audio — so the reference
     /// side of the comparison has to be fetched just to be fingerprinted.
-    Streaming { uri: String, url: String },
-    Unavailable { reason: String },
+    Streaming {
+        uri: String,
+        url: String,
+    },
+    Unavailable {
+        reason: String,
+    },
 }
 
 /// Decide how to get at a track's audio.
@@ -92,21 +97,21 @@ pub fn gate(
 
     // A duration difference beyond tolerance means these are not the same cut,
     // and it costs nothing to notice.
-    if let (Some(a), Some(b)) = (src.length, dst_length) {
-        if (a - b).abs() > cfg.fingerprint.duration_tol_secs {
-            return Ok(GateOutcome {
-                verdict: Verdict::Reject {
-                    reason: fp::RejectReason::Coverage {
-                        got: 0.0,
-                        min: t.coverage_min,
-                    },
-                    score: f64::NAN,
-                    coverage: 0.0,
-                    shift_ms: ((a - b) * 1000) as i64,
+    if let (Some(a), Some(b)) = (src.length, dst_length)
+        && (a - b).abs() > cfg.fingerprint.duration_tol_secs
+    {
+        return Ok(GateOutcome {
+            verdict: Verdict::Reject {
+                reason: fp::RejectReason::Coverage {
+                    got: 0.0,
+                    min: t.coverage_min,
                 },
-                durations: None,
-            });
-        }
+                score: f64::NAN,
+                coverage: 0.0,
+                shift_ms: ((a - b) * 1000),
+            },
+            durations: None,
+        });
     }
 
     let source = resolve_audio_source(src);
@@ -144,9 +149,7 @@ pub fn gate(
 
     let bpms = match (src.bpm, dst_bpm) {
         // BPM is stored ×100.
-        (Some(a), Some(b)) if a > 0 && b > 0 => {
-            Some((a as f64 / 100.0, b as f64 / 100.0))
-        }
+        (Some(a), Some(b)) if a > 0 && b > 0 => Some((a as f64 / 100.0, b as f64 / 100.0)),
         _ => None,
     };
 
@@ -270,11 +273,7 @@ pub fn process(
 /// hoisted here so it is actually seen.
 pub fn report(plan: &analysis::Plan, verdict: &Verdict) -> String {
     let mut s = String::new();
-    s.push_str(&format!(
-        "{} {}\n",
-        "fp ok".green().to_string(),
-        verdict.summary()
-    ));
+    s.push_str(&format!("{} {}\n", "fp ok".green(), verdict.summary()));
     s.push_str(&plan.render());
     if !plan.warnings.is_empty() {
         s.push('\n');
