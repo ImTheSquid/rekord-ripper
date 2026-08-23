@@ -21,18 +21,34 @@
 //! it is in (already bounded by the HTTP timeout) rather than blocking the user's
 //! exit on it.
 
+use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use std::time::{Duration, Instant};
 
 use crate::acquire::Registry;
 use crate::acquire::shop::{self, SearchOpts, SearchOutcome};
-use crate::acquire::types::SearchQuery;
+use crate::acquire::types::{
+    AcquiredFile, AudioFormat, FetchOpts, ItemRef, Retention, SearchQuery,
+};
 use crate::config::{Config, Credentials};
+
+/// Ceiling for one download, including any wait while bandcamp prepares it.
+const FETCH_BUDGET: Duration = Duration::from_secs(1800);
 
 /// Work the UI can ask for.
 pub enum Job {
     Shop {
         query: SearchQuery,
         opts: Box<SearchOpts>,
+    },
+    /// Download an offer. Long-running by nature — a purchased FLAC is tens of
+    /// megabytes and bandcamp may need minutes to prepare it — which is exactly
+    /// why it belongs here rather than in a key handler.
+    Fetch {
+        item: ItemRef,
+        dest: PathBuf,
+        format_pref: Vec<AudioFormat>,
+        overwrite: bool,
     },
 }
 
@@ -42,7 +58,16 @@ pub enum Update {
     Started,
     /// Boxed because a `SearchOutcome` is large and this moves through a channel.
     Finished(Box<SearchOutcome>),
+    /// A fetch finished. `Ok` carries where the files landed.
+    Fetched(Box<Result<Vec<AcquiredFile>, String>>),
     Failed(String),
+}
+
+impl Update {
+    /// True when this ends the job the UI is waiting on.
+    fn is_terminal(&self) -> bool {
+        matches!(self, Self::Finished(_) | Self::Fetched(_) | Self::Failed(_))
+    }
 }
 
 pub struct Worker {
@@ -75,6 +100,34 @@ impl Worker {
                             }
                             let outcome = shop::search_all(&reg, &query, &opts);
                             if up_tx.send(Update::Finished(Box::new(outcome))).is_err() {
+                                return;
+                            }
+                        }
+                        Job::Fetch {
+                            item,
+                            dest,
+                            format_pref,
+                            overwrite,
+                        } => {
+                            if up_tx.send(Update::Started).is_err() {
+                                return;
+                            }
+                            let result = match reg.get(item.backend) {
+                                None => Err(format!("{} is not enabled", item.backend)),
+                                Some(backend) => backend
+                                    .fetch(
+                                        &item,
+                                        &FetchOpts {
+                                            dest_dir: dest,
+                                            format_pref,
+                                            retention: Retention::Keep,
+                                            overwrite,
+                                            deadline: Instant::now() + FETCH_BUDGET,
+                                        },
+                                    )
+                                    .map_err(|e| e.to_string()),
+                            };
+                            if up_tx.send(Update::Fetched(Box::new(result))).is_err() {
                                 return;
                             }
                         }
@@ -114,7 +167,7 @@ impl Worker {
         loop {
             match self.updates.try_recv() {
                 Ok(u) => {
-                    if matches!(u, Update::Finished(_) | Update::Failed(_)) {
+                    if u.is_terminal() {
                         self.busy = false;
                     }
                     out.push(u);

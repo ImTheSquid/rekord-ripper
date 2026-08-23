@@ -46,7 +46,10 @@ fn try_quit(app: &mut App) {
     app.quit_pending = true;
     let mut bits = Vec::new();
     if !app.dst.selected.is_empty() {
-        bits.push(format!("{} destination(s) selected", app.dst.selected.len()));
+        bits.push(format!(
+            "{} destination(s) selected",
+            app.dst.selected.len()
+        ));
     }
     if app.unresolved_errors {
         bits.push("unresolved apply errors".into());
@@ -330,8 +333,13 @@ fn handle_shop(app: &mut App, key: KeyEvent) {
         (KeyCode::Char('r'), _) => {
             app.start_shop();
         }
-        (KeyCode::Enter, _) | (KeyCode::Char('o'), _) => open_selected_offer(app),
-        (KeyCode::Char('y'), _) => copy_selected_ref(app),
+        // Enter does the useful thing: download it.
+        (KeyCode::Enter, _) | (KeyCode::Char('f'), _) => {
+            app.start_fetch();
+        }
+        // Opening the page is for buying something you don't own yet.
+        (KeyCode::Char('o'), _) => open_selected_offer(app),
+        (KeyCode::Char('y'), _) => show_selected_ref(app),
         _ => {}
     }
 }
@@ -350,12 +358,12 @@ fn open_selected_offer(app: &mut App) {
     }
 }
 
-/// Show the item ref, which is the stable handle for the CLI's --offer.
-fn copy_selected_ref(app: &mut App) {
+/// Show the stable item ref, for scripting or a follow-up CLI run.
+fn show_selected_ref(app: &mut App) {
     match app.shop.selected() {
         Some(r) => {
-            let cmd = format!("rekord-ripper fetch --offer {}", r.offer.item_ref);
-            app.status.info(cmd);
+            let r = r.offer.item_ref.to_string();
+            app.status.info(r);
         }
         None => app.status.warn("no offer selected."),
     }
