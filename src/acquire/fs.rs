@@ -102,6 +102,54 @@ pub fn place(src: &Path, dest_dir: &Path, overwrite: bool) -> Result<PathBuf> {
     Ok(target)
 }
 
+/// Leading bytes that mean "this is markup, not audio".
+///
+/// The specific failure this exists to prevent: Bandcamp answers a
+/// not-yet-prepared download with an HTML page, and writing that out under a
+/// `.flac` name gives rekordbox a file it will import and analyse into nonsense.
+/// A wrong file that looks plausible is worse than a failed download.
+fn looks_like_markup(head: &[u8]) -> bool {
+    let s = String::from_utf8_lossy(head);
+    let t = s.trim_start().to_ascii_lowercase();
+    t.starts_with("<!doctype")
+        || t.starts_with("<html")
+        || t.starts_with("<?xml")
+        || t.starts_with("<head")
+}
+
+/// Like [`write_atomically`], but refuses to write markup to an audio path.
+pub fn write_audio_atomically(target: &Path, reader: &mut impl Read) -> Result<u64> {
+    // Peek before committing, so an interstitial never reaches the target name.
+    let mut head = [0u8; 64];
+    let mut filled = 0;
+    while filled < head.len() {
+        match reader.read(&mut head[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) => return Err(BackendError::Io(e)),
+        }
+    }
+    let head = &head[..filled];
+    if filled == 0 {
+        return Err(BackendError::Other(anyhow::anyhow!(
+            "download produced no data"
+        )));
+    }
+    if looks_like_markup(head) {
+        return Err(BackendError::Other(anyhow::anyhow!(
+            "the server sent an HTML page instead of audio — refusing to save it as {}",
+            target
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        )));
+    }
+
+    // Put the peeked bytes back in front of the rest of the stream.
+    let mut full = std::io::Read::chain(std::io::Cursor::new(head.to_vec()), reader);
+    write_atomically(target, &mut full)
+}
+
 /// Stream `reader` to `target` via a `.part` sibling, renaming only on success.
 ///
 /// The temporary is removed if the copy fails, so a failed download leaves
@@ -270,6 +318,85 @@ mod tests {
         assert_eq!(n, 10);
         assert_eq!(std::fs::read(&target).unwrap(), b"audio data");
         assert!(!dir.join("out.flac.part").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn refuses_to_save_an_html_page_as_audio() {
+        // The real regression: bandcamp answers a not-yet-prepared download with
+        // its download page, and this used to land as a 229KB ".flac" that
+        // rekordbox would happily import and analyse into nonsense.
+        let dir = tmp();
+        let target = dir.join("track.flac");
+        let page = b"<!DOCTYPE html>\n<html><head><title>Bandcamp</title></head><body>preparing</body></html>";
+        let mut src = std::io::Cursor::new(page.to_vec());
+
+        let err = write_audio_atomically(&target, &mut src).unwrap_err();
+        assert!(
+            err.to_string().contains("HTML page instead of audio"),
+            "got: {err}"
+        );
+        assert!(!target.exists(), "nothing may be written");
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            0,
+            "not even a .part"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn detects_markup_regardless_of_leading_whitespace_or_case() {
+        // The observed page began with spaces and newlines before the doctype.
+        assert!(looks_like_markup(b"    \n\n<!DOCTYPE html>"));
+        assert!(looks_like_markup(b"<html>"));
+        assert!(looks_like_markup(b"<?xml version=\"1.0\"?>"));
+        assert!(looks_like_markup(b"<!doctype HTML"));
+    }
+
+    #[test]
+    fn real_audio_magic_is_not_mistaken_for_markup() {
+        assert!(!looks_like_markup(b"fLaC\x00\x00\x00\x22"));
+        assert!(!looks_like_markup(b"FORM\x00\x00AIFF"));
+        assert!(!looks_like_markup(b"RIFF\x00\x00\x00\x00WAVE"));
+        assert!(!looks_like_markup(b"ID3\x04\x00"));
+        assert!(!looks_like_markup(&[0xff, 0xfb, 0x90, 0x00]));
+    }
+
+    #[test]
+    fn audio_shorter_than_the_peek_buffer_still_writes() {
+        // A stream that ends inside the 64-byte peek must not be truncated or
+        // rejected.
+        let dir = tmp();
+        let target = dir.join("tiny.flac");
+        let mut src = std::io::Cursor::new(b"fLaC short".to_vec());
+        let n = write_audio_atomically(&target, &mut src).unwrap();
+        assert_eq!(n, 10);
+        assert_eq!(std::fs::read(&target).unwrap(), b"fLaC short");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_peeked_bytes_are_not_lost_from_a_longer_stream() {
+        // The head is read before the decision, so it has to be put back.
+        let dir = tmp();
+        let target = dir.join("big.flac");
+        let mut body = b"fLaC".to_vec();
+        body.extend(std::iter::repeat_n(b'A', 500));
+        let mut src = std::io::Cursor::new(body.clone());
+        let n = write_audio_atomically(&target, &mut src).unwrap();
+        assert_eq!(n as usize, body.len());
+        assert_eq!(std::fs::read(&target).unwrap(), body);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_empty_audio_download_is_an_error() {
+        let dir = tmp();
+        let target = dir.join("empty.flac");
+        let mut src = std::io::Cursor::new(Vec::new());
+        assert!(write_audio_atomically(&target, &mut src).is_err());
+        assert!(!target.exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 
