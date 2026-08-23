@@ -257,6 +257,105 @@ pub fn parse_download_page(html: &str) -> Result<std::collections::HashMap<Audio
     Ok(out)
 }
 
+/// Longest we will wait for Bandcamp to prepare a download.
+///
+/// Measured: a file nobody has downloaded before returns an HTML interstitial for
+/// **longer than two minutes**, then serves the audio instantly once ready. Two
+/// minutes was not enough and produced a spurious timeout, so this is generous.
+const READY_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Longest gap between re-asks.
+const READY_MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Fetch the audio, waiting out Bandcamp's "preparing your download" page.
+///
+/// Bandcamp prepares a purchased file **asynchronously**. The first request for a
+/// download URL usually returns an HTML interstitial (the download page again,
+/// with `ready: false`) rather than audio; a later request returns the file. So
+/// this cannot be a single GET.
+///
+/// Two rules, both learned by writing a 229KB HTML page out as a `.flac`:
+///
+/// * A response is only written if it is actually audio. Content-Type is the
+///   primary signal, and the leading bytes are checked as a backstop — an HTML
+///   page saved with an audio extension is the worst possible outcome here,
+///   because rekordbox will import it and analyse it into nonsense.
+/// * The interstitial carries a fresh download URL, so each retry re-reads it
+///   instead of hammering a URL that may have expired.
+fn download_when_ready(
+    agent: &ureq::Agent,
+    first_url: &str,
+    cookie: &str,
+    format: AudioFormat,
+    target: &std::path::Path,
+) -> Result<u64> {
+    let mut url = first_url.to_string();
+    let mut delay = Duration::from_secs(2);
+    let started = std::time::Instant::now();
+    let mut attempt = 0u32;
+
+    while started.elapsed() < READY_TIMEOUT {
+        attempt += 1;
+        let mut resp = agent
+            .get(&url)
+            .header("Cookie", cookie)
+            .call()
+            .map_err(|e| http::map_err(BackendId::Bandcamp, &url, e))?;
+
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+
+        if !content_type.starts_with("text/html") {
+            let mut reader = resp.body_mut().as_reader();
+            return super::fs::write_audio_atomically(target, &mut reader);
+        }
+
+        // An interstitial. Re-read it for a fresh link and wait.
+        let body = resp
+            .body_mut()
+            .read_to_string()
+            .map_err(|e| http::map_err(BackendId::Bandcamp, &url, e))?;
+        if attempt == 1 {
+            eprintln!(
+                "  bandcamp is preparing this download — a file nobody has fetched before can \
+                 take several minutes. Waiting up to {}s.",
+                READY_TIMEOUT.as_secs()
+            );
+        } else {
+            eprintln!(
+                "  still preparing ({}s elapsed, attempt {attempt})",
+                started.elapsed().as_secs()
+            );
+        }
+        match parse_download_page(&body) {
+            Ok(links) => match links.get(&format) {
+                Some(fresh) if *fresh != url => url = fresh.clone(),
+                Some(_) => {}
+                None => {
+                    return Err(BackendError::parse(
+                        BackendId::Bandcamp,
+                        "download retry page",
+                        format!("{format} is no longer offered"),
+                    ));
+                }
+            },
+            Err(e) => eprintln!("  (could not re-read the download page: {e})"),
+        }
+        std::thread::sleep(delay);
+        delay = (delay * 2).min(READY_MAX_BACKOFF);
+    }
+
+    Err(BackendError::Timeout {
+        backend: BackendId::Bandcamp,
+        op: "waiting for bandcamp to prepare the download — try again in a few minutes",
+        elapsed: started.elapsed(),
+    })
+}
+
 /// Artist and title from a download page, for naming the file.
 fn item_artist(html: &str) -> Option<String> {
     blob::id_attr_json(html, "pagedata", "data-blob")
@@ -760,12 +859,7 @@ impl super::AcquisitionBackend for Bandcamp {
         );
         let target = super::fs::unique_path(&opts.dest_dir.join(name));
 
-        let mut resp = agent
-            .get(&url)
-            .header("Cookie", &cookie)
-            .call()
-            .map_err(|e| http::map_err(BackendId::Bandcamp, &url, e))?;
-        let bytes = super::fs::write_atomically(&target, &mut resp.body_mut().as_reader())?;
+        let bytes = download_when_ready(&agent, &url, &cookie, chosen, &target)?;
 
         Ok(vec![AcquiredFile {
             path: target,
