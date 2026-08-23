@@ -2,6 +2,8 @@
 //! the offers, buy or rip, and hand the file to the analysis-copy pipeline.
 
 pub mod backend;
+pub mod bandcamp;
+pub mod blob;
 pub mod error;
 pub mod http;
 pub mod report;
@@ -27,11 +29,13 @@ impl Registry {
     /// Build from config. Disabled backends are absent entirely; a backend
     /// missing its credentials is still present, so `backends` can report *why*
     /// it is unusable rather than silently omitting it.
-    pub fn from_config(_cfg: &Config, _creds: &Credentials) -> Self {
-        // Backends are registered here as they land.
-        Self {
-            backends: Vec::new(),
+    pub fn from_config(cfg: &Config, creds: &Credentials) -> Self {
+        let budget = std::time::Duration::from_secs(cfg.search.timeout_secs.max(1));
+        let mut backends: Vec<Box<dyn AcquisitionBackend>> = Vec::new();
+        if cfg.bandcamp.enabled {
+            backends.push(Box::new(bandcamp::Bandcamp::new(creds, budget)));
         }
+        Self { backends }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -91,12 +95,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_empty_registry_is_reported_as_empty() {
+    fn default_config_registers_the_enabled_backends() {
         let reg = Registry::from_config(&Config::default(), &Credentials::default());
-        assert!(reg.is_empty());
-        assert_eq!(reg.searchable().count(), 0);
+        assert!(!reg.is_empty());
+        assert!(reg.get(BackendId::Bandcamp).is_some());
+        // Search must be available before anything is configured.
+        assert!(reg.searchable().any(|b| b.id() == BackendId::Bandcamp));
+    }
+
+    #[test]
+    fn a_disabled_backend_is_absent_entirely() {
+        let mut cfg = Config::default();
+        cfg.bandcamp.enabled = false;
+        let reg = Registry::from_config(&cfg, &Credentials::default());
         assert!(reg.get(BackendId::Bandcamp).is_none());
-        assert!(reg.claim_url("https://soundcloud.com/a/b").is_none());
+    }
+
+    #[test]
+    fn url_claiming_routes_to_the_owning_backend() {
+        let reg = Registry::from_config(&Config::default(), &Credentials::default());
+        let (b, r) = reg
+            .claim_url("https://burial.bandcamp.com/album/untrue")
+            .expect("bandcamp should claim its own album url");
+        assert_eq!(b.id(), BackendId::Bandcamp);
+        assert_eq!(r.backend, BackendId::Bandcamp);
+        assert!(reg.claim_url("https://example.com/whatever").is_none());
     }
 
     #[test]

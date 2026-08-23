@@ -282,13 +282,13 @@ impl std::fmt::Display for Price {
 
 /// One purchasable format, for stores that price per format (24-bit vs 16-bit).
 /// `price: None` means "covered by the item price".
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FormatOffer {
     pub format: AudioFormat,
     pub price: Option<Price>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Pricing {
     /// Not probed yet. Renders as `?` — never as free, never as 0.00.
