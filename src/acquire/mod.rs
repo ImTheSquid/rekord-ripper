@@ -6,7 +6,10 @@ pub mod bandcamp;
 pub mod blob;
 pub mod error;
 pub mod http;
+pub mod render;
 pub mod report;
+pub mod shop;
+pub mod soundcloud;
 pub mod types;
 
 pub use backend::AcquisitionBackend;
@@ -34,6 +37,13 @@ impl Registry {
         let mut backends: Vec<Box<dyn AcquisitionBackend>> = Vec::new();
         if cfg.bandcamp.enabled {
             backends.push(Box::new(bandcamp::Bandcamp::new(creds, budget)));
+        }
+        if cfg.soundcloud.enabled {
+            backends.push(Box::new(soundcloud::SoundCloud::new(
+                &cfg.soundcloud.yt_dlp_path,
+                cfg.soundcloud.extra_args.clone(),
+                budget,
+            )));
         }
         Self { backends }
     }

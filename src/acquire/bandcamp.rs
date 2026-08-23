@@ -28,6 +28,7 @@ use super::types::*;
 use crate::config::{CredentialSource, Credentials, Secret};
 
 const SEARCH_URL: &str = "https://bandcamp.com/api/bcsearch_public_api/1/autocomplete_elastic";
+const COLLECTION_SUMMARY_URL: &str = "https://bandcamp.com/api/fan/2/collection_summary";
 
 /// `current.download_pref` constants, named in the page blob as `FREE`/`PAID`.
 const DOWNLOAD_PREF_FREE: i64 = 1;
@@ -59,12 +60,80 @@ pub struct Bandcamp {
     owned: OnceLock<OwnedSet>,
 }
 
-/// The set of item ids in the user's collection.
+/// What the user owns.
+///
+/// Keyed by Bandcamp's own `"t<id>"` / `"a<id>"` lookup strings.
 #[derive(Debug, Default)]
 struct OwnedSet {
-    /// `None` when we have no credentials, so "not owned" can be distinguished
-    /// from "we were never able to look".
-    ids: Option<std::collections::HashSet<i64>>,
+    /// `None` when we could not look at all, so "not owned" stays distinct from
+    /// "unknown" — reporting an unchecked item as unowned would push the user
+    /// towards buying something twice.
+    keys: Option<std::collections::HashSet<String>>,
+}
+
+impl OwnedSet {
+    fn contains(&self, kind: ItemKind, id: i64) -> Ownership {
+        let Some(keys) = &self.keys else {
+            return Ownership::Unknown;
+        };
+        let prefix = if kind == ItemKind::Track { 't' } else { 'a' };
+        if keys.contains(&format!("{prefix}{id}")) {
+            Ownership::Yes {
+                redownloadable: true,
+            }
+        } else {
+            Ownership::No
+        }
+    }
+}
+
+/// Parse `/api/fan/2/collection_summary`.
+///
+/// Returns `None` when the response says we are not logged in, so the caller can
+/// report an expired session rather than an empty collection.
+fn parse_collection_summary(body: &str) -> Result<std::collections::HashSet<String>> {
+    let v: serde_json::Value = serde_json::from_str(body).map_err(|e| {
+        BackendError::parse(BackendId::Bandcamp, "collection_summary", e.to_string())
+    })?;
+    if v["error"].as_bool().unwrap_or(false) {
+        let msg = v["error_message"]
+            .as_str()
+            .unwrap_or("unknown error")
+            .to_string();
+        return Err(BackendError::AuthExpired {
+            backend: BackendId::Bandcamp,
+            detail: msg,
+            reauth: Some("https://bandcamp.com/login".into()),
+        });
+    }
+    let lookup = &v["collection_summary"]["tralbum_lookup"];
+    let Some(map) = lookup.as_object() else {
+        // A logged-in fan with an empty collection is legitimate.
+        return Ok(std::collections::HashSet::new());
+    };
+    Ok(map.keys().cloned().collect())
+}
+
+/// Item keys are `<t|a>:<id>:<url>`.
+///
+/// The URL is carried in the key rather than looked up because Bandcamp gives no
+/// way to turn a numeric id back into a page URL — so without it a saved ref
+/// could not be opened in a browser later. The id stays the identity; the URL is
+/// just along for the ride, and Bandcamp slug changes only affect the latter.
+fn item_key(kind: ItemKind, id: i64, url: &str) -> String {
+    let prefix = if kind == ItemKind::Track { "t" } else { "a" };
+    format!("{prefix}:{id}:{url}")
+}
+
+/// Split an item key into its kind and numeric id.
+fn parse_item_key(key: &str) -> Option<(ItemKind, i64)> {
+    let mut parts = key.splitn(3, ':');
+    let kind = match parts.next()? {
+        "t" => ItemKind::Track,
+        "a" => ItemKind::Album,
+        _ => return None,
+    };
+    Some((kind, parts.next()?.parse().ok()?))
 }
 
 impl Bandcamp {
@@ -78,6 +147,72 @@ impl Bandcamp {
 
     fn err_parse(&self, at: &'static str, detail: impl Into<String>) -> BackendError {
         BackendError::parse(BackendId::Bandcamp, at, detail)
+    }
+
+    /// The collection, fetched at most once per process.
+    ///
+    /// One request answers ownership for everything, which is exactly why
+    /// `enrich` takes a slice: doing this per offer would multiply it by N.
+    fn owned(&self) -> &OwnedSet {
+        self.owned.get_or_init(|| {
+            let Some((secret, _)) = &self.identity else {
+                return OwnedSet::default();
+            };
+            let agent = http::agent(self.budget);
+            let result = agent
+                .get(COLLECTION_SUMMARY_URL)
+                .header("Cookie", &format!("identity={}", secret.expose()))
+                .call()
+                .map_err(|e| http::map_err(BackendId::Bandcamp, COLLECTION_SUMMARY_URL, e))
+                .and_then(|mut r| {
+                    r.body_mut().read_to_string().map_err(|e| {
+                        http::map_err(BackendId::Bandcamp, COLLECTION_SUMMARY_URL, e)
+                    })
+                })
+                .and_then(|body| parse_collection_summary(&body));
+
+            match result {
+                Ok(keys) => OwnedSet { keys: Some(keys) },
+                Err(e) => {
+                    // Ownership stays Unknown rather than No: telling the user
+                    // they don't own something we failed to check could have
+                    // them buy it twice.
+                    eprintln!("warning: could not read your bandcamp collection: {e}");
+                    OwnedSet::default()
+                }
+            }
+        })
+    }
+
+    /// Read one item page and fold its facts into the offer.
+    fn enrich_one(&self, offer: &mut Offer) -> Result<()> {
+        let agent = http::agent(self.budget);
+        let url = offer.url.clone();
+        let html = http::with_retries(2, || {
+            agent
+                .get(&url)
+                .call()
+                .map_err(|e| http::map_err(BackendId::Bandcamp, &url, e))?
+                .body_mut()
+                .read_to_string()
+                .map_err(|e| http::map_err(BackendId::Bandcamp, &url, e))
+        })?;
+
+        let facts = parse_item_page(&html)?;
+        let acquirable = !matches!(facts.pricing, Pricing::Unavailable { .. });
+        offer.pricing = facts.pricing;
+        if offer.duration_secs.is_none() {
+            offer.duration_secs = facts.duration_secs;
+        }
+        // Bandcamp's format menu only exists on the post-purchase download page,
+        // so this is their standard digital set rather than something read off
+        // this page. The download page stays authoritative at fetch time.
+        offer.formats = Some(if acquirable {
+            DIGITAL_FORMATS.to_vec()
+        } else {
+            Vec::new()
+        });
+        Ok(())
     }
 }
 
@@ -148,9 +283,8 @@ fn parse_search(body: &str, limit: usize) -> Result<Vec<Offer>> {
         let (Some(id), Some(name), Some(url)) = (h.id, h.name, h.item_url_path) else {
             continue;
         };
-        let key = format!("{}:{id}", if kind == ItemKind::Track { "t" } else { "a" });
         let mut offer = Offer::new(
-            ItemRef::new(BackendId::Bandcamp, key),
+            ItemRef::new(BackendId::Bandcamp, item_key(kind, id, &url)),
             kind,
             h.band_name.unwrap_or_default(),
             name,
@@ -333,6 +467,30 @@ impl super::AcquisitionBackend for Bandcamp {
         parse_search(&body, query.limit)
     }
 
+    fn enrich(&self, offers: &mut [Offer]) -> Result<()> {
+        // Ownership first: one request covers every offer, so it is nearly free
+        // and it can make a paid offer turn out to cost nothing.
+        let owned = self.owned();
+        for offer in offers.iter_mut() {
+            if let Some((kind, id)) = parse_item_key(&offer.item_ref.key) {
+                offer.ownership = owned.contains(kind, id);
+            }
+        }
+
+        // Pricing needs one page per offer, so it is the part the caller budgets.
+        for offer in offers.iter_mut() {
+            if let Err(e) = self.enrich_one(offer) {
+                // An expired session is a whole-batch problem: every remaining
+                // request would fail the same way, so stop rather than hammering.
+                if matches!(e, BackendError::AuthExpired { .. }) {
+                    return Err(e);
+                }
+                offer.enrich_error = Some(e.to_string());
+            }
+        }
+        Ok(())
+    }
+
     fn purchase(&self, item: &ItemRef) -> Result<PurchaseFlow> {
         // The buy page is the item page — Bandcamp's checkout lives there. There
         // is no automated purchase path and this tool will not pretend otherwise.
@@ -343,12 +501,22 @@ impl super::AcquisitionBackend for Bandcamp {
     }
 }
 
-/// Recover a browsable URL from an item ref, for refs that carry one.
-fn item_url(item: &ItemRef) -> Option<String> {
-    item.key
+/// Recover a browsable URL from an item ref.
+///
+/// Handles both key shapes: `<t|a>:<id>:<url>` from a search, and `url-<t|a>:<url>`
+/// from a URL the user pasted (which has no id until the page is read).
+pub fn item_url(item: &ItemRef) -> Option<String> {
+    if let Some(rest) = item
+        .key
         .strip_prefix("url-t:")
         .or_else(|| item.key.strip_prefix("url-a:"))
-        .map(|s| s.to_string())
+    {
+        return Some(rest.to_string());
+    }
+    let mut parts = item.key.splitn(3, ':');
+    let _kind = parts.next()?;
+    let _id = parts.next()?;
+    parts.next().map(|s| s.to_string()).filter(|s| !s.is_empty())
 }
 
 #[cfg(test)]
@@ -373,11 +541,96 @@ mod tests {
         assert_eq!(offers[0].kind, ItemKind::Album);
         assert_eq!(offers[0].artist, "Burial");
         assert_eq!(offers[0].title, "Untrue");
-        assert_eq!(offers[0].item_ref.to_string(), "bandcamp:a:856850876");
+        assert_eq!(
+            parse_item_key(&offers[0].item_ref.key),
+            Some((ItemKind::Album, 856850876))
+        );
 
         assert_eq!(offers[1].kind, ItemKind::Track);
         assert_eq!(offers[1].album.as_deref(), Some("UNTRUE"));
-        assert_eq!(offers[1].item_ref.to_string(), "bandcamp:t:2920211424");
+        assert_eq!(
+            parse_item_key(&offers[1].item_ref.key),
+            Some((ItemKind::Track, 2920211424))
+        );
+    }
+
+    #[test]
+    fn an_item_ref_from_a_search_can_still_be_opened_in_a_browser() {
+        // Bandcamp offers no id-to-url lookup, so the ref has to carry the url or
+        // a saved ref could never be reopened.
+        let o = &parse_search(SEARCH_FIXTURE, 1).unwrap()[0];
+        assert_eq!(
+            item_url(&o.item_ref).as_deref(),
+            Some("https://burial.bandcamp.com/album/untrue")
+        );
+    }
+
+    #[test]
+    fn item_refs_round_trip_through_their_string_form() {
+        let o = &parse_search(SEARCH_FIXTURE, 1).unwrap()[0];
+        let s = o.item_ref.to_string();
+        let back: ItemRef = s.parse().unwrap();
+        assert_eq!(back, o.item_ref, "a ref printed for --offer must parse back");
+        assert_eq!(parse_item_key(&back.key), Some((ItemKind::Album, 856850876)));
+    }
+
+    #[test]
+    fn item_keys_with_urls_containing_colons_still_parse() {
+        // The url has its own "https:" colon, so naive splitting would break.
+        let key = item_key(ItemKind::Track, 42, "https://x.bandcamp.com/track/y");
+        assert_eq!(parse_item_key(&key), Some((ItemKind::Track, 42)));
+        assert_eq!(item_url(&ItemRef::new(BackendId::Bandcamp, key)).as_deref(),
+                   Some("https://x.bandcamp.com/track/y"));
+    }
+
+    #[test]
+    fn malformed_item_keys_are_rejected() {
+        assert_eq!(parse_item_key("b:1:url"), None, "bands are not items");
+        assert_eq!(parse_item_key("t:notanumber:url"), None);
+        assert_eq!(parse_item_key("t"), None);
+    }
+
+    #[test]
+    fn ownership_is_unknown_when_the_collection_could_not_be_read() {
+        // Reporting "no" for an unchecked item could have the user buy it twice.
+        let unknown = OwnedSet::default();
+        assert_eq!(unknown.contains(ItemKind::Album, 1), Ownership::Unknown);
+    }
+
+    #[test]
+    fn ownership_distinguishes_tracks_from_albums_with_the_same_id() {
+        let owned = OwnedSet {
+            keys: Some(["a856850876".to_string()].into_iter().collect()),
+        };
+        assert_eq!(
+            owned.contains(ItemKind::Album, 856850876),
+            Ownership::Yes { redownloadable: true }
+        );
+        // Same number, different kind — must not be treated as owned.
+        assert_eq!(owned.contains(ItemKind::Track, 856850876), Ownership::No);
+    }
+
+    #[test]
+    fn parses_a_collection_summary_into_owned_keys() {
+        let body = r#"{"fan_id":123,"collection_summary":{"fan_id":123,
+            "tralbum_lookup":{"a856850876":{"item_type":"a"},"t42":{"item_type":"t"}}}}"#;
+        let keys = parse_collection_summary(body).unwrap();
+        assert!(keys.contains("a856850876"));
+        assert!(keys.contains("t42"));
+    }
+
+    #[test]
+    fn a_logged_out_collection_summary_is_an_auth_error_not_an_empty_collection() {
+        // Verified live: this endpoint answers HTTP 200 with this body.
+        let body = r#"{"error":true,"error_message":"must be logged in"}"#;
+        let err = parse_collection_summary(body).unwrap_err();
+        assert!(matches!(err, BackendError::AuthExpired { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn an_empty_collection_is_valid_not_an_error() {
+        let keys = parse_collection_summary(r#"{"collection_summary":{"tralbum_lookup":{}}}"#).unwrap();
+        assert!(keys.is_empty());
     }
 
     #[test]
