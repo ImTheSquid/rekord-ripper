@@ -70,6 +70,84 @@ fn main() -> anyhow::Result<()> {
     );
     println!("status: {}\n", app.status.text);
 
+    // Download the highlighted offer, the way Enter does, and keep ticking.
+    if std::env::var("RR_SMOKE_FETCH").is_ok() {
+        use rekord_ripper::tui::app::FetchState;
+        // Pick the first free offer, since a paid one is refused by design.
+        if let ShopState::Results { outcome, cursor } = &mut app.shop {
+            if let Some(i) = outcome
+                .offers
+                .iter()
+                .position(|r| !r.offer.requires_purchase())
+            {
+                *cursor = i;
+            }
+        }
+        println!(
+            "fetching: {:?}",
+            app.shop.selected().map(|r| r.offer.title.clone())
+        );
+        if app.start_fetch() {
+            let t = Instant::now();
+            let mut worst = Duration::ZERO;
+            loop {
+                let t0 = Instant::now();
+                term.draw(|f| render::draw(f, &app))?;
+                app.pump_worker();
+                worst = worst.max(t0.elapsed());
+                if matches!(app.fetch, FetchState::Done { .. } | FetchState::Failed(_)) {
+                    break;
+                }
+                if t.elapsed() > Duration::from_secs(240) {
+                    println!("fetch timed out");
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            println!(
+                "fetch finished in {:.1}s, slowest tick {:.1}ms",
+                t.elapsed().as_secs_f64(),
+                worst.as_secs_f64() * 1000.0
+            );
+            match &app.fetch {
+                FetchState::Done { paths, queued } => {
+                    for p in paths {
+                        println!(
+                            "  saved {} ({} bytes)",
+                            p.display(),
+                            std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+                        );
+                    }
+                    println!("  queued: {queued:?}");
+                }
+                FetchState::Failed(e) => println!("  failed: {e}"),
+                _ => {}
+            }
+        } else {
+            println!("start_fetch refused: {}", app.status.text);
+        }
+    }
+
+    // The help screen, to confirm nothing is clipped off the bottom or right.
+    app.mode = InputMode::Help;
+    term.draw(|f| render::draw(f, &app))?;
+    {
+        let buf = term.backend().buffer().clone();
+        println!("---- HELP ----");
+        for y in 0..buf.area.height {
+            let mut line = String::new();
+            for x in 0..buf.area.width {
+                line.push_str(buf[(x, y)].symbol());
+            }
+            let line = line.trim_end();
+            if line.contains('│') || line.contains('┌') || line.contains('└') {
+                println!("{line}");
+            }
+        }
+        println!("---- /HELP ----\n");
+    }
+    app.mode = InputMode::Shop;
+
     // Show what the overlay actually looks like.
     term.draw(|f| render::draw(f, &app))?;
     let buf = term.backend().buffer().clone();

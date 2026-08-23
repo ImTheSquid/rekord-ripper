@@ -41,6 +41,25 @@ pub enum ShopState {
     Failed(String),
 }
 
+/// A download in flight, or its result.
+///
+/// Kept separate from `ShopState` so the offer table stays on screen while a
+/// fetch runs — you can see what you picked.
+#[derive(Default)]
+pub enum FetchState {
+    #[default]
+    Idle,
+    Running {
+        since: Instant,
+        what: String,
+    },
+    Done {
+        paths: Vec<std::path::PathBuf>,
+        queued: Option<i64>,
+    },
+    Failed(String),
+}
+
 impl ShopState {
     /// Rows currently shown, for cursor clamping.
     pub fn len(&self) -> usize {
@@ -187,6 +206,10 @@ pub struct App {
     /// simply unavailable rather than the TUI failing to open.
     pub worker: Option<super::worker::Worker>,
     pub shop: ShopState,
+    pub fetch: FetchState,
+    /// The source track a fetch was started for, so the transfer can be queued
+    /// once the file lands.
+    fetch_src: Option<String>,
     pub cfg: crate::config::Config,
     pub pending: Option<PendingBatch>,
     pub unresolved_errors: bool,
@@ -221,6 +244,8 @@ impl App {
             status: StatusLine::default(),
             worker,
             shop: ShopState::Idle,
+            fetch: FetchState::Idle,
+            fetch_src: None,
             cfg,
             pending: None,
             unresolved_errors: false,
@@ -228,7 +253,8 @@ impl App {
             should_quit: false,
         };
         app.recompute_visible();
-        app.status.info(format!("Loaded {} tracks.", app.rows.len()));
+        app.status
+            .info(format!("Loaded {} tracks.", app.rows.len()));
         Ok(app)
     }
 
@@ -260,7 +286,9 @@ impl App {
         self.rows = load_rows(&self.db)?;
         // Drop selections that no longer correspond to existing rows.
         let existing: HashSet<&str> = self.rows.iter().map(|r| r.id.as_str()).collect();
-        self.dst.selected.retain(|id| existing.contains(id.as_str()));
+        self.dst
+            .selected
+            .retain(|id| existing.contains(id.as_str()));
         self.recompute_visible();
         Ok(())
     }
@@ -289,7 +317,9 @@ impl App {
                     self.shop = ShopState::Results { outcome, cursor: 0 };
                     match (found, failed.is_empty()) {
                         (0, true) => self.status.warn("no offers found."),
-                        (0, false) => self.status.err(format!("no offers — {}", failed.join("; "))),
+                        (0, false) => self
+                            .status
+                            .err(format!("no offers — {}", failed.join("; "))),
                         (n, true) => self.status.ok(format!("{n} offers.")),
                         // A partial table is still useful; say what is missing.
                         (n, false) => self
@@ -297,9 +327,39 @@ impl App {
                             .warn(format!("{n} offers, degraded — {}", failed.join("; "))),
                     }
                 }
+                super::worker::Update::Fetched(result) => match *result {
+                    Ok(files) => {
+                        let paths: Vec<std::path::PathBuf> =
+                            files.iter().map(|f| f.path.clone()).collect();
+                        let lossy = files.iter().any(|f| !f.format.is_lossless());
+                        // Queueing needs the database, so it happens here on the
+                        // main thread rather than in the worker.
+                        let queued = self.queue_transfer_for(&paths);
+                        match (queued, lossy) {
+                            (Some(id), _) => self.status.ok(format!(
+                                "downloaded and queued transfer #{id} — import, then `pending --apply`"
+                            )),
+                            (None, true) => self
+                                .status
+                                .warn("downloaded, but it is a lossy transcode".to_string()),
+                            (None, false) => {
+                                self.status.ok(format!("downloaded {} file(s)", paths.len()))
+                            }
+                        }
+                        self.fetch = FetchState::Done { paths, queued };
+                    }
+                    Err(why) => {
+                        self.status.err(format!("download failed: {why}"));
+                        self.fetch = FetchState::Failed(why);
+                    }
+                },
                 super::worker::Update::Failed(why) => {
                     self.status.err(format!("search failed: {why}"));
-                    self.shop = ShopState::Failed(why);
+                    if matches!(self.fetch, FetchState::Running { .. }) {
+                        self.fetch = FetchState::Failed(why);
+                    } else {
+                        self.shop = ShopState::Failed(why);
+                    }
                 }
             }
         }
@@ -364,6 +424,91 @@ impl App {
 
     pub fn shop_busy(&self) -> bool {
         self.worker.as_ref().map(|w| w.is_busy()).unwrap_or(false)
+    }
+
+    /// Download the highlighted offer.
+    ///
+    /// Does the whole thing rather than printing a command to run: the worker
+    /// makes a multi-minute download survivable, so there is no reason to hand
+    /// the user homework.
+    pub fn start_fetch(&mut self) -> bool {
+        let Some(offer) = self.shop.selected().map(|r| r.offer.clone()) else {
+            self.status.warn("no offer selected.");
+            return false;
+        };
+        // Something you have to pay for cannot be fetched; say what to do instead.
+        if offer.requires_purchase() {
+            self.status.warn(format!(
+                "you don't own this yet ({}). Press 'o' to open the buy page.",
+                super::super::acquire::render::price_cell(&offer)
+            ));
+            return false;
+        }
+
+        let dest = match self.cfg.download_dir() {
+            Ok(d) => d,
+            Err(e) => {
+                self.status.err(format!("no download directory: {e}"));
+                return false;
+            }
+        };
+        let format_pref = match crate::acquire::format_preference(&self.cfg) {
+            Ok(p) => p,
+            Err(e) => {
+                self.status.err(e.to_string());
+                return false;
+            }
+        };
+
+        let Some(worker) = self.worker.as_mut() else {
+            self.status.err("the worker thread is not running.");
+            return false;
+        };
+        if worker.is_busy() {
+            self.status.warn("something is already running.");
+            return false;
+        }
+        if !worker.submit(super::worker::Job::Fetch {
+            item: offer.item_ref.clone(),
+            dest,
+            format_pref,
+            overwrite: false,
+        }) {
+            self.status.err("could not start the download.");
+            return false;
+        }
+
+        let what = format!("{} — {}", offer.artist, offer.title);
+        // Remember the source so the transfer can be queued on completion.
+        self.fetch_src = self.current_src().map(|r| r.id.clone());
+        self.status.info(format!("downloading {what} …"));
+        self.fetch = FetchState::Running {
+            since: Instant::now(),
+            what,
+        };
+        true
+    }
+
+    /// Record a pending old→new pairing for a downloaded file.
+    ///
+    /// Returns the queued entry id. `None` when there was no source track
+    /// selected, which is a legitimate "just download it" case.
+    fn queue_transfer_for(&mut self, paths: &[std::path::PathBuf]) -> Option<i64> {
+        let src_id = self.fetch_src.take()?;
+        let src = crate::analysis::load_track(&self.db, &src_id).ok()?;
+        let store = crate::pending::PendingStore::open().ok()?;
+        let first = paths.first()?;
+        store
+            .add(
+                &src,
+                first,
+                None,
+                // Rekordbox auto-analyses on import and leaves cues behind.
+                true,
+                self.copy_opts.lock,
+                self.cfg.pending.ttl_days,
+            )
+            .ok()
     }
 
     pub fn focused_column_mut(&mut self) -> &mut ColumnState {
