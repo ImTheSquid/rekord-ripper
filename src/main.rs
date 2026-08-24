@@ -105,8 +105,9 @@ enum Cmd {
         /// Free-text query. Omit when using --track-id.
         query: Vec<String>,
         /// Build the query from a track already in your rekordbox library.
+        /// Repeatable, to shop for several tracks in one run.
         #[arg(long, value_name = "ID", conflicts_with = "query")]
-        track_id: Option<String>,
+        track_id: Vec<String>,
         /// Restrict to these backends. Repeatable; defaults to all enabled.
         #[arg(long, value_name = "BACKEND")]
         backend: Vec<acquire::BackendId>,
@@ -351,7 +352,11 @@ fn main() -> Result<()> {
                 acquire::cmd::BuyArgs {
                     query: query.join(" "),
                     track_id,
-                    selector: acquire::pick::Selector { offer, from, row: pick },
+                    selector: acquire::pick::Selector {
+                        offer,
+                        from,
+                        row: pick,
+                    },
                     print_url,
                     limit,
                     enrich,
@@ -431,9 +436,11 @@ fn main() -> Result<()> {
                 },
             )?
         }
-        Cmd::Dump { query, limit } => {
-            dump::run(db.as_ref().expect("dump needs the db"), query.as_deref(), limit)?
-        }
+        Cmd::Dump { query, limit } => dump::run(
+            db.as_ref().expect("dump needs the db"),
+            query.as_deref(),
+            limit,
+        )?,
         Cmd::Tui => tui::run(db.take().expect("tui needs the db"), safety)?,
         Cmd::Cp {
             src,
@@ -482,12 +489,7 @@ struct ImportArgs {
     undo: Option<String>,
 }
 
-fn run_import(
-    db: &mut MasterDb,
-    cfg: &Config,
-    safety: SafetyOpts,
-    args: ImportArgs,
-) -> Result<()> {
+fn run_import(db: &mut MasterDb, cfg: &Config, safety: SafetyOpts, args: ImportArgs) -> Result<()> {
     use owo_colors::OwoColorize;
     use rekord_ripper::{audio, import};
 
@@ -556,12 +558,7 @@ fn run_import(
         let mut note = rekord_ripper::import::insert(db, new)?;
         note.backup = Some(backup.to_string_lossy().into_owned());
         let note_path = note.write_beside(&backup)?;
-        eprintln!(
-            "{} track {} — {}",
-            "inserted:".green(),
-            new.id,
-            new.title
-        );
+        eprintln!("{} track {} — {}", "inserted:".green(), new.id, new.title);
         eprintln!(
             "  undo with: {}",
             format!("rekord-ripper import --undo {} --apply", new.id).bold()
@@ -721,7 +718,11 @@ fn run_fp(a: &std::path::Path, b: &std::path::Path, secs: u32, cfg: &Config) -> 
     );
     println!(
         "VERDICT    {}  {}",
-        if verdict.is_accept() { "ACCEPT" } else { "REJECT" },
+        if verdict.is_accept() {
+            "ACCEPT"
+        } else {
+            "REJECT"
+        },
         verdict.summary()
     );
     if !verdict.is_accept() {
@@ -736,7 +737,8 @@ fn needs_database(cmd: &Cmd) -> bool {
     match cmd {
         Cmd::Backends | Cmd::Config { .. } | Cmd::Fp { .. } => false,
         // Only needed to seed the query from an existing track.
-        Cmd::Shop { track_id, .. } | Cmd::Buy { track_id, .. } => track_id.is_some(),
+        Cmd::Shop { track_id, .. } => !track_id.is_empty(),
+        Cmd::Buy { track_id, .. } => track_id.is_some(),
         // Only needed to queue a transfer against an existing track.
         Cmd::Fetch { src_track_id, .. } => src_track_id.is_some(),
         Cmd::Dump { .. }
@@ -750,7 +752,7 @@ fn needs_database(cmd: &Cmd) -> bool {
 
 struct ShopArgs {
     query: String,
-    track_id: Option<String>,
+    track_id: Vec<String>,
     backend: Vec<acquire::BackendId>,
     limit: Option<usize>,
     enrich: Option<usize>,
@@ -773,36 +775,50 @@ fn run_shop(
 
     // Seed from a local track when asked, so you don't retype what rekordbox
     // already knows.
-    let query = match (&args.track_id, args.query.trim()) {
-        (Some(id), _) => {
-            let t = analysis::load_track(db.expect("--track-id requires the db"), id)?;
-            let title = t
-                .title
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("track {id} has no title to search for"))?;
-            eprintln!(
-                "searching for: {} — {}",
-                t.artist.as_deref().unwrap_or("?"),
-                title
-            );
-            acquire::SearchQuery {
-                title,
-                artist: t.artist.clone(),
-                duration_secs: t.length,
-                limit,
-                ..Default::default()
-            }
+    // One spec per thing to look for. A single search is one spec, so bulk needs
+    // no separate code path here either.
+    let mut specs: Vec<shop::QuerySpec> = Vec::new();
+    if !args.track_id.is_empty() {
+        let db = db.ok_or_else(|| anyhow::anyhow!("--track-id needs the rekordbox database"))?;
+        for id in &args.track_id {
+            let t = analysis::load_track(db, id)?;
+            let Some(title) = t.title.clone().filter(|s| !s.trim().is_empty()) else {
+                eprintln!("skipping track {id}: no title to search for");
+                continue;
+            };
+            specs.push(shop::QuerySpec {
+                label: format!("{} — {title}", t.artist.as_deref().unwrap_or("?")),
+                src_id: Some(id.clone()),
+                query: acquire::SearchQuery {
+                    title,
+                    artist: t.artist.clone(),
+                    duration_secs: t.length,
+                    limit,
+                    ..Default::default()
+                },
+            });
         }
-        (None, "") => anyhow::bail!("give me something to search for, or pass --track-id"),
-        (None, text) => acquire::SearchQuery::from_text(text, limit),
-    };
+        if specs.is_empty() {
+            anyhow::bail!("none of the given tracks had a title to search for");
+        }
+    } else if args.query.trim().is_empty() {
+        anyhow::bail!("give me something to search for, or pass --track-id");
+    } else {
+        let text = args.query.trim();
+        specs.push(shop::QuerySpec {
+            label: text.to_string(),
+            src_id: None,
+            query: acquire::SearchQuery::from_text(text, limit),
+        });
+    }
 
     // A price threshold across currencies is not computable here, so refuse it
     // rather than silently comparing incomparable numbers.
     if let Some(c) = &args.currency
-        && c.trim().len() != 3 {
-            anyhow::bail!("--currency takes a 3-letter ISO code, e.g. GBP");
-        }
+        && c.trim().len() != 3
+    {
+        anyhow::bail!("--currency takes a 3-letter ISO code, e.g. GBP");
+    }
 
     let reg = acquire::Registry::from_config(cfg, creds);
     if reg.is_empty() {
@@ -818,26 +834,62 @@ fn run_shop(
         sort: args.sort,
     };
 
-    let outcome = shop::search_all(&reg, &query, &opts);
+    let multi = specs.len() > 1;
+    let groups = shop::search_many(&reg, &specs, &opts, |done, total, label| {
+        if label.is_empty() {
+            return;
+        }
+        if total > 1 {
+            eprintln!("[{}/{total}] {label}", done + 1);
+        } else {
+            eprintln!("searching for: {label}");
+        }
+    });
 
     if args.json {
-        println!("{}", shop_json(&outcome)?);
+        println!("{}", shop_json_groups(&groups)?);
     } else {
-        print!("{}", acquire::render::table(&outcome));
+        for g in &groups {
+            if multi {
+                println!();
+                println!("for: {}", g.label);
+            }
+            print!("{}", acquire::render::table(&g.outcome));
+        }
     }
 
-    if args.strict
-        && let Some(first) = outcome.failures().next() {
-            anyhow::bail!(
-                "{} failed and --strict was given: {}",
-                first.backend,
-                first.error.as_ref().expect("failures() filters on error")
-            );
+    if args.strict {
+        for g in &groups {
+            if let Some(first) = g.outcome.failures().next() {
+                anyhow::bail!(
+                    "{} failed and --strict was given: {}",
+                    first.backend,
+                    first.error.as_ref().expect("failures() filters on error")
+                );
+            }
         }
-    if outcome.total_failure() {
+    }
+    if !groups.is_empty() && groups.iter().all(|g| g.outcome.total_failure()) {
         anyhow::bail!("every backend failed — see the errors above");
     }
     Ok(())
+}
+
+/// Machine-readable grouped outcome, so a bulk run is scriptable.
+fn shop_json_groups(groups: &[acquire::shop::GroupOutcome]) -> Result<String> {
+    let mut out = Vec::new();
+    for g in groups {
+        let mut v: serde_json::Value = serde_json::from_str(&shop_json(&g.outcome)?)?;
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("label".into(), serde_json::json!(g.label));
+            obj.insert("src_track_id".into(), serde_json::json!(g.src_id));
+        }
+        out.push(v);
+    }
+    Ok(serde_json::to_string_pretty(&serde_json::json!({
+        "groups": out,
+        "currency_note": "prices are in each seller's own currency and are never converted",
+    }))?)
 }
 
 /// Machine-readable outcome, for scripting and tests.
@@ -971,10 +1023,7 @@ fn run_auto(db: &mut MasterDb, args: AutoArgs) -> Result<()> {
         println!("{}", plan.render());
     }
     for (m, e) in &failed {
-        eprintln!(
-            "skip {} ← {}: {e}",
-            m.dst_id, m.src_id
-        );
+        eprintln!("skip {} ← {}: {e}", m.dst_id, m.src_id);
     }
 
     if !args.apply {

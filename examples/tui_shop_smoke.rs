@@ -74,12 +74,12 @@ fn main() -> anyhow::Result<()> {
     if std::env::var("RR_SMOKE_FETCH").is_ok() {
         use rekord_ripper::tui::app::FetchState;
         // Pick the first free offer, since a paid one is refused by design.
-        if let ShopState::Results { outcome, cursor } = &mut app.shop {
-            if let Some(i) = outcome
-                .offers
-                .iter()
-                .position(|r| !r.offer.requires_purchase())
-            {
+        let free = app
+            .shop
+            .flattened()
+            .position(|(_, r)| !r.offer.requires_purchase());
+        if let ShopState::Results { cursor, .. } = &mut app.shop {
+            if let Some(i) = free {
                 *cursor = i;
             }
         }
@@ -125,6 +125,54 @@ fn main() -> anyhow::Result<()> {
             }
         } else {
             println!("start_fetch refused: {}", app.status.text);
+        }
+    }
+
+    // The reported bug: step away from finished results, come back with 's'.
+    {
+        use rekord_ripper::tui::app::InputMode as M;
+        let before = app.shop.len();
+        app.mode = M::Normal; // Esc
+        let reopened = app.open_shop(); // s
+        println!(
+            "reopen after finishing: opened={reopened} mode_is_shop={} offers_kept={} (was {before})",
+            app.mode == M::Shop,
+            app.shop.len()
+        );
+        assert!(reopened && app.mode == M::Shop, "s must reopen the overlay");
+        assert_eq!(app.shop.len(), before, "results must not be discarded");
+        assert!(!app.shop_busy(), "reopening must not start a new search");
+    }
+
+    // Bulk: search for several visible source tracks at once.
+    if std::env::var("RR_SMOKE_BULK").is_ok() {
+        use rekord_ripper::tui::app::ShopState as S;
+        app.src.query = std::env::var("RR_SMOKE_BULK").unwrap_or_default();
+        app.recompute_visible();
+        println!("bulk over {} visible sources", app.src.visible.len());
+        if app.start_bulk_shop(3) {
+            let t = Instant::now();
+            loop {
+                term.draw(|f| render::draw(f, &app))?;
+                app.pump_worker();
+                if matches!(app.shop, S::Results { .. } | S::Failed(_)) {
+                    break;
+                }
+                if t.elapsed() > Duration::from_secs(180) {
+                    println!("bulk timed out");
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            if let S::Results { groups, .. } = &app.shop {
+                println!("bulk groups: {}", groups.len());
+                for g in groups.iter() {
+                    println!("  {:<44} {} offers", g.label, g.outcome.offers.len());
+                }
+            }
+            println!("total offers: {}", app.shop.len());
+        } else {
+            println!("bulk refused: {}", app.status.text);
         }
     }
 
