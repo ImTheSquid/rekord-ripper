@@ -14,14 +14,45 @@ pub enum Focus {
     Dst,
 }
 
+/// The two full screens.
+///
+/// The shop used to be an overlay on the transfer view, which forced `Space` to
+/// mean two unrelated things at once — "copy target" in the DESTINATIONS column
+/// and "shop for this" in SOURCES — and left "select some sources, then move to
+/// destinations" with no meaning at all. Each screen now owns its own selection,
+/// and each selection means exactly one thing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Screen {
+    Transfer,
+    Shop,
+}
+
+/// Which pane of the shop screen the keys go to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShopFocus {
+    Tracks,
+    Offers,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InputMode {
     Normal,
     Search(Focus),
     Confirm,
     Help,
-    /// The offer table overlay, driven by the background worker.
-    Shop,
+    /// Typing into the shop screen's track filter.
+    ShopSearch,
+}
+
+/// How far along a track is in the shop screen's track list.
+///
+/// Shown per row so a queue of searches is legible: which are answered, which
+/// are still waiting, and how much each one found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShopTrackState {
+    Untouched,
+    Queued,
+    Done(usize),
 }
 
 /// Where the shop overlay has got to.
@@ -141,6 +172,29 @@ impl ShopState {
     }
 }
 
+/// The per-track tag the shop list shows.
+///
+/// A group that came back with nothing is still *answered* — the difference
+/// between "found nothing" and "not searched" is the whole reason for the tag.
+fn track_state(shop: &ShopState, queued: &[String], src_id: &str) -> ShopTrackState {
+    let found = shop
+        .flattened()
+        .filter(|(g, _)| g.src_id.as_deref() == Some(src_id))
+        .count();
+    if found > 0 {
+        return ShopTrackState::Done(found);
+    }
+    if let ShopState::Results { groups, .. } = shop
+        && groups.iter().any(|g| g.src_id.as_deref() == Some(src_id))
+    {
+        return ShopTrackState::Done(0);
+    }
+    if queued.iter().any(|q| q == src_id) {
+        return ShopTrackState::Queued;
+    }
+    ShopTrackState::Untouched
+}
+
 #[derive(Clone, Copy, Default, Debug)]
 pub struct DstFilters {
     pub auto: bool,
@@ -249,6 +303,11 @@ pub struct App {
     pub src: ColumnState,
     pub dst: ColumnState,
     pub focus: Focus,
+    pub screen: Screen,
+    pub shop_focus: ShopFocus,
+    /// The shop screen's own track list: its own filter, and a selection that
+    /// only ever means "search for these".
+    pub shop_list: ColumnState,
     pub mode: InputMode,
     pub copy_opts: CopyOpts,
     pub dst_filters: DstFilters,
@@ -293,6 +352,9 @@ impl App {
             src: ColumnState::default(),
             dst: ColumnState::default(),
             focus: Focus::Src,
+            screen: Screen::Transfer,
+            shop_focus: ShopFocus::Tracks,
+            shop_list: ColumnState::default(),
             mode: InputMode::Normal,
             copy_opts: CopyOpts::default(),
             dst_filters: DstFilters::default(),
@@ -317,6 +379,11 @@ impl App {
     pub fn recompute_visible(&mut self) {
         self.src.visible = src_visible(&self.rows, &self.src.query);
         self.src.clamp_cursor();
+
+        // The shop list filters the same rows independently, so moving around on
+        // one screen never disturbs the other.
+        self.shop_list.visible = src_visible(&self.rows, &self.shop_list.query);
+        self.shop_list.clamp_cursor();
 
         // Hand the current src to dst_visible so it always gets excluded from
         // the dst list (you can't copy a track onto itself); the fuzzy flag is
@@ -343,6 +410,9 @@ impl App {
         // Drop selections that no longer correspond to existing rows.
         let existing: HashSet<&str> = self.rows.iter().map(|r| r.id.as_str()).collect();
         self.dst
+            .selected
+            .retain(|id| existing.contains(id.as_str()));
+        self.shop_list
             .selected
             .retain(|id| existing.contains(id.as_str()));
         self.recompute_visible();
@@ -498,39 +568,137 @@ impl App {
         })
     }
 
-    /// What `s` does: show what is already there, or search if there is nothing.
-    ///
-    /// This is the fix for a dead end: `s` used to always start a fresh search,
-    /// so a completed result you had stepped away from was thrown away, and while
-    /// one was running `s` refused *without* reopening the overlay — leaving no
-    /// way back to it at all.
+    /// What `s` on the transfer screen does: cross to the shop screen, landing on
+    /// the track that was highlighted, and search for it.
     pub fn open_shop(&mut self) -> bool {
+        self.screen = Screen::Shop;
         let Some(row) = self.current_src().cloned() else {
-            self.status.warn("no source track selected to search for.");
+            self.shop_focus = ShopFocus::Tracks;
+            self.status
+                .info("pick a track and press 's' to search for it.");
+            return false;
+        };
+        self.focus_shop_list_on(&row.id);
+        self.shop_track()
+    }
+
+    /// Search for the shop screen's highlighted track, or show what is already
+    /// known about it.
+    ///
+    /// Never re-runs a finished search: `s` used to throw completed results away,
+    /// and while one was running it refused with no way back to it at all.
+    pub fn shop_track(&mut self) -> bool {
+        let Some(row) = self.current_shop_track().cloned() else {
+            self.status.warn("no track highlighted.");
             return false;
         };
 
         // Already answered: show it, and put the cursor on its block.
         if let Some(i) = self.first_offer_index_for(&row.id) {
-            self.mode = InputMode::Shop;
             if let ShopState::Results { cursor, .. } = &mut self.shop {
                 *cursor = i;
             }
+            self.shop_focus = ShopFocus::Offers;
             self.status
                 .info("already searched — 'r' re-runs just this track.");
             return true;
         }
-        // Already in the queue: just show the overlay.
+        // Already in the queue: nothing to do but say so.
         if self.shop_queued.contains(&row.id) {
-            self.mode = InputMode::Shop;
             self.status.info(format!(
                 "queued — {} search(es) to go.",
-                self.worker.as_ref().map(|w| w.outstanding()).unwrap_or(0)
+                self.shop_outstanding()
             ));
             return true;
         }
         // Otherwise add it to the list, behind anything already running.
         self.enqueue_shop(&[row])
+    }
+
+    /// Put the shop list's cursor on `id`.
+    ///
+    /// A filter hiding the row loses to the seeded cursor: arriving from the
+    /// transfer screen on some unrelated track would be worse than a cleared
+    /// filter.
+    fn focus_shop_list_on(&mut self, id: &str) {
+        if let Some(p) = self.position_in_shop_list(id) {
+            self.shop_list.cursor = p;
+            return;
+        }
+        self.shop_list.query.clear();
+        self.recompute_visible();
+        if let Some(p) = self.position_in_shop_list(id) {
+            self.shop_list.cursor = p;
+        }
+    }
+
+    fn position_in_shop_list(&self, id: &str) -> Option<usize> {
+        self.shop_list
+            .visible
+            .iter()
+            .position(|&i| self.rows.get(i).is_some_and(|r| r.id == id))
+    }
+
+    /// Follow the offer cursor with the track list, so crossing a group boundary
+    /// visibly changes which track the offers belong to.
+    fn sync_list_to_selected_offer(&mut self) {
+        let Some(id) = self
+            .shop
+            .selected_with_group()
+            .and_then(|(g, _)| g.src_id.clone())
+        else {
+            return;
+        };
+        // Only if it is on screen — a filter the user typed is theirs to keep.
+        if let Some(p) = self.position_in_shop_list(&id) {
+            self.shop_list.cursor = p;
+        }
+    }
+
+    pub fn toggle_shop_focus(&mut self) {
+        self.shop_focus = match self.shop_focus {
+            ShopFocus::Tracks => ShopFocus::Offers,
+            ShopFocus::Offers => ShopFocus::Tracks,
+        };
+    }
+
+    pub fn shop_move(&mut self, delta: isize) {
+        match self.shop_focus {
+            ShopFocus::Tracks => self.shop_list.move_by(delta),
+            ShopFocus::Offers => {
+                self.shop.move_cursor(delta);
+                self.sync_list_to_selected_offer();
+            }
+        }
+    }
+
+    pub fn shop_jump(&mut self, top: bool) {
+        match (self.shop_focus, top) {
+            (ShopFocus::Tracks, true) => self.shop_list.jump_top(),
+            (ShopFocus::Tracks, false) => self.shop_list.jump_bottom(),
+            (ShopFocus::Offers, true) => self.shop_move(isize::MIN / 2),
+            (ShopFocus::Offers, false) => self.shop_move(isize::MAX / 2),
+        }
+    }
+
+    /// Add or remove the highlighted track from the basket.
+    pub fn toggle_basket(&mut self) {
+        if self.shop_focus != ShopFocus::Tracks {
+            self.status
+                .info("space fills the basket — Tab back to the track list.");
+            return;
+        }
+        let Some(id) = self.current_shop_track().map(|r| r.id.clone()) else {
+            return;
+        };
+        if !self.shop_list.selected.remove(&id) {
+            self.shop_list.selected.insert(id);
+        }
+    }
+
+    /// How far along a track is: answered, waiting, or untouched.
+    pub fn shop_track_state(&self, src_id: &str) -> ShopTrackState {
+        track_state(&self.shop, &self.shop_queued, src_id)
     }
 
     /// Add source tracks to the search queue, keeping any results already shown.
@@ -549,7 +717,6 @@ impl App {
             .collect();
 
         if specs.is_empty() {
-            self.mode = InputMode::Shop;
             self.status
                 .info("nothing new to search — those are already done or queued.");
             return false;
@@ -564,10 +731,22 @@ impl App {
             .position(|(g, _)| g.src_id.as_deref() == Some(src_id))
     }
 
-    /// Search for the highlighted source track, replacing its existing results.
+    /// Re-run one search, replacing just that track's results.
+    ///
+    /// On the offers pane that means the group the highlighted offer belongs to,
+    /// which after a queue of searches is not necessarily the track under the
+    /// list cursor.
     pub fn start_shop(&mut self) -> bool {
-        let Some(row) = self.current_src().cloned() else {
-            self.status.warn("no source track selected to search for.");
+        let id = match self.shop_focus {
+            ShopFocus::Offers => self
+                .shop
+                .selected_with_group()
+                .and_then(|(g, _)| g.src_id.clone())
+                .or_else(|| self.current_shop_track().map(|r| r.id.clone())),
+            ShopFocus::Tracks => self.current_shop_track().map(|r| r.id.clone()),
+        };
+        let Some(row) = id.and_then(|id| self.rows.iter().find(|r| r.id == id).cloned()) else {
+            self.status.warn("nothing to re-search.");
             return false;
         };
         let Some(spec) = self.spec_for(&row) else {
@@ -596,23 +775,23 @@ impl App {
         }
     }
 
-    /// Add every selected source track to the search queue.
+    /// Search for everything in the basket.
     ///
-    /// Selection rather than "everything visible": a filter can match hundreds of
+    /// A basket rather than "everything visible": a filter can match hundreds of
     /// rows, and each track is a full fan-out across every backend.
     pub fn shop_selected(&mut self, cap: usize) -> bool {
-        if self.src.selected.is_empty() {
+        if self.shop_list.selected.is_empty() {
             self.status
-                .warn("nothing selected — press space on the source rows you want, then 'S'.");
+                .warn("the basket is empty — press space on the tracks you want, then 'S'.");
             return false;
         }
         // Selection order is not meaningful, so follow the visible order.
         let rows: Vec<TrackRow> = self
-            .src
+            .shop_list
             .visible
             .iter()
             .filter_map(|&i| self.rows.get(i))
-            .filter(|r| self.src.selected.contains(&r.id))
+            .filter(|r| self.shop_list.selected.contains(&r.id))
             .cloned()
             .collect();
 
@@ -677,13 +856,22 @@ impl App {
         } else if let ShopState::Results { specs: have, .. } = &mut self.shop {
             have.extend(specs);
         }
-        self.mode = InputMode::Shop;
+        self.screen = Screen::Shop;
         true
     }
 
     /// Searches submitted but not yet answered.
     pub fn shop_outstanding(&self) -> usize {
         self.worker.as_ref().map(|w| w.outstanding()).unwrap_or(0)
+    }
+
+    /// When the work currently in flight started, for the spinner.
+    pub fn shop_since(&self) -> Option<Instant> {
+        match (&self.shop, &self.fetch) {
+            (_, FetchState::Running { since, .. }) => Some(*since),
+            (ShopState::Searching { since, .. }, _) => Some(*since),
+            _ => None,
+        }
     }
 
     pub fn shop_busy(&self) -> bool {
@@ -751,7 +939,7 @@ impl App {
 
         let what = format!("{} — {}", offer.artist, offer.title);
         // Remember the source so the transfer can be queued on completion.
-        self.fetch_src = group_src.or_else(|| self.current_src().map(|r| r.id.clone()));
+        self.fetch_src = group_src.or_else(|| self.current_shop_track().map(|r| r.id.clone()));
         self.status.info(format!("downloading {what} …"));
         self.fetch = FetchState::Running {
             since: Instant::now(),
@@ -805,6 +993,12 @@ impl App {
         self.dst
             .visible
             .get(self.dst.cursor)
+            .and_then(|&i| self.rows.get(i))
+    }
+    pub fn current_shop_track(&self) -> Option<&TrackRow> {
+        self.shop_list
+            .visible
+            .get(self.shop_list.cursor)
             .and_then(|&i| self.rows.get(i))
     }
 }
@@ -927,6 +1121,35 @@ mod tests {
         let empty = results(vec![], vec![]);
         assert!(empty.selected().is_none());
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn the_track_tag_tells_found_nothing_apart_from_not_searched() {
+        // Both would otherwise render as a blank tag, and the user could not tell
+        // whether pressing 's' again would do anything.
+        let s = results(vec![group("101", 3), group("202", 0)], vec![]);
+        let queued = vec!["303".to_string()];
+        assert_eq!(track_state(&s, &queued, "101"), ShopTrackState::Done(3));
+        assert_eq!(track_state(&s, &queued, "202"), ShopTrackState::Done(0));
+        assert_eq!(track_state(&s, &queued, "303"), ShopTrackState::Queued);
+        assert_eq!(track_state(&s, &queued, "404"), ShopTrackState::Untouched);
+    }
+
+    #[test]
+    fn a_queued_track_that_has_answered_reads_as_done() {
+        // The queue list is cleared on arrival, but a stale entry must not make a
+        // finished search look like it is still waiting.
+        let s = results(vec![group("101", 2)], vec![]);
+        let stale = vec!["101".to_string()];
+        assert_eq!(track_state(&s, &stale, "101"), ShopTrackState::Done(2));
+    }
+
+    #[test]
+    fn nothing_is_queued_or_done_before_the_first_search() {
+        assert_eq!(
+            track_state(&ShopState::Idle, &[], "101"),
+            ShopTrackState::Untouched
+        );
     }
 
     #[test]

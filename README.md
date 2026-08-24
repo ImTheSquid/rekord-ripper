@@ -54,17 +54,27 @@ rekord-ripper pending --list
 rekord-ripper pending --apply
 ```
 
-In the TUI, `s` adds the highlighted source track to a shopping list. Tap it on
-several tracks and they search one after another, results accumulating into one
-grouped table — nothing is discarded and nothing is searched twice. `Space`
-selects source rows and `S` queues all of them at once. `Enter` downloads the
-highlighted offer and queues its analysis transfer against that offer's own
-source track.
+### In the TUI
 
-Searches run on a background thread, so `Esc` steps away without losing anything
-and `s` brings it back. They run sequentially rather than in parallel: each track
-is already a fan-out across every backend, so firing several at once would
-multiply requests per backend and invite a rate limit.
+The TUI has two screens, and each one's selection means exactly one thing.
+
+The **transfer screen** is the src → dst view. `Space` picks destinations, and
+that is all it does — the source is always the highlighted row. `s` crosses to
+the shop screen, landing on the track you were on.
+
+The **shop screen** is a track list beside an offer table. `s` searches the
+highlighted track; tap it on several and they search one after another, results
+accumulating into one grouped table — nothing is discarded and nothing is
+searched twice. `Space` fills a basket and `S` searches all of it. Each track
+carries a tag showing what its search found: a count, `·` for nothing, `…` for
+still queued. `Enter` on an offer downloads it and queues an analysis transfer
+against that offer's *own* source track, which after a batch of searches is not
+necessarily the one under the list cursor. `Esc` goes back.
+
+Searches run on a background thread, so leaving the screen loses nothing and `s`
+brings it back. They run sequentially rather than in parallel: each track is
+already a fan-out across every backend, so firing several at once would multiply
+requests per backend and invite a rate limit.
 
 Backends implement the `AcquisitionBackend` trait, so adding another is a matter
 of implementing search, enrich, purchase and fetch. Bandcamp and SoundCloud ship

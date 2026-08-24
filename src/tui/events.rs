@@ -3,13 +3,14 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::analysis;
 use crate::db::safety_preflight;
 
-use super::app::{App, Focus, InputMode, PendingBatch};
+use super::app::{App, Focus, InputMode, PendingBatch, Screen, ShopFocus};
 
 /// Most tracks one `S` will queue at once.
 ///
 /// Each track is a full fan-out across every backend, so this is a guard against
-/// selecting half the library by accident, not a limit on how many you can shop
-/// for — tap `s` on individual tracks and they queue up behind each other.
+/// filling the basket with half the library by accident, not a limit on how many
+/// you can shop for — tap `s` on individual tracks and they queue up behind each
+/// other with no cap.
 const BULK_SHOP_CAP: usize = 25;
 
 pub fn handle_key(app: &mut App, key: KeyEvent) {
@@ -30,19 +31,22 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
 
     let mode = app.mode.clone();
     match mode {
-        InputMode::Normal => handle_normal(app, key),
+        InputMode::Normal => match app.screen {
+            Screen::Transfer => handle_normal(app, key),
+            Screen::Shop => handle_shop(app, key),
+        },
         InputMode::Search(focus) => handle_search(app, key, focus),
+        InputMode::ShopSearch => handle_shop_search(app, key),
         InputMode::Confirm => handle_confirm(app, key),
         InputMode::Help => {
             app.mode = InputMode::Normal;
         }
-        InputMode::Shop => handle_shop(app, key),
     }
 }
 
 /// Return true if quitting now would discard work the user might want.
 fn has_pending_work(app: &App) -> bool {
-    !app.dst.selected.is_empty() || app.unresolved_errors
+    !app.dst.selected.is_empty() || app.unresolved_errors || app.shop_outstanding() > 0
 }
 
 fn try_quit(app: &mut App) {
@@ -60,6 +64,9 @@ fn try_quit(app: &mut App) {
     }
     if app.unresolved_errors {
         bits.push("unresolved apply errors".into());
+    }
+    if app.shop_outstanding() > 0 {
+        bits.push(format!("{} search(es) still running", app.shop_outstanding()));
     }
     app.status.warn(format!(
         "{}. Press 'q' again to confirm quit.",
@@ -103,33 +110,32 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
         (KeyCode::Char('/'), _) => {
             app.mode = InputMode::Search(app.focus);
         }
-        // Shop for the highlighted source track. Reopens existing results rather
-        // than throwing them away, and reopens a search still in flight.
+        // Cross to the shop screen, landing on this track.
         (KeyCode::Char('s'), _) => {
             app.open_shop();
         }
-        // Bulk: shop for the selected source rows.
-        (KeyCode::Char('S'), _) => {
-            app.shop_selected(BULK_SHOP_CAP);
-        }
-        // Multi-select works in both columns: destinations pick the copy targets,
-        // sources pick what to shop for with 'S'.
+        // Selection here means one thing only: the copy targets. A source is
+        // always the highlighted row, so there is nothing to select on that side.
         (KeyCode::Char(' '), _) => {
-            let col = app.focused_column();
-            let id = col
+            if !matches!(app.focus, Focus::Dst) {
+                app.status
+                    .info("the source is the highlighted row — 's' shops for it, Tab picks destinations.");
+                return;
+            }
+            let id = app
+                .dst
                 .visible
-                .get(col.cursor)
+                .get(app.dst.cursor)
                 .and_then(|&i| app.rows.get(i))
                 .map(|r| r.id.clone());
-            if let Some(id) = id {
-                let col = app.focused_column_mut();
-                if !col.selected.remove(&id) {
-                    col.selected.insert(id);
-                }
+            if let Some(id) = id
+                && !app.dst.selected.remove(&id)
+            {
+                app.dst.selected.insert(id);
             }
         }
         (KeyCode::Char('c'), _) => {
-            app.focused_column_mut().selected.clear();
+            app.dst.selected.clear();
         }
         (KeyCode::Char('a'), _) => {
             app.dst_filters.auto = !app.dst_filters.auto;
@@ -323,36 +329,88 @@ fn apply_pending(app: &mut App) {
     }
 }
 
-/// The offer-table overlay.
+/// The shop screen: a track list on the left, offers on the right.
 ///
-/// Kept read-only on purpose: browsing offers and opening a buy page cannot touch
-/// `master.db`, so nothing here needs the safety preflight. Actually fetching a
-/// file is left to the CLI, where a multi-minute download can show real progress.
+/// Only downloading writes anything, and it writes a file rather than the
+/// database — browsing offers and opening a buy page cannot touch `master.db`,
+/// so nothing here needs the safety preflight. The transfer it queues is applied
+/// later, through the same gated path as everything else.
 fn handle_shop(app: &mut App, key: KeyEvent) {
     match (key.code, key.modifiers) {
+        // Esc leaves the screen rather than quitting: quitting is the transfer
+        // screen's job, so a stray Esc here cannot lose a queue of searches.
         (KeyCode::Esc, _) | (KeyCode::Char('q'), _) => {
-            app.mode = InputMode::Normal;
+            app.screen = Screen::Transfer;
         }
-        (KeyCode::Up, _) | (KeyCode::Char('k'), _) => app.shop.move_cursor(-1),
-        (KeyCode::Down, _) | (KeyCode::Char('j'), _) => app.shop.move_cursor(1),
-        (KeyCode::PageUp, _) => app.shop.move_cursor(-10),
-        (KeyCode::PageDown, _) => app.shop.move_cursor(10),
-        (KeyCode::Char('g'), _) => app.shop.move_cursor(isize::MIN / 2),
-        (KeyCode::Char('G'), _) => app.shop.move_cursor(isize::MAX / 2),
-        // Re-run the search for the current source track, discarding these.
-        (KeyCode::Char('r'), _) => {
-            app.start_shop();
+        (KeyCode::Char('?'), _) => {
+            app.mode = InputMode::Help;
+        }
+        (KeyCode::Tab, _) | (KeyCode::BackTab, _) => app.toggle_shop_focus(),
+        (KeyCode::Char('/'), _) => {
+            app.shop_focus = ShopFocus::Tracks;
+            app.mode = InputMode::ShopSearch;
+        }
+        (KeyCode::Up, _) | (KeyCode::Char('k'), _) => app.shop_move(-1),
+        (KeyCode::Down, _) | (KeyCode::Char('j'), _) => app.shop_move(1),
+        (KeyCode::PageUp, _) => app.shop_move(-10),
+        (KeyCode::PageDown, _) => app.shop_move(10),
+        (KeyCode::Char('g'), _) => app.shop_jump(true),
+        (KeyCode::Char('G'), _) => app.shop_jump(false),
+        (KeyCode::Char(' '), _) => app.toggle_basket(),
+        (KeyCode::Char('c'), _) => {
+            app.shop_list.selected.clear();
+            app.status.info("basket emptied.");
+        }
+        // Add to the shopping list, or show what it already found.
+        (KeyCode::Char('s'), _) => {
+            app.shop_track();
         }
         (KeyCode::Char('S'), _) => {
             app.shop_selected(BULK_SHOP_CAP);
         }
-        // Enter does the useful thing: download it.
-        (KeyCode::Enter, _) | (KeyCode::Char('f'), _) => {
+        // Re-run one search, keeping every other result.
+        (KeyCode::Char('r'), _) => {
+            app.start_shop();
+        }
+        // Enter does the useful thing for whichever pane you are in.
+        (KeyCode::Enter, _) => match app.shop_focus {
+            ShopFocus::Tracks => {
+                app.shop_track();
+            }
+            ShopFocus::Offers => {
+                app.start_fetch();
+            }
+        },
+        (KeyCode::Char('f'), _) => {
             app.start_fetch();
         }
         // Opening the page is for buying something you don't own yet.
         (KeyCode::Char('o'), _) => open_selected_offer(app),
         (KeyCode::Char('y'), _) => show_selected_ref(app),
+        _ => {}
+    }
+}
+
+/// Typing into the shop screen's track filter.
+fn handle_shop_search(app: &mut App, key: KeyEvent) {
+    match (key.code, key.modifiers) {
+        (KeyCode::Esc, _) | (KeyCode::Enter, _) => {
+            app.mode = InputMode::Normal;
+        }
+        (KeyCode::Backspace, _) => {
+            app.shop_list.query.pop();
+            app.recompute_visible();
+        }
+        (KeyCode::Char('u'), KeyModifiers::CONTROL) => {
+            app.shop_list.query.clear();
+            app.recompute_visible();
+        }
+        (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => {
+            app.shop_list.query.push(c);
+            app.recompute_visible();
+        }
+        (KeyCode::Up, _) => app.shop_list.move_by(-1),
+        (KeyCode::Down, _) => app.shop_list.move_by(1),
         _ => {}
     }
 }

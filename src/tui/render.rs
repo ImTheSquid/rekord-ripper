@@ -6,11 +6,23 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 
 use crate::format::{file_type_name, format_bpm, format_length};
 
-use super::app::{App, Focus, InputMode, StatusLevel};
+use super::app::{App, Focus, InputMode, Screen, ShopFocus, ShopTrackState, StatusLevel};
 use super::data::TrackRow;
 use super::diff::render_pair;
 
 pub fn draw(f: &mut Frame, app: &App) {
+    match app.screen {
+        Screen::Transfer => draw_transfer(f, app),
+        Screen::Shop => draw_shop_screen(f, app),
+    }
+    match app.mode {
+        InputMode::Confirm => draw_confirm(f, app),
+        InputMode::Help => draw_help(f),
+        _ => {}
+    }
+}
+
+fn draw_transfer(f: &mut Frame, app: &App) {
     let outer = Layout::vertical([
         Constraint::Length(1), // top bar
         Constraint::Min(0),    // body (columns + preview)
@@ -33,13 +45,6 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     draw_preview(f, body[1], app);
     draw_status(f, outer[2], app);
-
-    match app.mode {
-        InputMode::Confirm => draw_confirm(f, app),
-        InputMode::Help => draw_help(f),
-        InputMode::Shop => draw_shop(f, app),
-        _ => {}
-    }
 }
 
 fn draw_top_bar(f: &mut Frame, area: Rect, app: &App) {
@@ -60,14 +65,7 @@ fn draw_top_bar(f: &mut Frame, area: Rect, app: &App) {
 
 fn draw_column(f: &mut Frame, area: Rect, app: &App, which: Focus) {
     let (state, label, extras) = match which {
-        Focus::Src => {
-            let t = if app.src.selected.is_empty() {
-                String::new()
-            } else {
-                format!(" [{} picked]", app.src.selected.len())
-            };
-            (&app.src, "SOURCES", t)
-        }
+        Focus::Src => (&app.src, "SOURCES", String::new()),
         Focus::Dst => {
             let mut tags = Vec::new();
             if app.dst_filters.auto {
@@ -124,14 +122,9 @@ fn draw_column(f: &mut Frame, area: Rect, app: &App, which: Focus) {
     let mut items: Vec<ListItem> = Vec::with_capacity(state.visible.len() * 2);
     for (visible_pos, &row_idx) in state.visible.iter().enumerate() {
         let row = &app.rows[row_idx];
-        // A tick means "this row is in the batch": the cursor for sources when
-        // nothing is picked, plus anything explicitly selected in either column.
-        let marked = state.selected.contains(&row.id)
-            || (matches!(which, Focus::Src)
-                && state.selected.is_empty()
-                && visible_pos == state.cursor);
-        // "Active" = would participate in apply: src cursor row, or dst
-        // selections (or dst cursor row if no explicit selection).
+        // A tick means "this row is in the batch": the cursor row for sources
+        // (there is only ever one source), and the selection for destinations —
+        // falling back to the cursor row when nothing is picked.
         let active = match which {
             Focus::Src => visible_pos == state.cursor,
             Focus::Dst => {
@@ -144,7 +137,7 @@ fn draw_column(f: &mut Frame, area: Rect, app: &App, which: Focus) {
         } else {
             Style::new()
         };
-        items.push(track_item_line1(row, marked).style(row_style));
+        items.push(track_item_line1(row, active).style(row_style));
         items.push(track_item_line2(row).style(row_style));
     }
 
@@ -233,7 +226,14 @@ fn draw_preview(f: &mut Frame, area: Rect, app: &App) {
 fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     let parts = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(area);
 
-    let hints = "tab focus  / search  s shop  space select  a auto  f fuzzy  r replace  l lock  enter apply  ? help  q quit";
+    let hints = match app.screen {
+        Screen::Transfer => {
+            "tab focus  / search  s shop  space pick dest  a auto  f fuzzy  r replace  l lock  enter apply  ? help  q quit"
+        }
+        Screen::Shop => {
+            "tab pane  / filter  s search  space basket  S search basket  r re-search  enter download  o buy page  y ref  esc back"
+        }
+    };
     f.render_widget(
         Paragraph::new(hints).style(Style::new().fg(Color::DarkGray)),
         parts[0],
@@ -325,17 +325,254 @@ fn draw_confirm(f: &mut Frame, app: &App) {
     f.render_widget(para, area);
 }
 
+/// The shop screen: a track list on the left, offers on the right.
+///
+/// A screen rather than an overlay on the transfer view. As an overlay it shared
+/// the track cursor and `Space` with that view, so selecting sources and then
+/// stepping across to DESTINATIONS was reachable and meant nothing at all. Each
+/// screen now owns its own list and its own selection.
+fn draw_shop_screen(f: &mut Frame, app: &App) {
+    let outer = Layout::vertical([
+        Constraint::Length(1), // top bar
+        Constraint::Min(0),    // tracks + offers
+        Constraint::Length(2), // status bar
+    ])
+    .split(f.area());
+
+    draw_shop_top_bar(f, outer[0], app);
+    let cols = Layout::horizontal([Constraint::Percentage(34), Constraint::Min(0)]).split(outer[1]);
+    draw_shop_tracks(f, cols[0], app);
+    draw_shop_offers(f, cols[1], app);
+    draw_status(f, outer[2], app);
+}
+
+fn draw_shop_top_bar(f: &mut Frame, area: Rect, app: &App) {
+    let mut spans = vec![Span::styled("shop", Style::new().bold().magenta())];
+    // The full label of the highlighted track: the track pane is narrow enough to
+    // clip a long title, and this is the one place with room for all of it.
+    if let Some(row) = app.current_shop_track() {
+        spans.push(Span::raw(format!(
+            "  {} — {}",
+            display_artist(row),
+            display_title(row)
+        )));
+    }
+    // The spinner lives here rather than in the table: results stay on screen
+    // while more searches run, and a line appearing above them would shove the
+    // whole table down a row.
+    let queued = app.shop_outstanding();
+    if queued > 0 {
+        spans.push(Span::styled(
+            format!("  {} {queued} search(es) running", spinner(app.shop_since())),
+            Style::new().fg(Color::Cyan),
+        ));
+    } else {
+        spans.push(Span::styled("  esc → transfer", Style::new().fg(Color::DarkGray)));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// The library, filtered, with each track's search state.
+fn draw_shop_tracks(f: &mut Frame, area: Rect, app: &App) {
+    let focused = app.shop_focus == ShopFocus::Tracks;
+    let basket = app.shop_list.selected.len();
+    let title = if basket > 0 {
+        format!(
+            " TRACKS ({}) [basket {basket}] ",
+            app.shop_list.visible.len()
+        )
+    } else {
+        format!(" TRACKS ({}) ", app.shop_list.visible.len())
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(pane_border(focused))
+        .title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let parts = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
+    let typing = matches!(app.mode, InputMode::ShopSearch);
+    let bar = format!(
+        " / {}{}",
+        app.shop_list.query,
+        if typing { "_" } else { "" }
+    );
+    f.render_widget(
+        Paragraph::new(bar).style(if typing {
+            Style::new().bold()
+        } else {
+            Style::new().dim()
+        }),
+        parts[0],
+    );
+
+    let items: Vec<ListItem> = app
+        .shop_list
+        .visible
+        .iter()
+        .map(|&i| {
+            let row = &app.rows[i];
+            let in_basket = app.shop_list.selected.contains(&row.id);
+            // The state tag is what makes a queue of searches legible: how many
+            // offers each track found, and which are still waiting their turn.
+            let (tag, tag_style) = match app.shop_track_state(&row.id) {
+                ShopTrackState::Done(0) => ("  · ".to_string(), Style::new().fg(Color::DarkGray)),
+                ShopTrackState::Done(n) => (format!("{n:>3} "), Style::new().fg(Color::Green)),
+                ShopTrackState::Queued => ("  … ".to_string(), Style::new().fg(Color::Cyan)),
+                ShopTrackState::Untouched => ("    ".to_string(), Style::new()),
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    if in_basket { "✓ " } else { "  " },
+                    Style::new().fg(Color::Yellow).bold(),
+                ),
+                Span::styled(tag, tag_style),
+                Span::styled(display_title(row).to_string(), Style::new().bold()),
+                Span::styled(
+                    format!(" — {}", display_artist(row)),
+                    Style::new().fg(Color::Gray),
+                ),
+            ]))
+        })
+        .collect();
+
+    let mut state = ListState::default();
+    if !app.shop_list.visible.is_empty() {
+        state.select(Some(app.shop_list.cursor));
+    }
+    let list = List::new(items).highlight_style(if focused {
+        Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+    } else {
+        Style::new().add_modifier(Modifier::BOLD)
+    });
+    f.render_stateful_widget(list, parts[1], &mut state);
+}
+
 /// The offer table, and — the reason the worker exists — a live "searching"
 /// state instead of a frozen screen.
-fn draw_shop(f: &mut Frame, app: &App) {
-    use super::app::{FetchState, ShopState};
+fn draw_shop_offers(f: &mut Frame, area: Rect, app: &App) {
+    let focused = app.shop_focus == ShopFocus::Offers;
+    let view = offer_body(app, area.width.saturating_sub(2), focused);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(pane_border(focused))
+        .title(view.title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
 
-    // Wide, because the point of the table is reading artist and title.
-    let area = popup_area(f.area(), 96, 84);
-    f.render_widget(Clear, area);
+    let detail = detail_lines(app, inner.width);
+    // A fixed share, so the table does not jump every time the highlighted
+    // offer's url wraps to a different number of lines.
+    let want = (detail.len() as u16).min(inner.height * 2 / 5);
+    let parts = Layout::vertical([
+        // The column header is pinned: it used to be row 0 of the scrolling body,
+        // so scrolling down to a later track's offers left an unlabelled table.
+        Constraint::Length(u16::from(view.header.is_some())),
+        Constraint::Min(0),
+        Constraint::Length(want),
+    ])
+    .split(inner);
 
+    if let Some(header) = view.header {
+        f.render_widget(Paragraph::new(header), parts[0]);
+    }
+    let scroll = scroll_for(view.cursor_line, view.lines.len(), parts[1].height as usize);
+    f.render_widget(
+        Paragraph::new(view.lines).scroll((scroll as u16, 0)),
+        parts[1],
+    );
+    if want > 0 {
+        f.render_widget(Paragraph::new(detail), parts[2]);
+    }
+}
+
+/// Scroll offset that keeps `cursor_line` inside a pane `height` rows tall.
+///
+/// The offer table has no scrolling of its own — it is a `Paragraph`, not a
+/// `List` — so once a few tracks are searched the cursor would otherwise walk
+/// off the bottom with no way to follow it.
+fn scroll_for(cursor_line: Option<usize>, total: usize, height: usize) -> usize {
+    cursor_line
+        .map(|c| c.saturating_sub(height / 2))
+        .unwrap_or(0)
+        .min(total.saturating_sub(height))
+}
+
+fn pane_border(focused: bool) -> Style {
+    if focused {
+        Style::new().fg(Color::Cyan)
+    } else {
+        Style::new().fg(Color::DarkGray)
+    }
+}
+
+/// Animated from elapsed time, so it visibly advances on every 300ms tick and
+/// the user can tell the difference between working and hung.
+fn spinner(since: Option<std::time::Instant>) -> &'static str {
+    // Process start, so a spinner with no job start time — a queued search while
+    // earlier results are still on screen — still animates.
+    static START: std::sync::LazyLock<std::time::Instant> =
+        std::sync::LazyLock::new(std::time::Instant::now);
+    const FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
+    let ms = since.unwrap_or(*START).elapsed().as_millis();
+    FRAMES[(ms / 300) as usize % FRAMES.len()]
+}
+
+fn display_title(row: &TrackRow) -> &str {
+    if row.title.is_empty() {
+        "(untitled)"
+    } else {
+        &row.title
+    }
+}
+
+fn display_artist(row: &TrackRow) -> &str {
+    if row.artist.is_empty() {
+        "—"
+    } else {
+        &row.artist
+    }
+}
+
+/// Everything `draw_shop_offers` needs to lay the pane out.
+struct OfferView {
+    title: String,
+    /// The column header, pinned above the scrolling rows. `None` when there is
+    /// no table — searching, failed, or nothing searched yet.
+    header: Option<Line<'static>>,
+    lines: Vec<Line<'static>>,
+    cursor_line: Option<usize>,
+}
+
+fn offer_body(app: &App, width: u16, focused: bool) -> OfferView {
+    use super::app::ShopState;
+
+    let mut cursor_line: Option<usize> = None;
+    let mut header: Option<Line<'static>> = None;
     let (title, body_lines): (String, Vec<Line>) = match &app.shop {
-        ShopState::Idle => (" SHOP ".into(), vec![Line::from("nothing to show.")]),
+        ShopState::Idle => (
+            " OFFERS ".into(),
+            vec![
+                Line::from(Span::styled(
+                    "nothing searched yet.",
+                    Style::new().fg(Color::DarkGray),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  's' searches the highlighted track. Tap it on several and they",
+                    Style::new().fg(Color::DarkGray),
+                )),
+                Line::from(Span::styled(
+                    "  search one after another, results accumulating here.",
+                    Style::new().fg(Color::DarkGray),
+                )),
+                Line::from(Span::styled(
+                    "  Space fills the basket; 'S' searches all of it.",
+                    Style::new().fg(Color::DarkGray),
+                )),
+            ],
+        ),
 
         ShopState::Searching {
             since,
@@ -344,11 +581,8 @@ fn draw_shop(f: &mut Frame, app: &App) {
             total,
             ..
         } => {
-            // Animated from elapsed time, so it visibly advances on every 300ms
-            // tick and the user can tell the difference between working and hung.
-            const FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
             let secs = since.elapsed().as_secs();
-            let frame = FRAMES[(since.elapsed().as_millis() / 300) as usize % FRAMES.len()];
+            let frame = spinner(Some(*since));
             let mut lines = vec![
                 Line::from(vec![
                     Span::styled(format!("{frame} "), Style::new().fg(Color::Cyan)),
@@ -378,11 +612,11 @@ fn draw_shop(f: &mut Frame, app: &App) {
                 "  Esc steps away without losing this; 's' brings it back",
                 Style::new().fg(Color::DarkGray),
             )));
-            (" SHOP — searching ".into(), lines)
+            (" OFFERS — searching ".into(), lines)
         }
 
         ShopState::Failed(why) => (
-            " SHOP — failed ".into(),
+            " OFFERS — failed ".into(),
             vec![Line::from(Span::styled(
                 why.clone(),
                 Style::new().fg(Color::Red),
@@ -390,17 +624,11 @@ fn draw_shop(f: &mut Frame, app: &App) {
         ),
 
         ShopState::Results { groups, cursor, .. } => {
-            // Give the leftover width to artist/title instead of a fixed 38, so a
-            // wide terminal actually shows the name.
-            let title_w = title_width(area.width);
-            let fmt_w = FORMATS_W as usize;
-            let mut lines = vec![Line::from(Span::styled(
-                format!(
-                    "{:<2}{:<11} {:<title_w$} {:<fmt_w$} {:<16} {:<4}",
-                    "L", "backend", "artist / title", "formats", "price", "own"
-                ),
+            header = Some(Line::from(Span::styled(
+                offer_header(width),
                 Style::new().add_modifier(Modifier::BOLD),
-            ))];
+            )));
+            let mut lines: Vec<Line> = Vec::new();
 
             // Flatten the groups, inserting a header per group so a bulk search
             // shows which track each block of offers belongs to.
@@ -424,24 +652,30 @@ fn draw_shop(f: &mut Frame, app: &App) {
                 for r in g.outcome.offers.iter() {
                     let o = &r.offer;
                     let selected = i == *cursor;
+                    if selected {
+                        cursor_line = Some(lines.len());
+                    }
                     i += 1;
-                    let style = if selected {
-                        Style::new()
-                            .bg(Color::DarkGray)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::new()
+                    // Dimmed when the pane is not focused, so it is obvious which
+                    // list the arrow keys are driving.
+                    let style = match (selected, focused) {
+                        (true, true) => Style::new()
+                            .add_modifier(Modifier::REVERSED | Modifier::BOLD),
+                        (true, false) => Style::new().add_modifier(Modifier::BOLD),
+                        (false, _) => Style::new(),
                     };
                     // Lossless is the whole point, so mark it in the row itself.
-                    let marker = lossless_marker(o);
                     lines.push(Line::from(Span::styled(
-                        format!(
-                            "{marker} {:<11} {:<title_w$} {:<fmt_w$} {:<16} {:<4}",
-                            o.backend().as_str(),
-                            clip_cell(&format!("{} — {}", o.artist, o.title), title_w),
-                            clip_cell(&crate::acquire::render::format_cell(o), fmt_w),
-                            clip_cell(&crate::acquire::render::price_cell(o), 16),
-                            crate::acquire::render::ownership_cell(o),
+                        offer_row(
+                            Row {
+                                marker: lossless_marker(o),
+                                backend: o.backend().as_str(),
+                                title: &format!("{} — {}", o.artist, o.title),
+                                formats: &crate::acquire::render::format_cell(o),
+                                price: &crate::acquire::render::price_cell(o),
+                                own: crate::acquire::render::ownership_cell(o),
+                            },
+                            width,
                         ),
                         style,
                     )));
@@ -503,85 +737,41 @@ fn draw_shop(f: &mut Frame, app: &App) {
                 }
             }
 
-            // Full, untruncated detail for the highlighted row. The table has to
-            // fit columns; this does not, so nothing is hidden behind an ellipsis.
-            if let Some(r) = app.shop.selected() {
-                let o = &r.offer;
-                lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled(
-                    "selected".to_string(),
-                    Style::new().add_modifier(Modifier::BOLD),
-                )));
-                for (label, value) in [
-                    ("artist", o.artist.clone()),
-                    ("title", o.title.clone()),
-                    ("album", o.album.clone().unwrap_or_else(|| "—".into())),
-                    (
-                        "formats",
-                        match &o.formats {
-                            None => "not checked yet".into(),
-                            Some(fs) if fs.is_empty() => "none usable".into(),
-                            Some(fs) => fs
-                                .iter()
-                                .map(|f| f.to_string())
-                                .collect::<Vec<_>>()
-                                .join(", "),
-                        },
-                    ),
-                    ("price", crate::acquire::render::price_cell(o)),
-                    ("url", o.url.clone()),
-                    ("ref", o.item_ref.to_string()),
-                ] {
-                    // Wrapped rather than clipped, so a long url or title is
-                    // readable in full.
-                    for (i, chunk) in wrap(&value, detail_width(area.width))
-                        .into_iter()
-                        .enumerate()
-                    {
-                        let head = if i == 0 { label } else { "" };
-                        lines.push(Line::from(vec![
-                            Span::styled(format!("  {head:<9} "), Style::new().fg(Color::DarkGray)),
-                            Span::raw(chunk),
-                        ]));
-                    }
-                }
-                if let Some(e) = &o.enrich_error {
-                    lines.push(Line::from(Span::styled(
-                        format!("  {:<9} {e}", "note"),
-                        Style::new().fg(Color::Yellow),
-                    )));
-                }
-            }
-
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                MARKER_LEGEND,
-                Style::new().fg(Color::DarkGray),
-            )));
-            lines.push(Line::from(Span::styled(
-                "j/k move   Enter download   o open buy page   y show ref   r re-search   Esc close",
-                Style::new().fg(Color::DarkGray),
-            )));
             let title = if multi {
-                format!(" SHOP — {i} offers across {} tracks ", groups.len())
+                format!(" OFFERS — {i} across {} tracks ", groups.len())
             } else {
-                format!(" SHOP — {i} offers ")
+                format!(" OFFERS — {i} ")
             };
             (title, lines)
         }
     };
+    OfferView {
+        title,
+        header,
+        lines: body_lines,
+        cursor_line,
+    }
+}
 
-    // A download in flight is shown alongside the table, not instead of it, so
-    // you can still see what you picked.
-    let mut body_lines = body_lines;
+/// Everything about the highlighted offer that the table had to clip, plus
+/// whatever a download is currently doing.
+///
+/// Its own pane rather than more table rows: a long url wraps to a different
+/// number of lines per offer, and appending that to the table made it jump
+/// around under the cursor.
+fn detail_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+    use super::app::FetchState;
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // A download in flight goes first, because it is the thing you are waiting
+    // on and it must never be the part that gets clipped.
     match &app.fetch {
         FetchState::Idle => {}
         FetchState::Running { since, what } => {
-            const FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
-            let frame = FRAMES[(since.elapsed().as_millis() / 300) as usize % FRAMES.len()];
-            body_lines.push(Line::from(vec![
+            lines.push(Line::from(vec![
                 Span::styled(
-                    format!("{frame} downloading "),
+                    format!("{} downloading ", spinner(Some(*since))),
                     Style::new().fg(Color::Cyan),
                 ),
                 Span::raw(what.clone()),
@@ -593,7 +783,7 @@ fn draw_shop(f: &mut Frame, app: &App) {
         }
         FetchState::Done { paths, queued } => {
             for p in paths {
-                body_lines.push(Line::from(Span::styled(
+                lines.push(Line::from(Span::styled(
                     format!(
                         "saved {}",
                         p.file_name()
@@ -603,7 +793,7 @@ fn draw_shop(f: &mut Frame, app: &App) {
                     Style::new().fg(Color::Green),
                 )));
             }
-            body_lines.push(Line::from(Span::styled(
+            lines.push(Line::from(Span::styled(
                 match queued {
                     Some(id) => format!(
                         "queued transfer #{id} — import the download folder, then `pending --apply`"
@@ -614,18 +804,58 @@ fn draw_shop(f: &mut Frame, app: &App) {
             )));
         }
         FetchState::Failed(why) => {
-            body_lines.push(Line::from(Span::styled(
+            lines.push(Line::from(Span::styled(
                 format!("download failed: {why}"),
                 Style::new().fg(Color::Red),
             )));
         }
     }
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::new().fg(Color::Cyan))
-        .title(title);
-    f.render_widget(Paragraph::new(body_lines).block(block), area);
+    if let Some(r) = app.shop.selected() {
+        let o = &r.offer;
+        lines.push(Line::from(Span::styled(
+            MARKER_LEGEND,
+            Style::new().fg(Color::DarkGray),
+        )));
+        for (label, value) in [
+            ("artist", o.artist.clone()),
+            ("title", o.title.clone()),
+            ("album", o.album.clone().unwrap_or_else(|| "—".into())),
+            (
+                "formats",
+                match &o.formats {
+                    None => "not checked yet".into(),
+                    Some(fs) if fs.is_empty() => "none usable".into(),
+                    Some(fs) => fs
+                        .iter()
+                        .map(|f| f.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                },
+            ),
+            ("price", crate::acquire::render::price_cell(o)),
+            ("url", o.url.clone()),
+            ("ref", o.item_ref.to_string()),
+        ] {
+            // Wrapped rather than clipped, so a long url or title is readable
+            // in full.
+            for (i, chunk) in wrap(&value, detail_width(width)).into_iter().enumerate() {
+                let head = if i == 0 { label } else { "" };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {head:<9} "), Style::new().fg(Color::DarkGray)),
+                    Span::raw(chunk),
+                ]));
+            }
+        }
+        if let Some(e) = &o.enrich_error {
+            lines.push(Line::from(Span::styled(
+                format!("  {:<9} {e}", "note"),
+                Style::new().fg(Color::Yellow),
+            )));
+        }
+    }
+
+    lines
 }
 
 /// What the `L` column shows.
@@ -642,25 +872,97 @@ fn lossless_marker(o: &crate::acquire::types::Offer) -> &'static str {
 }
 
 /// The legend for [`lossless_marker`]. Kept next to it so the two stay in step.
-const MARKER_LEGEND: &str =
-    "L: * has lossless, ? formats not checked yet (only the top few offers are probed)";
-
-/// Fixed columns either side of artist/title: marker, backend, formats, price,
-/// own, plus their separators.
-const FIXED_COLUMNS: u16 = 2 + 11 + 1 + FORMATS_W + 1 + 16 + 1 + 4;
+const MARKER_LEGEND: &str = "L: * lossless, ? formats not checked (only top offers are probed)";
 
 /// Wide enough for three format names, which is what `format_cell` shows.
 const FORMATS_W: u16 = 23;
 
-/// Width available to artist/title inside the overlay.
-fn title_width(popup_width: u16) -> usize {
-    let inner = popup_width.saturating_sub(2); // borders
-    inner.saturating_sub(FIXED_COLUMNS).max(24) as usize
+/// The `own` column, dropped whole when the pane is too narrow for it.
+const OWN_W: u16 = 4;
+
+const BACKEND_W: u16 = 11;
+const PRICE_W: u16 = 16;
+const MARKER_W: u16 = 2;
+
+/// Narrowest artist/title worth showing.
+const MIN_TITLE_W: u16 = 20;
+
+/// Every column except artist/title and `own`, plus the three separators between
+/// them. Derived from the same pieces [`offer_row`] formats, so the two cannot
+/// drift — they did, by one column, and the row silently ran off the pane.
+const FIXED_NO_OWN: u16 = MARKER_W + BACKEND_W + FORMATS_W + PRICE_W + 3;
+
+/// The same, with `own` and its separator.
+const FIXED_COLUMNS: u16 = FIXED_NO_OWN + 1 + OWN_W;
+
+/// True when the pane has room for the `own` column.
+fn shows_ownership(content_width: u16) -> bool {
+    content_width >= FIXED_COLUMNS + MIN_TITLE_W
+}
+
+/// Width available to artist/title, given the pane's usable width.
+fn title_width(content_width: u16) -> usize {
+    let fixed = if shows_ownership(content_width) {
+        FIXED_COLUMNS
+    } else {
+        FIXED_NO_OWN
+    };
+    content_width.saturating_sub(fixed).max(MIN_TITLE_W) as usize
+}
+
+/// The cells of one offer-table row.
+struct Row<'a> {
+    marker: &'a str,
+    backend: &'a str,
+    title: &'a str,
+    formats: &'a str,
+    price: &'a str,
+    own: &'a str,
+}
+
+/// Render one row, sized to `content_width`.
+///
+/// The header goes through here too, so a column change cannot update one and
+/// leave the other behind — they are drawn as separate widgets, since the header
+/// is pinned outside the scroll region.
+fn offer_row(r: Row<'_>, content_width: u16) -> String {
+    let tw = title_width(content_width);
+    let mut s = format!(
+        "{:<mw$}{:<bw$} {:<tw$} {:<fw$} {:<pw$}",
+        r.marker,
+        clip_cell(r.backend, BACKEND_W as usize),
+        clip_cell(r.title, tw),
+        clip_cell(r.formats, FORMATS_W as usize),
+        clip_cell(r.price, PRICE_W as usize),
+        mw = MARKER_W as usize,
+        bw = BACKEND_W as usize,
+        fw = FORMATS_W as usize,
+        pw = PRICE_W as usize,
+    );
+    if shows_ownership(content_width) {
+        s.push_str(&format!(" {}", clip_cell(r.own, OWN_W as usize)));
+    }
+    s
+}
+
+/// The column header row.
+fn offer_header(content_width: u16) -> String {
+    offer_row(
+        Row {
+            marker: "L",
+            backend: "backend",
+            title: "artist / title",
+            formats: "formats",
+            price: "price",
+            own: "own",
+        },
+        content_width,
+    )
 }
 
 /// Width available to a wrapped detail value, after its label gutter.
-fn detail_width(popup_width: u16) -> usize {
-    popup_width.saturating_sub(2 + 12).max(24) as usize
+fn detail_width(content_width: u16) -> usize {
+    content_width.saturating_sub(12).max(24) as usize
 }
 
 /// Break `s` into chunks of at most `width` characters, on whitespace where
@@ -728,38 +1030,50 @@ fn draw_help(f: &mut Frame) {
 }
 
 const HELP_BODY: &str = "\
-Tab / Shift-Tab    Switch focus between SOURCES and DESTINATIONS
-↑ ↓ / k j          Move cursor
-PgUp / PgDn        Page
-g / G              Jump top / bottom
-/                  Search the focused column (Esc/Enter to leave)
-s                  Add the highlighted source track to the shopping list. Tap it
-                   on several tracks and they search one after another, results
-                   accumulating. On an already-searched track it just shows the
-                   results again
-S                  Add every SELECTED source track to the shopping list
-Space              Select rows: destinations are copy targets, sources are what
-                   S shops for
-Ctrl-U             Clear search query (in search mode)
-c                  Clear the focused column's selection
-a                  Toggle dest auto-mode (unlocked + cueless + audio)
-f                  Toggle dest fuzzy-match-from-source filter
-r                  Toggle --replace
-l                  Toggle --lock (set lock on dst after copy)
-R                  Force-reload tracks from master.db
-Enter              Build plans and open confirm modal
-y / Enter          (Confirm) Apply the batch
-n / Esc / q        (Confirm) Cancel
-Enter / f          (Shop) Download the highlighted offer, and queue an analysis
-                   transfer from the selected source track onto it
-o                  (Shop) Open the offer's page in a browser (to buy it)
-y                  (Shop) Show the offer's stable ref, for use with the CLI
-r                  (Shop) Re-run the search for the highlighted track only,
-                   keeping results for the others
-j / k              (Shop) Move; full details for the highlighted row are shown
-                   below the table
+Two screens. Each one's selection means exactly one thing.
+
+TRANSFER SCREEN — copy analysis from one track onto others
+  Tab / Shift-Tab  Switch focus between SOURCES and DESTINATIONS
+  ↑ ↓ / k j        Move cursor
+  PgUp / PgDn      Page
+  g / G            Jump top / bottom
+  /                Filter the focused column (Esc/Enter to leave, Ctrl-U clears)
+  Space            Pick a DESTINATION. The source is always the highlighted
+                   SOURCES row, so there is nothing to select on that side
+  c                Clear the destination selection
+  a                Toggle dest auto-mode (unlocked + cueless + audio)
+  f                Toggle dest fuzzy-match-from-source filter
+  r                Toggle --replace
+  l                Toggle --lock (set lock on dst after copy)
+  R                Force-reload tracks from master.db
+  s                Go shopping for the highlighted source track
+  Enter            Build plans and open the confirm modal
+  y / Enter        (Confirm) Apply the batch
+  n / Esc / q      (Confirm) Cancel
+
+SHOP SCREEN — find and download better copies
+  Tab              Switch focus between TRACKS and OFFERS
+  ↑ ↓ / k j        Move cursor in the focused pane
+  /                Filter the track list (Ctrl-U clears)
+  s                Search for the highlighted track. Tap it on several and they
+                   search one after another, results accumulating. On an
+                   already-searched track it just shows what it found
+  Space            Add the highlighted track to the basket
+  S                Search every track in the basket
+  c                Empty the basket
+  r                Re-run one search, keeping every other result
+  Enter            (Tracks) Search it   (Offers) Download it
+  f                Download the highlighted offer, and queue an analysis
+                   transfer from its own source track onto the download
+  o                Open the offer's page in a browser (to buy it)
+  y                Show the offer's stable ref, for use with the CLI
+  Esc / q          Back to the transfer screen
+
+  The tag beside each track is what its search found: a count, · for nothing,
+  … for still queued.
+
 ?                  This help
-q / Esc            Quit
+q / Esc            Quit (from the transfer screen)
 ";
 
 /// A centred popup just big enough for `body`, clamped to `area`.
@@ -850,11 +1164,98 @@ mod tests {
 
     #[test]
     fn title_column_grows_with_the_terminal() {
-        let narrow = title_width(80);
+        let narrow = title_width(90);
         let wide = title_width(200);
         assert!(wide > narrow, "{wide} should exceed {narrow}");
         // And never collapses to nothing on a small terminal.
-        assert!(title_width(40) >= 24);
+        assert!(title_width(40) >= MIN_TITLE_W as usize);
+    }
+
+    #[test]
+    fn a_row_never_overruns_its_pane() {
+        // Overrun is invisible: ratatui just clips the right-hand columns, which
+        // is how `price` ended up reading "name your pric" with `own` gone. So
+        // measure the real string, not the arithmetic that produced it.
+        for pane in [
+            FIXED_NO_OWN + MIN_TITLE_W,
+            77,
+            79,
+            FIXED_COLUMNS + MIN_TITLE_W,
+            83,
+            100,
+            140,
+            200,
+        ] {
+            let header = offer_header(pane);
+            let row = offer_row(
+                Row {
+                    marker: "*",
+                    backend: "bandcamp",
+                    title: "Some Artist — Some Very Long Track Title Indeed",
+                    formats: "FLAC AIFF WAV",
+                    price: "name your price",
+                    own: "yes",
+                },
+                pane,
+            );
+            assert_eq!(
+                header.chars().count(),
+                pane as usize,
+                "header at pane {pane}: {header:?}"
+            );
+            assert_eq!(
+                row.chars().count(),
+                pane as usize,
+                "row at pane {pane}: {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_header_and_the_rows_line_up() {
+        // They are drawn as two separate widgets — the header is pinned outside
+        // the scroll region — so nothing else forces their columns to agree.
+        // By character, not by byte: an em dash in a title shifts every byte
+        // offset after it without moving the column at all.
+        fn col_of(s: &str, needle: &str) -> usize {
+            let at = s.find(needle).unwrap_or_else(|| panic!("no {needle:?} in {s:?}"));
+            s[..at].chars().count()
+        }
+        let header = offer_header(120);
+        let row = offer_row(
+            Row {
+                marker: "*",
+                backend: "bandcamp",
+                title: "A — B",
+                formats: "FLAC",
+                price: "free",
+                own: "yes",
+            },
+            120,
+        );
+        assert_eq!(col_of(&header, "formats"), col_of(&row, "FLAC"));
+        assert_eq!(col_of(&header, "price"), col_of(&row, "free"));
+        assert_eq!(col_of(&header, "own"), col_of(&row, "yes"));
+    }
+
+    #[test]
+    fn ownership_is_dropped_before_the_title_is_starved() {
+        assert!(
+            !shows_ownership(FIXED_NO_OWN + MIN_TITLE_W),
+            "the narrowest full row has no room for `own`"
+        );
+        assert!(shows_ownership(FIXED_COLUMNS + MIN_TITLE_W));
+        assert!(shows_ownership(200));
+    }
+
+    #[test]
+    fn the_legend_fits_the_narrowest_pane_it_is_drawn_in() {
+        let narrowest = (FIXED_NO_OWN + MIN_TITLE_W) as usize;
+        assert!(
+            MARKER_LEGEND.chars().count() <= narrowest,
+            "legend is {} wide, pane is {narrowest}",
+            MARKER_LEGEND.chars().count()
+        );
     }
 
     #[test]
@@ -922,15 +1323,60 @@ mod tests {
     }
 
     #[test]
-    fn the_help_lists_the_shop_keys() {
+    fn the_offer_table_scrolls_to_follow_its_cursor() {
+        // 60 rows in a 20-row pane.
+        assert_eq!(scroll_for(Some(0), 60, 20), 0, "top needs no scroll");
+        assert_eq!(scroll_for(Some(5), 60, 20), 0, "still on the first page");
+        assert_eq!(scroll_for(Some(30), 60, 20), 20, "centres the cursor");
+        assert_eq!(
+            scroll_for(Some(59), 60, 20),
+            40,
+            "the last row must be reachable, and not scrolled past"
+        );
+    }
+
+    #[test]
+    fn a_table_shorter_than_its_pane_never_scrolls() {
+        assert_eq!(scroll_for(Some(3), 5, 20), 0);
+        assert_eq!(scroll_for(None, 5, 20), 0);
+        // And a zero-height pane must not underflow.
+        assert_eq!(scroll_for(Some(3), 5, 0), 3);
+    }
+
+    #[test]
+    fn the_help_documents_both_screens_and_their_keys() {
         for expected in [
-            "s ",
-            "shopping list",
-            "(Shop) Download",
-            "(Shop) Open",
-            "S  ",
+            "TRANSFER SCREEN",
+            "SHOP SCREEN",
+            "Go shopping",
+            "basket",
+            "Back to the transfer screen",
         ] {
             assert!(HELP_BODY.contains(expected), "help is missing {expected:?}");
         }
+    }
+
+    #[test]
+    fn the_help_says_what_each_screens_selection_means() {
+        // The confusion this split was for: one Space key that meant "copy
+        // target" in one column and "shop for this" in another. The help has to
+        // state each meaning separately, or the split buys nothing.
+        let (transfer, shop) = HELP_BODY.split_once("SHOP SCREEN").expect("two sections");
+        assert!(
+            transfer.contains("Pick a DESTINATION"),
+            "the transfer section must say Space picks destinations"
+        );
+        assert!(
+            transfer.contains("nothing to select on that side"),
+            "the transfer section must say sources are not selectable"
+        );
+        assert!(
+            shop.contains("Add the highlighted track to the basket"),
+            "the shop section must say Space fills the basket"
+        );
+        assert!(
+            !transfer.contains("basket"),
+            "the basket belongs to the shop screen only"
+        );
     }
 }

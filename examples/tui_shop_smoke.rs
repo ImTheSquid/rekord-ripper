@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use rekord_ripper::db::{MasterDb, SafetyOpts};
-use rekord_ripper::tui::app::{App, InputMode, ShopState};
+use rekord_ripper::tui::app::{App, Screen, ShopState};
 use rekord_ripper::tui::render;
 
 fn main() -> anyhow::Result<()> {
@@ -27,20 +27,28 @@ fn main() -> anyhow::Result<()> {
         .expect("no titled track in the library");
     app.src.cursor = idx;
     app.recompute_visible();
-    let track = app.current_src().expect("cursor should resolve");
+    let track = app.current_src().expect("cursor should resolve").clone();
     println!("searching for: {} — {}", track.artist, track.title);
 
     let backend = TestBackend::new(120, 40);
     let mut term = Terminal::new(backend)?;
 
-    if !app.start_shop() {
-        println!("start_shop refused: {}", app.status.text);
+    // 's' from the transfer screen: cross to the shop screen and search.
+    if !app.open_shop() {
+        println!("open_shop refused: {}", app.status.text);
         return Ok(());
     }
-    assert_eq!(app.mode, InputMode::Shop, "overlay should open immediately");
+    assert_eq!(app.screen, Screen::Shop, "should be on the shop screen");
+    assert_eq!(
+        app.current_shop_track().map(|r| r.id.clone()),
+        Some(track.id.clone()),
+        "the shop list should land on the track we came from"
+    );
 
     let began = Instant::now();
     let mut worst_tick = Duration::ZERO;
+    // Separately, so a slow cold first draw cannot be mistaken for a slow loop.
+    let mut worst_warm = Duration::ZERO;
     let mut ticks = 0u32;
 
     loop {
@@ -51,6 +59,9 @@ fn main() -> anyhow::Result<()> {
         app.pump_worker();
         let elapsed = t0.elapsed();
         worst_tick = worst_tick.max(elapsed);
+        if ticks >= 3 {
+            worst_warm = worst_warm.max(elapsed);
+        }
         ticks += 1;
 
         if matches!(app.shop, ShopState::Results { .. } | ShopState::Failed(_)) {
@@ -64,9 +75,10 @@ fn main() -> anyhow::Result<()> {
     }
 
     println!(
-        "\nsearch took {:.1}s over {ticks} ticks; slowest tick {:.1}ms",
+        "\nsearch took {:.1}s over {ticks} ticks; slowest tick {:.1}ms, slowest after warmup {:.1}ms",
         began.elapsed().as_secs_f64(),
-        worst_tick.as_secs_f64() * 1000.0
+        worst_tick.as_secs_f64() * 1000.0,
+        worst_warm.as_secs_f64() * 1000.0
     );
     println!("status: {}\n", app.status.text);
 
@@ -130,16 +142,18 @@ fn main() -> anyhow::Result<()> {
 
     // The reported bug: step away from finished results, come back with 's'.
     {
-        use rekord_ripper::tui::app::InputMode as M;
         let before = app.shop.len();
-        app.mode = M::Normal; // Esc
+        app.screen = Screen::Transfer; // Esc
         let reopened = app.open_shop(); // s
         println!(
-            "reopen after finishing: opened={reopened} mode_is_shop={} offers_kept={} (was {before})",
-            app.mode == M::Shop,
+            "reopen after finishing: opened={reopened} on_shop_screen={} offers_kept={} (was {before})",
+            app.screen == Screen::Shop,
             app.shop.len()
         );
-        assert!(reopened && app.mode == M::Shop, "s must reopen the overlay");
+        assert!(
+            reopened && app.screen == Screen::Shop,
+            "s must come back to the shop screen"
+        );
         assert_eq!(app.shop.len(), before, "results must not be discarded");
         assert!(!app.shop_busy(), "reopening must not start a new search");
     }
@@ -147,32 +161,28 @@ fn main() -> anyhow::Result<()> {
     // The queue: tap 's' on several tracks and let them run one after another.
     if std::env::var("RR_SMOKE_QUEUE").is_ok() {
         use rekord_ripper::tui::app::ShopState as S;
-        app.src.query = std::env::var("RR_SMOKE_QUEUE").unwrap_or_default();
+        app.shop_list.query = std::env::var("RR_SMOKE_QUEUE").unwrap_or_default();
         app.recompute_visible();
-        let picks: Vec<usize> = app.src.visible.iter().take(3).copied().collect();
+        let picks: Vec<usize> = app.shop_list.visible.iter().take(3).copied().collect();
         println!("tapping s on {} tracks", picks.len());
 
         let before = app.shop.len();
         for (n, _) in picks.iter().enumerate() {
-            app.src.cursor = n;
-            app.recompute_visible();
-            app.src.cursor = n;
+            app.shop_list.cursor = n;
             let label = app
-                .current_src()
+                .current_shop_track()
                 .map(|r| format!("{} — {}", r.artist, r.title))
                 .unwrap_or_default();
-            let ok = app.open_shop();
+            let ok = app.shop_track();
             println!(
                 "  s on {label:<48} accepted={ok} outstanding={}",
                 app.shop_outstanding()
             );
         }
         // Pressing s again on the same track must not queue it twice.
-        app.src.cursor = 0;
-        app.recompute_visible();
-        app.src.cursor = 0;
+        app.shop_list.cursor = 0;
         let dup = app.shop_outstanding();
-        app.open_shop();
+        app.shop_track();
         println!(
             "  s again on the first track: outstanding {dup} -> {}",
             app.shop_outstanding()
@@ -208,11 +218,11 @@ fn main() -> anyhow::Result<()> {
     // Bulk: search for several visible source tracks at once.
     if std::env::var("RR_SMOKE_BULK").is_ok() {
         use rekord_ripper::tui::app::ShopState as S;
-        app.src.query = std::env::var("RR_SMOKE_BULK").unwrap_or_default();
+        app.shop_list.query = std::env::var("RR_SMOKE_BULK").unwrap_or_default();
         app.recompute_visible();
-        // Select a few of the filtered rows, the way space does.
+        // Fill the basket, the way space does.
         let picks: Vec<String> = app
-            .src
+            .shop_list
             .visible
             .iter()
             .take(3)
@@ -220,12 +230,12 @@ fn main() -> anyhow::Result<()> {
             .map(|r| r.id.clone())
             .collect();
         for id in &picks {
-            app.src.selected.insert(id.clone());
+            app.shop_list.selected.insert(id.clone());
         }
         println!(
-            "bulk over {} selected of {} visible",
-            app.src.selected.len(),
-            app.src.visible.len()
+            "basket holds {} of {} visible",
+            app.shop_list.selected.len(),
+            app.shop_list.visible.len()
         );
         if app.shop_selected(3) {
             let t = Instant::now();
@@ -256,7 +266,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     // The help screen, to confirm nothing is clipped off the bottom or right.
-    app.mode = InputMode::Help;
+    app.mode = rekord_ripper::tui::app::InputMode::Help;
     term.draw(|f| render::draw(f, &app))?;
     {
         let buf = term.backend().buffer().clone();
@@ -273,9 +283,9 @@ fn main() -> anyhow::Result<()> {
         }
         println!("---- /HELP ----\n");
     }
-    app.mode = InputMode::Shop;
+    app.mode = rekord_ripper::tui::app::InputMode::Normal;
 
-    // Show what the overlay actually looks like.
+    // Show what the shop screen actually looks like.
     term.draw(|f| render::draw(f, &app))?;
     let buf = term.backend().buffer().clone();
     for y in 0..buf.area.height {
