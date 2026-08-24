@@ -39,6 +39,9 @@ onto it.
 rekord-ripper shop "burial untrue"
 rekord-ripper shop --track-id 12345678 --lossless-only
 
+# Bulk: shop for several tracks in one run, grouped per track.
+rekord-ripper shop --track-id 12345678 --track-id 87654321 --json
+
 # Open the purchase page in your browser. Payment is never automated.
 rekord-ripper buy "burial untrue"
 
@@ -50,6 +53,13 @@ rekord-ripper fetch https://soundcloud.com/artist/track --src-track-id 12345678
 rekord-ripper pending --list
 rekord-ripper pending --apply
 ```
+
+In the TUI, `s` shops for the highlighted source track and `S` shops for every
+source row the `/` filter is showing (capped, since each track is a full fan-out
+across every backend). Results are grouped per track; `Enter` downloads the
+highlighted offer and queues its analysis transfer against the right source.
+Searches run on a background thread, so `Esc` steps away without losing one and
+`s` brings it back.
 
 Backends implement the `AcquisitionBackend` trait, so adding another is a matter
 of implementing search, enrich, purchase and fetch. Bandcamp and SoundCloud ship

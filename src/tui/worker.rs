@@ -26,10 +26,8 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
 use crate::acquire::Registry;
-use crate::acquire::shop::{self, SearchOpts, SearchOutcome};
-use crate::acquire::types::{
-    AcquiredFile, AudioFormat, FetchOpts, ItemRef, Retention, SearchQuery,
-};
+use crate::acquire::shop::{self, GroupOutcome, QuerySpec, SearchOpts};
+use crate::acquire::types::{AcquiredFile, AudioFormat, FetchOpts, ItemRef, Retention};
 use crate::config::{Config, Credentials};
 
 /// Ceiling for one download, including any wait while bandcamp prepares it.
@@ -37,8 +35,10 @@ const FETCH_BUDGET: Duration = Duration::from_secs(1800);
 
 /// Work the UI can ask for.
 pub enum Job {
+    /// One or many searches. A single search is a one-element `specs`, so bulk
+    /// is not a separate path.
     Shop {
-        query: SearchQuery,
+        specs: Vec<QuerySpec>,
         opts: Box<SearchOpts>,
     },
     /// Download an offer. Long-running by nature — a purchased FLAC is tens of
@@ -56,8 +56,15 @@ pub enum Job {
 pub enum Update {
     /// Picked up; the UI can start showing progress.
     Started,
-    /// Boxed because a `SearchOutcome` is large and this moves through a channel.
-    Finished(Box<SearchOutcome>),
+    /// `done` of `total` specs searched. Lets a bulk search show real progress
+    /// instead of an indeterminate spinner.
+    Progress {
+        done: usize,
+        total: usize,
+        label: String,
+    },
+    /// Boxed because the outcomes are large and this moves through a channel.
+    Finished(Box<Vec<GroupOutcome>>),
     /// A fetch finished. `Ok` carries where the files landed.
     Fetched(Box<Result<Vec<AcquiredFile>, String>>),
     Failed(String),
@@ -94,12 +101,22 @@ impl Worker {
                 // Ends when the UI drops its sender.
                 while let Ok(job) = job_rx.recv() {
                     match job {
-                        Job::Shop { query, opts } => {
+                        Job::Shop { specs, opts } => {
                             if up_tx.send(Update::Started).is_err() {
                                 return;
                             }
-                            let outcome = shop::search_all(&reg, &query, &opts);
-                            if up_tx.send(Update::Finished(Box::new(outcome))).is_err() {
+                            let tx = up_tx.clone();
+                            let groups =
+                                shop::search_many(&reg, &specs, &opts, |done, total, label| {
+                                    // Best-effort: a closed channel means the UI
+                                    // is gone, and the loop will notice shortly.
+                                    let _ = tx.send(Update::Progress {
+                                        done,
+                                        total,
+                                        label: label.to_string(),
+                                    });
+                                });
+                            if up_tx.send(Update::Finished(Box::new(groups))).is_err() {
                                 return;
                             }
                         }
@@ -206,6 +223,15 @@ mod tests {
         Worker::spawn(&Config::default(), &Credentials::default()).unwrap()
     }
 
+    /// A spec every backend short-circuits on, so tests do no network work.
+    fn empty_spec() -> QuerySpec {
+        QuerySpec {
+            label: "nothing".into(),
+            src_id: None,
+            query: crate::acquire::types::SearchQuery::from_text("", 1),
+        }
+    }
+
     #[test]
     fn a_new_worker_is_idle_and_has_nothing_to_report() {
         let mut w = worker();
@@ -222,7 +248,7 @@ mod tests {
         let job = || Job::Shop {
             // An empty query short-circuits in every backend, so this does no
             // network work.
-            query: SearchQuery::from_text("", 1),
+            specs: vec![empty_spec()],
             opts: Box::new(SearchOpts::default()),
         };
         assert!(w.submit(job()));
@@ -237,7 +263,7 @@ mod tests {
     fn a_finished_job_clears_busy_and_reports_an_outcome() {
         let mut w = worker();
         assert!(w.submit(Job::Shop {
-            query: SearchQuery::from_text("", 1),
+            specs: vec![empty_spec()],
             opts: Box::new(SearchOpts::default()),
         }));
 
@@ -274,7 +300,7 @@ mod tests {
         w.shutdown();
         // Submitting after shutdown fails rather than panicking.
         assert!(!w.submit(Job::Shop {
-            query: SearchQuery::from_text("", 1),
+            specs: vec![empty_spec()],
             opts: Box::new(SearchOpts::default()),
         }));
     }

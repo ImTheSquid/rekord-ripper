@@ -5,6 +5,13 @@ use crate::db::safety_preflight;
 
 use super::app::{App, Focus, InputMode, PendingBatch};
 
+/// Most tracks one `S` will search for.
+///
+/// Each track is a full fan-out across every backend, so an unbounded bulk
+/// search over a 4000-track library would be thousands of requests and a certain
+/// rate limit. Narrow with `/` and press `S` again for the rest.
+const BULK_SHOP_CAP: usize = 25;
+
 pub fn handle_key(app: &mut App, key: KeyEvent) {
     // Ignore key-release / repeat events from crossterm's KittyKeyboard-style
     // enhanced events. Only process Press.
@@ -96,10 +103,14 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
         (KeyCode::Char('/'), _) => {
             app.mode = InputMode::Search(app.focus);
         }
-        // Search online for a better copy of the highlighted source track. Runs
-        // on the worker thread, so the UI keeps drawing while it waits.
+        // Shop for the highlighted source track. Reopens existing results rather
+        // than throwing them away, and reopens a search still in flight.
         (KeyCode::Char('s'), _) => {
-            app.start_shop();
+            app.open_shop();
+        }
+        // Bulk: shop for every source row the current filter shows.
+        (KeyCode::Char('S'), _) => {
+            app.start_bulk_shop(BULK_SHOP_CAP);
         }
         (KeyCode::Char(' '), _) => {
             if let Focus::Dst = app.focus {
@@ -329,9 +340,12 @@ fn handle_shop(app: &mut App, key: KeyEvent) {
         (KeyCode::PageDown, _) => app.shop.move_cursor(10),
         (KeyCode::Char('g'), _) => app.shop.move_cursor(isize::MIN / 2),
         (KeyCode::Char('G'), _) => app.shop.move_cursor(isize::MAX / 2),
-        // Re-run the search for the current source track.
+        // Re-run the search for the current source track, discarding these.
         (KeyCode::Char('r'), _) => {
             app.start_shop();
+        }
+        (KeyCode::Char('S'), _) => {
+            app.start_bulk_shop(BULK_SHOP_CAP);
         }
         // Enter does the useful thing: download it.
         (KeyCode::Enter, _) | (KeyCode::Char('f'), _) => {

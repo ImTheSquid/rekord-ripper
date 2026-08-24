@@ -92,6 +92,52 @@ pub struct BackendReport {
     pub enrich_errors: usize,
 }
 
+/// One thing to search for, with enough context to label its results.
+///
+/// Bulk and single search share this: a single search is just one spec, so there
+/// is no second code path to keep in step.
+#[derive(Debug, Clone)]
+pub struct QuerySpec {
+    /// What to show above the results, e.g. `Artist — Title`.
+    pub label: String,
+    /// The local track this was searched for, so a download can be paired to it.
+    pub src_id: Option<String>,
+    pub query: SearchQuery,
+}
+
+/// The results for one spec.
+#[derive(Debug)]
+pub struct GroupOutcome {
+    pub label: String,
+    pub src_id: Option<String>,
+    pub outcome: SearchOutcome,
+}
+
+/// Search each spec in turn, reporting progress as it goes.
+///
+/// Sequential across specs on purpose: `search_all` already fans out across
+/// backends inside one spec, and running several specs concurrently would
+/// multiply requests per backend and invite a rate limit.
+pub fn search_many(
+    reg: &Registry,
+    specs: &[QuerySpec],
+    opts: &SearchOpts,
+    mut on_progress: impl FnMut(usize, usize, &str),
+) -> Vec<GroupOutcome> {
+    let total = specs.len();
+    let mut out = Vec::with_capacity(total);
+    for (i, spec) in specs.iter().enumerate() {
+        on_progress(i, total, &spec.label);
+        out.push(GroupOutcome {
+            label: spec.label.clone(),
+            src_id: spec.src_id.clone(),
+            outcome: search_all(reg, &spec.query, opts),
+        });
+    }
+    on_progress(total, total, "");
+    out
+}
+
 /// Deliberately not a `Result<Vec<Offer>>`.
 ///
 /// `run_cp` aborting a whole batch when one plan fails validation is right for

@@ -328,30 +328,48 @@ fn draw_shop(f: &mut Frame, app: &App) {
     let (title, body_lines): (String, Vec<Line>) = match &app.shop {
         ShopState::Idle => (" SHOP ".into(), vec![Line::from("nothing to show.")]),
 
-        ShopState::Searching { since, what } => {
+        ShopState::Searching {
+            since,
+            what,
+            done,
+            total,
+            ..
+        } => {
             // Animated from elapsed time, so it visibly advances on every 300ms
             // tick and the user can tell the difference between working and hung.
             const FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
             let secs = since.elapsed().as_secs();
             let frame = FRAMES[(since.elapsed().as_millis() / 300) as usize % FRAMES.len()];
-            (
-                " SHOP — searching ".into(),
-                vec![
-                    Line::from(vec![
-                        Span::styled(format!("{frame} "), Style::new().fg(Color::Cyan)),
-                        Span::raw(format!("searching for {what}")),
-                    ]),
-                    Line::from(Span::styled(
-                        format!("  {secs}s elapsed"),
-                        Style::new().fg(Color::DarkGray),
-                    )),
-                    Line::from(""),
-                    Line::from(Span::styled(
-                        "  the interface stays responsive; Esc to hide this",
-                        Style::new().fg(Color::DarkGray),
-                    )),
-                ],
-            )
+            let mut lines = vec![
+                Line::from(vec![
+                    Span::styled(format!("{frame} "), Style::new().fg(Color::Cyan)),
+                    Span::raw(format!("searching for {what}")),
+                ]),
+                Line::from(Span::styled(
+                    format!("  {secs}s elapsed"),
+                    Style::new().fg(Color::DarkGray),
+                )),
+            ];
+            // A real progress bar for a bulk search; a single search has nothing
+            // meaningful to show beyond the spinner.
+            if *total > 1 {
+                let width = 40usize;
+                let filled = (*done * width) / (*total).max(1);
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "  [{}{}] {done}/{total}",
+                        "#".repeat(filled),
+                        "·".repeat(width.saturating_sub(filled))
+                    ),
+                    Style::new().fg(Color::Cyan),
+                )));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  Esc steps away without losing this; 's' brings it back",
+                Style::new().fg(Color::DarkGray),
+            )));
+            (" SHOP — searching ".into(), lines)
         }
 
         ShopState::Failed(why) => (
@@ -362,7 +380,7 @@ fn draw_shop(f: &mut Frame, app: &App) {
             ))],
         ),
 
-        ShopState::Results { outcome, cursor } => {
+        ShopState::Results { groups, cursor, .. } => {
             // Give the leftover width to artist/title instead of a fixed 38, so a
             // wide terminal actually shows the name.
             let title_w = title_width(area.width);
@@ -375,52 +393,86 @@ fn draw_shop(f: &mut Frame, app: &App) {
                 Style::new().add_modifier(Modifier::BOLD),
             ))];
 
-            for (i, r) in outcome.offers.iter().enumerate() {
-                let o = &r.offer;
-                let selected = i == *cursor;
-                let style = if selected {
-                    Style::new()
-                        .bg(Color::DarkGray)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::new()
-                };
-                // Lossless is the whole point, so mark it in the row itself.
-                let marker = lossless_marker(o);
-                lines.push(Line::from(Span::styled(
-                    format!(
-                        "{marker} {:<11} {:<title_w$} {:<fmt_w$} {:<16} {:<4}",
-                        o.backend().as_str(),
-                        clip_cell(&format!("{} — {}", o.artist, o.title), title_w),
-                        clip_cell(&crate::acquire::render::format_cell(o), fmt_w),
-                        clip_cell(&crate::acquire::render::price_cell(o), 16),
-                        crate::acquire::render::ownership_cell(o),
-                    ),
-                    style,
-                )));
+            // Flatten the groups, inserting a header per group so a bulk search
+            // shows which track each block of offers belongs to.
+            let multi = groups.len() > 1;
+            let mut i = 0usize;
+            for g in groups.iter() {
+                if multi {
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "── for: {}{}",
+                            g.label,
+                            if g.outcome.offers.is_empty() {
+                                "  (nothing found)"
+                            } else {
+                                ""
+                            }
+                        ),
+                        Style::new().fg(Color::Yellow),
+                    )));
+                }
+                for r in g.outcome.offers.iter() {
+                    let o = &r.offer;
+                    let selected = i == *cursor;
+                    i += 1;
+                    let style = if selected {
+                        Style::new()
+                            .bg(Color::DarkGray)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::new()
+                    };
+                    // Lossless is the whole point, so mark it in the row itself.
+                    let marker = lossless_marker(o);
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "{marker} {:<11} {:<title_w$} {:<fmt_w$} {:<16} {:<4}",
+                            o.backend().as_str(),
+                            clip_cell(&format!("{} — {}", o.artist, o.title), title_w),
+                            clip_cell(&crate::acquire::render::format_cell(o), fmt_w),
+                            clip_cell(&crate::acquire::render::price_cell(o), 16),
+                            crate::acquire::render::ownership_cell(o),
+                        ),
+                        style,
+                    )));
+                }
             }
 
-            if outcome.offers.is_empty() {
+            if i == 0 {
                 lines.push(Line::from(Span::styled(
                     "no offers found.",
                     Style::new().fg(Color::DarkGray),
                 )));
             }
 
-            // Per-backend failures, so a partial table looks partial.
-            for r in outcome.failures() {
-                if let Some(e) = &r.error {
-                    if !e.is_silently_skippable() {
-                        lines.push(Line::from(Span::styled(
-                            format!("degraded: {}: {e}", r.backend),
-                            Style::new().fg(Color::Yellow),
-                        )));
+            // Per-backend failures, so a partial table looks partial. Deduped:
+            // a bulk search would otherwise repeat the same backend error once
+            // per track.
+            let mut seen: Vec<String> = Vec::new();
+            for g in groups.iter() {
+                for r in g.outcome.failures() {
+                    if let Some(e) = &r.error {
+                        if !e.is_silently_skippable() {
+                            let msg = format!("degraded: {}: {e}", r.backend);
+                            if !seen.contains(&msg) {
+                                seen.push(msg.clone());
+                                lines.push(Line::from(Span::styled(
+                                    msg,
+                                    Style::new().fg(Color::Yellow),
+                                )));
+                            }
+                        }
                     }
                 }
             }
 
             // Currencies are grouped, never converted — say so here too.
-            let cheap = crate::acquire::shop::cheapest_per_currency(&outcome.offers);
+            let all_offers: Vec<crate::acquire::shop::RankedOffer> = groups
+                .iter()
+                .flat_map(|g| g.outcome.offers.iter().cloned())
+                .collect();
+            let cheap = crate::acquire::shop::cheapest_per_currency(&all_offers);
             if !cheap.is_empty() {
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
@@ -434,7 +486,7 @@ fn draw_shop(f: &mut Frame, app: &App) {
                     ),
                     Style::new().fg(Color::DarkGray),
                 )));
-                if crate::acquire::shop::has_mixed_currencies(&outcome.offers) {
+                if crate::acquire::shop::has_mixed_currencies(&all_offers) {
                     lines.push(Line::from(Span::styled(
                         "different currencies are not compared — no exchange rates available",
                         Style::new().fg(Color::DarkGray),
@@ -444,7 +496,7 @@ fn draw_shop(f: &mut Frame, app: &App) {
 
             // Full, untruncated detail for the highlighted row. The table has to
             // fit columns; this does not, so nothing is hidden behind an ellipsis.
-            if let Some(r) = outcome.offers.get(*cursor) {
+            if let Some(r) = app.shop.selected() {
                 let o = &r.offer;
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
@@ -501,7 +553,12 @@ fn draw_shop(f: &mut Frame, app: &App) {
                 "j/k move   Enter download   o open buy page   y show ref   r re-search   Esc close",
                 Style::new().fg(Color::DarkGray),
             )));
-            (format!(" SHOP — {} offers ", outcome.offers.len()), lines)
+            let title = if multi {
+                format!(" SHOP — {i} offers across {} tracks ", groups.len())
+            } else {
+                format!(" SHOP — {i} offers ")
+            };
+            (title, lines)
         }
     };
 
@@ -667,8 +724,11 @@ Tab / Shift-Tab    Switch focus between SOURCES and DESTINATIONS
 PgUp / PgDn        Page
 g / G              Jump top / bottom
 /                  Search the focused column (Esc/Enter to leave)
-s                  Shop online for the highlighted source track (runs in the
-                   background; the interface stays responsive)
+s                  Shop online for the highlighted source track. Reopens the
+                   last results instead of re-searching; Esc steps away from a
+                   search in progress and s brings it back
+S                  Bulk shop: search for every source row the filter shows
+                   (narrow with / first)
 Ctrl-U             Clear search query (in search mode)
 Space              Toggle destination selection (multi-select)
 c                  Clear destination selection
@@ -684,7 +744,7 @@ Enter / f          (Shop) Download the highlighted offer, and queue an analysis
                    transfer from the selected source track onto it
 o                  (Shop) Open the offer's page in a browser (to buy it)
 y                  (Shop) Show the offer's stable ref, for use with the CLI
-r                  (Shop) Re-run the search
+r                  (Shop) Re-run the search, discarding the current results
 j / k              (Shop) Move; full details for the highlighted row are shown
                    below the table
 ?                  This help

@@ -33,10 +33,19 @@ pub enum ShopState {
     Searching {
         since: Instant,
         what: String,
+        /// Progress through a bulk search. `(0, 1)` for a single search.
+        done: usize,
+        total: usize,
+        /// What was asked for, so the results can be reopened rather than
+        /// re-searched when you come back to them.
+        specs: Vec<crate::acquire::shop::QuerySpec>,
     },
     Results {
-        outcome: Box<crate::acquire::shop::SearchOutcome>,
+        groups: Box<Vec<crate::acquire::shop::GroupOutcome>>,
+        /// Index into the flattened offer list across all groups.
         cursor: usize,
+        /// The specs these results answer, used to decide reopen vs re-search.
+        specs: Vec<crate::acquire::shop::QuerySpec>,
     },
     Failed(String),
 }
@@ -61,29 +70,72 @@ pub enum FetchState {
 }
 
 impl ShopState {
-    /// Rows currently shown, for cursor clamping.
+    /// Total offers across every group.
     pub fn len(&self) -> usize {
         match self {
-            Self::Results { outcome, .. } => outcome.offers.len(),
+            Self::Results { groups, .. } => groups.iter().map(|g| g.outcome.offers.len()).sum(),
             _ => 0,
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn move_cursor(&mut self, delta: isize) {
-        if let Self::Results { outcome, cursor } = self {
-            let n = outcome.offers.len();
+        let n = self.len();
+        if let Self::Results { cursor, .. } = self {
             if n == 0 {
                 *cursor = 0;
                 return;
             }
-            let next = (*cursor as isize + delta).clamp(0, n as isize - 1);
-            *cursor = next as usize;
+            *cursor = (*cursor as isize + delta).clamp(0, n as isize - 1) as usize;
         }
     }
 
+    /// Walk the flattened offer list, yielding `(group, offer)` in display order.
+    pub fn flattened(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            &crate::acquire::shop::GroupOutcome,
+            &crate::acquire::shop::RankedOffer,
+        ),
+    > {
+        let groups: &[crate::acquire::shop::GroupOutcome] = match self {
+            Self::Results { groups, .. } => groups,
+            _ => &[],
+        };
+        groups
+            .iter()
+            .flat_map(|g| g.outcome.offers.iter().map(move |o| (g, o)))
+    }
+
     pub fn selected(&self) -> Option<&crate::acquire::shop::RankedOffer> {
+        self.selected_with_group().map(|(_, o)| o)
+    }
+
+    /// The highlighted offer and the group it belongs to.
+    ///
+    /// The group carries the source track, which is what a bulk search needs in
+    /// order to pair a download with the right local track.
+    pub fn selected_with_group(
+        &self,
+    ) -> Option<(
+        &crate::acquire::shop::GroupOutcome,
+        &crate::acquire::shop::RankedOffer,
+    )> {
+        let cursor = match self {
+            Self::Results { cursor, .. } => *cursor,
+            _ => return None,
+        };
+        self.flattened().nth(cursor)
+    }
+
+    /// The specs these results answer, if any.
+    pub fn specs(&self) -> Option<&[crate::acquire::shop::QuerySpec]> {
         match self {
-            Self::Results { outcome, cursor } => outcome.offers.get(*cursor),
+            Self::Searching { specs, .. } | Self::Results { specs, .. } => Some(specs),
             _ => None,
         }
     }
@@ -308,23 +360,62 @@ impl App {
         for update in worker.drain() {
             match update {
                 super::worker::Update::Started => {}
-                super::worker::Update::Finished(outcome) => {
-                    let found = outcome.offers.len();
-                    let failed: Vec<String> = outcome
-                        .failures()
-                        .filter_map(|r| r.error.as_ref().map(|e| format!("{}: {e}", r.backend)))
-                        .collect();
-                    self.shop = ShopState::Results { outcome, cursor: 0 };
+                super::worker::Update::Progress {
+                    done: d,
+                    total: t,
+                    label,
+                } => {
+                    if let ShopState::Searching {
+                        done, total, what, ..
+                    } = &mut self.shop
+                    {
+                        *done = d;
+                        *total = t;
+                        // A bulk search gets real progress instead of a spinner
+                        // that says nothing about how far along it is.
+                        if t > 1 && !label.is_empty() {
+                            *what = format!("{label}  ({}/{t})", d + 1);
+                        }
+                    }
+                }
+                super::worker::Update::Finished(groups) => {
+                    let found: usize = groups.iter().map(|g| g.outcome.offers.len()).sum();
+                    let mut failed: Vec<String> = Vec::new();
+                    for g in groups.iter() {
+                        for r in g.outcome.failures() {
+                            if let Some(e) = &r.error {
+                                let msg = format!("{}: {e}", r.backend);
+                                if !failed.contains(&msg) {
+                                    failed.push(msg);
+                                }
+                            }
+                        }
+                    }
+                    // Keep the specs so `s` can reopen these results instead of
+                    // starting over.
+                    let specs = self.shop.specs().unwrap_or(&[]).to_vec();
+                    let n_groups = groups.len();
+                    self.shop = ShopState::Results {
+                        groups,
+                        cursor: 0,
+                        specs,
+                    };
+                    let scope = if n_groups > 1 {
+                        format!(" across {n_groups} tracks")
+                    } else {
+                        String::new()
+                    };
                     match (found, failed.is_empty()) {
                         (0, true) => self.status.warn("no offers found."),
                         (0, false) => self
                             .status
                             .err(format!("no offers — {}", failed.join("; "))),
-                        (n, true) => self.status.ok(format!("{n} offers.")),
+                        (n, true) => self.status.ok(format!("{n} offers{scope}.")),
                         // A partial table is still useful; say what is missing.
-                        (n, false) => self
-                            .status
-                            .warn(format!("{n} offers, degraded — {}", failed.join("; "))),
+                        (n, false) => self.status.warn(format!(
+                            "{n} offers{scope}, degraded — {}",
+                            failed.join("; ")
+                        )),
                     }
                 }
                 super::worker::Update::Fetched(result) => match *result {
@@ -365,31 +456,101 @@ impl App {
         }
     }
 
-    /// Start a search for the highlighted source track.
+    /// Build the search spec for one source row.
+    fn spec_for(&self, row: &TrackRow) -> Option<crate::acquire::shop::QuerySpec> {
+        let title = row.title.trim().to_string();
+        if title.is_empty() {
+            return None;
+        }
+        // TrackRow stores these as plain Strings, with empty meaning absent.
+        let artist = Some(row.artist.trim().to_string()).filter(|a| !a.is_empty());
+        Some(crate::acquire::shop::QuerySpec {
+            label: format!("{} — {title}", artist.as_deref().unwrap_or("?")),
+            src_id: Some(row.id.clone()),
+            query: crate::acquire::types::SearchQuery {
+                title,
+                artist,
+                duration_secs: row.length,
+                limit: self.cfg.search.limit,
+                ..Default::default()
+            },
+        })
+    }
+
+    /// What `s` does: show what is already there, or search if there is nothing.
     ///
-    /// Returns false when it could not be started, so the caller can explain why
-    /// rather than opening an overlay that will never fill in.
+    /// This is the fix for a dead end: `s` used to always start a fresh search,
+    /// so a completed result you had stepped away from was thrown away, and while
+    /// one was running `s` refused *without* reopening the overlay — leaving no
+    /// way back to it at all.
+    pub fn open_shop(&mut self) -> bool {
+        let wanted = self.current_src().and_then(|r| self.spec_for(r));
+        let same_target = match (self.shop.specs(), &wanted) {
+            // A single-track result is "for" the highlighted row.
+            (Some([existing]), Some(w)) => existing.src_id == w.src_id,
+            // A bulk result is not tied to one row, so keep showing it.
+            (Some(specs), _) => specs.len() > 1,
+            _ => false,
+        };
+
+        if self.shop_busy() && self.shop.specs().is_some() {
+            self.mode = InputMode::Shop;
+            self.status.info("still searching — Esc to step away.");
+            return true;
+        }
+        if same_target && !self.shop.is_empty() {
+            self.mode = InputMode::Shop;
+            self.status
+                .info("showing the previous results — 'r' to search again.");
+            return true;
+        }
+        self.start_shop()
+    }
+
+    /// Search for the highlighted source track, discarding any previous results.
     pub fn start_shop(&mut self) -> bool {
-        let Some(track) = self.current_src() else {
+        let Some(row) = self.current_src().cloned() else {
             self.status.warn("no source track selected to search for.");
             return false;
         };
-        let title = track.title.trim().to_string();
-        if title.is_empty() {
+        let Some(spec) = self.spec_for(&row) else {
             self.status.warn("that track has no title to search for.");
             return false;
-        }
-        // TrackRow stores these as plain Strings, with empty meaning absent.
-        let artist = Some(track.artist.trim().to_string()).filter(|a| !a.is_empty());
-        let what = format!("{} — {title}", artist.as_deref().unwrap_or("?"));
-
-        let query = crate::acquire::types::SearchQuery {
-            title,
-            artist,
-            duration_secs: track.length,
-            limit: self.cfg.search.limit,
-            ..Default::default()
         };
+        self.submit_shop(vec![spec])
+    }
+
+    /// Search for every source track currently visible in the left column.
+    ///
+    /// The `/` filter is the selection mechanism, so narrowing the list and
+    /// pressing `S` shops for exactly what you can see.
+    pub fn start_bulk_shop(&mut self, cap: usize) -> bool {
+        let rows: Vec<TrackRow> = self
+            .src
+            .visible
+            .iter()
+            .filter_map(|&i| self.rows.get(i))
+            .cloned()
+            .collect();
+        let specs: Vec<_> = rows.iter().filter_map(|r| self.spec_for(r)).collect();
+
+        if specs.is_empty() {
+            self.status
+                .warn("nothing to search for — no visible source track has a title.");
+            return false;
+        }
+        let total = specs.len();
+        let specs: Vec<_> = specs.into_iter().take(cap).collect();
+        if total > specs.len() {
+            self.status.warn(format!(
+                "{total} visible; searching the first {} — narrow with '/' for the rest.",
+                specs.len()
+            ));
+        }
+        self.submit_shop(specs)
+    }
+
+    fn submit_shop(&mut self, specs: Vec<crate::acquire::shop::QuerySpec>) -> bool {
         let opts = crate::acquire::shop::SearchOpts {
             timeout: std::time::Duration::from_secs(self.cfg.search.timeout_secs.max(1)),
             enrich_top_n: self.cfg.search.enrich_top_n,
@@ -402,11 +563,17 @@ impl App {
             return false;
         };
         if worker.is_busy() {
-            self.status.warn("a search is already running.");
+            self.status.warn("something is already running.");
+            // Still open the overlay, so there is a way to watch it.
+            self.mode = InputMode::Shop;
             return false;
         }
+        let what = match specs.len() {
+            1 => specs[0].label.clone(),
+            n => format!("{n} tracks"),
+        };
         if !worker.submit(super::worker::Job::Shop {
-            query,
+            specs: specs.clone(),
             opts: Box::new(opts),
         }) {
             self.status.err("could not start the search.");
@@ -414,9 +581,13 @@ impl App {
         }
 
         self.status.info(format!("searching for {what} …"));
+        let total = specs.len();
         self.shop = ShopState::Searching {
             since: Instant::now(),
             what,
+            done: 0,
+            total,
+            specs,
         };
         self.mode = InputMode::Shop;
         true
@@ -432,7 +603,14 @@ impl App {
     /// makes a multi-minute download survivable, so there is no reason to hand
     /// the user homework.
     pub fn start_fetch(&mut self) -> bool {
-        let Some(offer) = self.shop.selected().map(|r| r.offer.clone()) else {
+        // Take the source from the offer's own group, not the cursor in the left
+        // column: in a bulk search the highlighted offer belongs to whichever
+        // track it was found for, which may not be the one highlighted now.
+        let Some((offer, group_src)) = self
+            .shop
+            .selected_with_group()
+            .map(|(g, r)| (r.offer.clone(), g.src_id.clone()))
+        else {
             self.status.warn("no offer selected.");
             return false;
         };
@@ -480,7 +658,7 @@ impl App {
 
         let what = format!("{} — {}", offer.artist, offer.title);
         // Remember the source so the transfer can be queued on completion.
-        self.fetch_src = self.current_src().map(|r| r.id.clone());
+        self.fetch_src = group_src.or_else(|| self.current_src().map(|r| r.id.clone()));
         self.status.info(format!("downloading {what} …"));
         self.fetch = FetchState::Running {
             since: Instant::now(),
@@ -535,5 +713,140 @@ impl App {
             .visible
             .get(self.dst.cursor)
             .and_then(|&i| self.rows.get(i))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::acquire::shop::{GroupOutcome, QuerySpec, SearchOutcome};
+    use crate::acquire::types::{BackendId, ItemKind, ItemRef, Offer, SearchQuery};
+
+    fn spec(src_id: &str) -> QuerySpec {
+        QuerySpec {
+            label: format!("track {src_id}"),
+            src_id: Some(src_id.to_string()),
+            query: SearchQuery::from_text("x", 5),
+        }
+    }
+
+    fn group(src_id: &str, offers: usize) -> GroupOutcome {
+        let ranked = (0..offers)
+            .map(|i| crate::acquire::shop::RankedOffer {
+                offer: Offer::new(
+                    ItemRef::new(BackendId::Bandcamp, format!("t:{src_id}:{i}")),
+                    ItemKind::Track,
+                    "A",
+                    format!("T{i}"),
+                    "https://x/y",
+                ),
+                row: i + 1,
+                match_score: 50,
+            })
+            .collect();
+        GroupOutcome {
+            label: format!("track {src_id}"),
+            src_id: Some(src_id.to_string()),
+            outcome: SearchOutcome {
+                offers: ranked,
+                per_backend: vec![],
+            },
+        }
+    }
+
+    fn results(groups: Vec<GroupOutcome>, specs: Vec<QuerySpec>) -> ShopState {
+        ShopState::Results {
+            groups: Box::new(groups),
+            cursor: 0,
+            specs,
+        }
+    }
+
+    #[test]
+    fn completed_results_remember_what_they_were_for() {
+        // The bug: nothing recorded which track the results answered, so there
+        // was no way to tell "reopen these" from "search again".
+        let s = results(vec![group("101", 2)], vec![spec("101")]);
+        assert_eq!(s.specs().unwrap().len(), 1);
+        assert_eq!(s.specs().unwrap()[0].src_id.as_deref(), Some("101"));
+        assert_eq!(s.len(), 2);
+    }
+
+    #[test]
+    fn the_cursor_walks_across_groups() {
+        let mut s = results(
+            vec![group("101", 2), group("202", 3)],
+            vec![spec("101"), spec("202")],
+        );
+        assert_eq!(s.len(), 5);
+
+        // First group.
+        assert_eq!(
+            s.selected_with_group().unwrap().0.src_id.as_deref(),
+            Some("101")
+        );
+        s.move_cursor(1);
+        assert_eq!(
+            s.selected_with_group().unwrap().0.src_id.as_deref(),
+            Some("101")
+        );
+        // Crossing into the second group must switch which track it is for.
+        s.move_cursor(1);
+        assert_eq!(
+            s.selected_with_group().unwrap().0.src_id.as_deref(),
+            Some("202")
+        );
+        s.move_cursor(10);
+        assert_eq!(
+            s.selected_with_group().unwrap().0.src_id.as_deref(),
+            Some("202")
+        );
+        assert_eq!(s.selected().unwrap().offer.title, "T2");
+    }
+
+    #[test]
+    fn the_cursor_clamps_at_both_ends() {
+        let mut s = results(vec![group("101", 2)], vec![spec("101")]);
+        s.move_cursor(-5);
+        assert_eq!(s.selected().unwrap().offer.title, "T0");
+        s.move_cursor(99);
+        assert_eq!(s.selected().unwrap().offer.title, "T1");
+    }
+
+    #[test]
+    fn an_empty_group_contributes_no_rows_but_still_shows() {
+        // A bulk search where one track found nothing must not break the cursor.
+        let s = results(
+            vec![group("101", 0), group("202", 2)],
+            vec![spec("101"), spec("202")],
+        );
+        assert_eq!(s.len(), 2);
+        assert_eq!(
+            s.selected_with_group().unwrap().0.src_id.as_deref(),
+            Some("202")
+        );
+    }
+
+    #[test]
+    fn nothing_is_selected_when_there_are_no_results() {
+        assert!(ShopState::Idle.selected().is_none());
+        assert!(ShopState::Failed("x".into()).selected().is_none());
+        let empty = results(vec![], vec![]);
+        assert!(empty.selected().is_none());
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn a_search_in_flight_still_reports_its_specs() {
+        // So `s` can reopen a running search instead of refusing with no way back.
+        let s = ShopState::Searching {
+            since: Instant::now(),
+            what: "track 101".into(),
+            done: 0,
+            total: 1,
+            specs: vec![spec("101")],
+        };
+        assert_eq!(s.specs().unwrap()[0].src_id.as_deref(), Some("101"));
+        assert!(s.selected().is_none());
     }
 }
