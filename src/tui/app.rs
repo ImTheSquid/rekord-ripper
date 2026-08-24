@@ -172,6 +172,39 @@ impl ShopState {
     }
 }
 
+/// Selected rows the column's filter is currently hiding.
+///
+/// Worth surfacing: a selection you cannot see reads as one the program dropped,
+/// even though it is still in the batch.
+fn hidden_selected(rows: &[TrackRow], col: &ColumnState) -> usize {
+    let shown = col
+        .visible
+        .iter()
+        .filter_map(|&i| rows.get(i))
+        .filter(|r| col.selected.contains(&r.id))
+        .count();
+    col.selected.len().saturating_sub(shown)
+}
+
+/// Basket rows in library order, capped, with the uncapped total.
+///
+/// Walks every row rather than the visible ones: filtering the list after filling
+/// the basket used to drop the hidden items from the search without a word, which
+/// looked exactly like the basket being forgotten.
+fn basket_rows(
+    rows: &[TrackRow],
+    selected: &HashSet<String>,
+    cap: usize,
+) -> (Vec<TrackRow>, usize) {
+    let all: Vec<TrackRow> = rows
+        .iter()
+        .filter(|r| selected.contains(&r.id))
+        .cloned()
+        .collect();
+    let total = all.len();
+    (all.into_iter().take(cap).collect(), total)
+}
+
 /// The per-track tag the shop list shows.
 ///
 /// A group that came back with nothing is still *answered* — the difference
@@ -593,20 +626,29 @@ impl App {
             return false;
         };
 
-        // Already answered: show it, and put the cursor on its block.
+        // Already answered: jump the offer table to its block. Focus stays where
+        // it is — stealing it to the offers pane is what made the next `s` look
+        // like a dead key.
         if let Some(i) = self.first_offer_index_for(&row.id) {
+            let found = self
+                .shop
+                .flattened()
+                .filter(|(g, _)| g.src_id.as_deref() == Some(row.id.as_str()))
+                .count();
             if let ShopState::Results { cursor, .. } = &mut self.shop {
                 *cursor = i;
             }
-            self.shop_focus = ShopFocus::Offers;
-            self.status
-                .info("already searched — 'r' re-runs just this track.");
+            self.status.info(format!(
+                "showing the {found} offer(s) already found for {} — 'r' re-runs it.",
+                row.title
+            ));
             return true;
         }
         // Already in the queue: nothing to do but say so.
         if self.shop_queued.contains(&row.id) {
             self.status.info(format!(
-                "queued — {} search(es) to go.",
+                "{} is already queued — {} search(es) to go.",
+                row.title,
                 self.shop_outstanding()
             ));
             return true;
@@ -639,22 +681,6 @@ impl App {
             .position(|&i| self.rows.get(i).is_some_and(|r| r.id == id))
     }
 
-    /// Follow the offer cursor with the track list, so crossing a group boundary
-    /// visibly changes which track the offers belong to.
-    fn sync_list_to_selected_offer(&mut self) {
-        let Some(id) = self
-            .shop
-            .selected_with_group()
-            .and_then(|(g, _)| g.src_id.clone())
-        else {
-            return;
-        };
-        // Only if it is on screen — a filter the user typed is theirs to keep.
-        if let Some(p) = self.position_in_shop_list(&id) {
-            self.shop_list.cursor = p;
-        }
-    }
-
     pub fn toggle_shop_focus(&mut self) {
         self.shop_focus = match self.shop_focus {
             ShopFocus::Tracks => ShopFocus::Offers,
@@ -665,10 +691,12 @@ impl App {
     pub fn shop_move(&mut self, delta: isize) {
         match self.shop_focus {
             ShopFocus::Tracks => self.shop_list.move_by(delta),
-            ShopFocus::Offers => {
-                self.shop.move_cursor(delta);
-                self.sync_list_to_selected_offer();
-            }
+            // Deliberately does not move the track cursor. It used to follow the
+            // offer cursor, which meant `s` acted on whichever track the offers
+            // happened to belong to rather than the one the user had highlighted
+            // — so from the offers pane `s` always landed on an already-searched
+            // track and did nothing visible.
+            ShopFocus::Offers => self.shop.move_cursor(delta),
         }
     }
 
@@ -785,25 +813,42 @@ impl App {
                 .warn("the basket is empty — press space on the tracks you want, then 'S'.");
             return false;
         }
-        // Selection order is not meaningful, so follow the visible order.
-        let rows: Vec<TrackRow> = self
-            .shop_list
-            .visible
-            .iter()
-            .filter_map(|&i| self.rows.get(i))
-            .filter(|r| self.shop_list.selected.contains(&r.id))
-            .cloned()
-            .collect();
-
-        let total = rows.len();
-        let rows: Vec<TrackRow> = rows.into_iter().take(cap).collect();
-        if total > rows.len() {
+        let (rows, total) = basket_rows(&self.rows, &self.shop_list.selected, cap);
+        let queued = rows.len();
+        let ok = self.enqueue_shop(&rows);
+        // Said *after* the submit, which sets its own status — a warning written
+        // before it was simply overwritten and never seen.
+        if ok && total > queued {
+            let text = self.status.text.clone();
             self.status.warn(format!(
-                "{total} selected; queueing the first {}.",
-                rows.len()
+                "{text} {total} in the basket, only the first {queued} queued — press 'S' again for the rest."
             ));
         }
-        self.enqueue_shop(&rows)
+        ok
+    }
+
+    /// Basket items the current filter is hiding.
+    pub fn basket_hidden(&self) -> usize {
+        hidden_selected(&self.rows, &self.shop_list)
+    }
+
+    /// Selected destinations the current filters are hiding.
+    ///
+    /// `fuzzy_from_src` narrows the destination list from the *source* cursor, so
+    /// simply moving around on the left can hide rows that are still selected and
+    /// still in the apply batch.
+    pub fn dst_hidden(&self) -> usize {
+        hidden_selected(&self.rows, &self.dst)
+    }
+
+    /// The source track of the highlighted offer.
+    ///
+    /// Marked in the track list rather than moved to: the cursor there is the
+    /// user's, and `s` acts on it.
+    pub fn shop_offer_src(&self) -> Option<&str> {
+        self.shop
+            .selected_with_group()
+            .and_then(|(g, _)| g.src_id.as_deref())
     }
 
     fn submit_shop_queued(&mut self, specs: Vec<crate::acquire::shop::QuerySpec>) -> bool {
@@ -1121,6 +1166,82 @@ mod tests {
         let empty = results(vec![], vec![]);
         assert!(empty.selected().is_none());
         assert!(empty.is_empty());
+    }
+
+    fn basket(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn library() -> Vec<TrackRow> {
+        vec![
+            TrackRow::stub("1", "alpha"),
+            TrackRow::stub("2", "beta"),
+            TrackRow::stub("3", "gamma"),
+            TrackRow::stub("4", "delta"),
+        ]
+    }
+
+    #[test]
+    fn the_basket_survives_a_filter_that_hides_part_of_it() {
+        // The bug: the search was built from the *visible* rows, so typing a
+        // filter after filling the basket silently dropped whatever it hid. The
+        // basket still showed the right count, so it read as the program losing
+        // selections at random.
+        let (rows, total) = basket_rows(&library(), &basket(&["1", "3", "4"]), 25);
+        assert_eq!(total, 3);
+        assert_eq!(
+            rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["1", "3", "4"],
+            "every basket item must be queued regardless of the filter"
+        );
+    }
+
+    #[test]
+    fn the_basket_is_queued_in_library_order() {
+        // Selection order is not recorded, so the order has to come from
+        // somewhere stable rather than from a HashSet's iteration order.
+        let picked = basket(&["4", "2", "1"]);
+        for _ in 0..8 {
+            let (rows, _) = basket_rows(&library(), &picked, 25);
+            assert_eq!(
+                rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+                ["1", "2", "4"]
+            );
+        }
+    }
+
+    #[test]
+    fn the_cap_limits_what_is_queued_but_reports_the_whole_basket() {
+        let (rows, total) = basket_rows(&library(), &basket(&["1", "2", "3", "4"]), 2);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(total, 4, "the caller needs the real total to warn with");
+    }
+
+    #[test]
+    fn an_id_no_longer_in_the_library_is_ignored() {
+        let (rows, total) = basket_rows(&library(), &basket(&["2", "999"]), 25);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(total, 1);
+        assert_eq!(rows[0].id, "2");
+    }
+
+    #[test]
+    fn a_filter_hiding_a_selection_is_counted_not_lost() {
+        let rows = library();
+        let mut col = ColumnState {
+            selected: basket(&["1", "4"]),
+            ..ColumnState::default()
+        };
+        // Everything visible: nothing hidden.
+        col.visible = vec![0, 1, 2, 3];
+        assert_eq!(hidden_selected(&rows, &col), 0);
+        // A filter matching only "alpha" hides the other pick.
+        col.visible = vec![0];
+        assert_eq!(hidden_selected(&rows, &col), 1);
+        // A filter matching neither hides both, and the selection still stands.
+        col.visible = vec![1, 2];
+        assert_eq!(hidden_selected(&rows, &col), 2);
+        assert_eq!(col.selected.len(), 2, "counting must not mutate anything");
     }
 
     #[test]

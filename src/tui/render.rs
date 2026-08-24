@@ -69,15 +69,20 @@ fn draw_column(f: &mut Frame, area: Rect, app: &App, which: Focus) {
         Focus::Dst => {
             let mut tags = Vec::new();
             if app.dst_filters.auto {
-                tags.push("auto");
+                tags.push("auto".to_string());
             }
             if app.dst_filters.fuzzy_from_src {
-                tags.push("fuzzy");
+                tags.push("fuzzy".to_string());
+            }
+            // Selected but filtered out is still selected, and still applied.
+            let hidden = app.dst_hidden();
+            if hidden > 0 {
+                tags.push(format!("{hidden} selected hidden"));
             }
             let t = if tags.is_empty() {
                 String::new()
             } else {
-                format!(" [{}]", tags.join("+"))
+                format!(" [{}]", tags.join(", "))
             };
             (&app.dst, "DESTINATIONS", t)
         }
@@ -376,13 +381,16 @@ fn draw_shop_top_bar(f: &mut Frame, area: Rect, app: &App) {
 fn draw_shop_tracks(f: &mut Frame, area: Rect, app: &App) {
     let focused = app.shop_focus == ShopFocus::Tracks;
     let basket = app.shop_list.selected.len();
-    let title = if basket > 0 {
-        format!(
-            " TRACKS ({}) [basket {basket}] ",
+    let hidden = app.basket_hidden();
+    let title = match (basket, hidden) {
+        (0, _) => format!(" TRACKS ({}) ", app.shop_list.visible.len()),
+        // A basket item the filter is hiding is still in the basket, and 'S' still
+        // searches it. Saying so is what stops it reading as forgotten.
+        (b, 0) => format!(" TRACKS ({}) [basket {b}] ", app.shop_list.visible.len()),
+        (b, h) => format!(
+            " TRACKS ({}) [basket {b}, {h} hidden by filter] ",
             app.shop_list.visible.len()
-        )
-    } else {
-        format!(" TRACKS ({}) ", app.shop_list.visible.len())
+        ),
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -407,6 +415,7 @@ fn draw_shop_tracks(f: &mut Frame, area: Rect, app: &App) {
         parts[0],
     );
 
+    let offer_src = app.shop_offer_src();
     let items: Vec<ListItem> = app
         .shop_list
         .visible
@@ -414,6 +423,9 @@ fn draw_shop_tracks(f: &mut Frame, area: Rect, app: &App) {
         .map(|&i| {
             let row = &app.rows[i];
             let in_basket = app.shop_list.selected.contains(&row.id);
+            // Two independent one-character slots: basket membership, and whether
+            // the highlighted offer came from this track.
+            let is_offer_src = offer_src == Some(row.id.as_str());
             // The state tag is what makes a queue of searches legible: how many
             // offers each track found, and which are still waiting their turn.
             let (tag, tag_style) = match app.shop_track_state(&row.id) {
@@ -424,8 +436,12 @@ fn draw_shop_tracks(f: &mut Frame, area: Rect, app: &App) {
             };
             ListItem::new(Line::from(vec![
                 Span::styled(
-                    if in_basket { "✓ " } else { "  " },
+                    if in_basket { "✓" } else { " " },
                     Style::new().fg(Color::Yellow).bold(),
+                ),
+                Span::styled(
+                    if is_offer_src { "▸" } else { " " },
+                    Style::new().fg(Color::Cyan).bold(),
                 ),
                 Span::styled(tag, tag_style),
                 Span::styled(display_title(row).to_string(), Style::new().bold()),
@@ -1069,8 +1085,10 @@ SHOP SCREEN — find and download better copies
   y                Show the offer's stable ref, for use with the CLI
   Esc / q          Back to the transfer screen
 
-  The tag beside each track is what its search found: a count, · for nothing,
+  Markers on a track row: ✓ in the basket, ▸ source of the highlighted offer.
+  The tag after them is what its search found: a count, · for nothing,
   … for still queued.
+  's' and 'S' always act on the TRACKS list, whichever pane has focus.
 
 ?                  This help
 q / Esc            Quit (from the transfer screen)
