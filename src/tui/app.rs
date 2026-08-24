@@ -262,6 +262,9 @@ pub struct App {
     /// The source track a fetch was started for, so the transfer can be queued
     /// once the file lands.
     fetch_src: Option<String>,
+    /// Source track ids submitted to the worker but not yet answered, so `s` on
+    /// the same track twice does not search it twice.
+    shop_queued: Vec<String>,
     pub cfg: crate::config::Config,
     pub pending: Option<PendingBatch>,
     pub unresolved_errors: bool,
@@ -298,6 +301,7 @@ impl App {
             shop: ShopState::Idle,
             fetch: FetchState::Idle,
             fetch_src: None,
+            shop_queued: Vec::new(),
             cfg,
             pending: None,
             unresolved_errors: false,
@@ -378,10 +382,15 @@ impl App {
                         }
                     }
                 }
-                super::worker::Update::Finished(groups) => {
-                    let found: usize = groups.iter().map(|g| g.outcome.offers.len()).sum();
+                super::worker::Update::Finished(new_groups) => {
+                    for g in new_groups.iter() {
+                        if let Some(id) = &g.src_id {
+                            self.shop_queued.retain(|q| q != id);
+                        }
+                    }
+                    let found: usize = new_groups.iter().map(|g| g.outcome.offers.len()).sum();
                     let mut failed: Vec<String> = Vec::new();
-                    for g in groups.iter() {
+                    for g in new_groups.iter() {
                         for r in g.outcome.failures() {
                             if let Some(e) = &r.error {
                                 let msg = format!("{}: {e}", r.backend);
@@ -391,29 +400,41 @@ impl App {
                             }
                         }
                     }
-                    // Keep the specs so `s` can reopen these results instead of
-                    // starting over.
+
+                    // Append rather than replace, so a queue of searches builds up
+                    // one list instead of each result wiping the last.
                     let specs = self.shop.specs().unwrap_or(&[]).to_vec();
-                    let n_groups = groups.len();
+                    let mut groups: Vec<crate::acquire::shop::GroupOutcome> =
+                        match std::mem::replace(&mut self.shop, ShopState::Idle) {
+                            ShopState::Results { groups, .. } => *groups,
+                            _ => Vec::new(),
+                        };
+                    let cursor_at = groups.iter().map(|g| g.outcome.offers.len()).sum::<usize>();
+                    groups.extend(*new_groups);
+                    let total: usize = groups.iter().map(|g| g.outcome.offers.len()).sum();
                     self.shop = ShopState::Results {
-                        groups,
-                        cursor: 0,
+                        groups: Box::new(groups),
+                        // Land on the newly arrived block, which is what you were
+                        // waiting for.
+                        cursor: cursor_at.min(total.saturating_sub(1)),
                         specs,
                     };
-                    let scope = if n_groups > 1 {
-                        format!(" across {n_groups} tracks")
+
+                    let pending = self.worker.as_ref().map(|w| w.outstanding()).unwrap_or(0);
+                    let tail = if pending > 0 {
+                        format!(" — {pending} still queued")
                     } else {
                         String::new()
                     };
                     match (found, failed.is_empty()) {
-                        (0, true) => self.status.warn("no offers found."),
+                        (0, true) => self.status.warn(format!("no offers found{tail}.")),
                         (0, false) => self
                             .status
-                            .err(format!("no offers — {}", failed.join("; "))),
-                        (n, true) => self.status.ok(format!("{n} offers{scope}.")),
+                            .err(format!("no offers — {}{tail}", failed.join("; "))),
+                        (n, true) => self.status.ok(format!("{n} more offers{tail}.")),
                         // A partial table is still useful; say what is missing.
                         (n, false) => self.status.warn(format!(
-                            "{n} offers{scope}, degraded — {}",
+                            "{n} more offers, degraded — {}{tail}",
                             failed.join("; ")
                         )),
                     }
@@ -484,30 +505,66 @@ impl App {
     /// one was running `s` refused *without* reopening the overlay — leaving no
     /// way back to it at all.
     pub fn open_shop(&mut self) -> bool {
-        let wanted = self.current_src().and_then(|r| self.spec_for(r));
-        let same_target = match (self.shop.specs(), &wanted) {
-            // A single-track result is "for" the highlighted row.
-            (Some([existing]), Some(w)) => existing.src_id == w.src_id,
-            // A bulk result is not tied to one row, so keep showing it.
-            (Some(specs), _) => specs.len() > 1,
-            _ => false,
+        let Some(row) = self.current_src().cloned() else {
+            self.status.warn("no source track selected to search for.");
+            return false;
         };
 
-        if self.shop_busy() && self.shop.specs().is_some() {
+        // Already answered: show it, and put the cursor on its block.
+        if let Some(i) = self.first_offer_index_for(&row.id) {
             self.mode = InputMode::Shop;
-            self.status.info("still searching — Esc to step away.");
-            return true;
-        }
-        if same_target && !self.shop.is_empty() {
-            self.mode = InputMode::Shop;
+            if let ShopState::Results { cursor, .. } = &mut self.shop {
+                *cursor = i;
+            }
             self.status
-                .info("showing the previous results — 'r' to search again.");
+                .info("already searched — 'r' re-runs just this track.");
             return true;
         }
-        self.start_shop()
+        // Already in the queue: just show the overlay.
+        if self.shop_queued.contains(&row.id) {
+            self.mode = InputMode::Shop;
+            self.status.info(format!(
+                "queued — {} search(es) to go.",
+                self.worker.as_ref().map(|w| w.outstanding()).unwrap_or(0)
+            ));
+            return true;
+        }
+        // Otherwise add it to the list, behind anything already running.
+        self.enqueue_shop(&[row])
     }
 
-    /// Search for the highlighted source track, discarding any previous results.
+    /// Add source tracks to the search queue, keeping any results already shown.
+    ///
+    /// Sequential by construction: the worker takes one job at a time, so tapping
+    /// `s` on several tracks builds a list that works through itself rather than
+    /// firing a burst of concurrent requests at each backend.
+    pub fn enqueue_shop(&mut self, rows: &[TrackRow]) -> bool {
+        let specs: Vec<_> = rows
+            .iter()
+            // Skip anything already answered or already queued.
+            .filter(|r| {
+                self.first_offer_index_for(&r.id).is_none() && !self.shop_queued.contains(&r.id)
+            })
+            .filter_map(|r| self.spec_for(r))
+            .collect();
+
+        if specs.is_empty() {
+            self.mode = InputMode::Shop;
+            self.status
+                .info("nothing new to search — those are already done or queued.");
+            return false;
+        }
+        self.submit_shop_queued(specs)
+    }
+
+    /// Index into the flattened offer list of the first offer found for `src_id`.
+    fn first_offer_index_for(&self, src_id: &str) -> Option<usize> {
+        self.shop
+            .flattened()
+            .position(|(g, _)| g.src_id.as_deref() == Some(src_id))
+    }
+
+    /// Search for the highlighted source track, replacing its existing results.
     pub fn start_shop(&mut self) -> bool {
         let Some(row) = self.current_src().cloned() else {
             self.status.warn("no source track selected to search for.");
@@ -517,40 +574,60 @@ impl App {
             self.status.warn("that track has no title to search for.");
             return false;
         };
-        self.submit_shop(vec![spec])
+        // Drop the stale block for this track only, so a re-search does not throw
+        // away results for everything else in the list.
+        self.drop_group_for(&row.id);
+        self.shop_queued.retain(|id| id != &row.id);
+        self.submit_shop_queued(vec![spec])
     }
 
-    /// Search for every source track currently visible in the left column.
+    /// Remove the results block for one source track.
+    fn drop_group_for(&mut self, src_id: &str) {
+        if let ShopState::Results {
+            groups,
+            cursor,
+            specs,
+        } = &mut self.shop
+        {
+            groups.retain(|g| g.src_id.as_deref() != Some(src_id));
+            specs.retain(|s| s.src_id.as_deref() != Some(src_id));
+            let n: usize = groups.iter().map(|g| g.outcome.offers.len()).sum();
+            *cursor = (*cursor).min(n.saturating_sub(1));
+        }
+    }
+
+    /// Add every selected source track to the search queue.
     ///
-    /// The `/` filter is the selection mechanism, so narrowing the list and
-    /// pressing `S` shops for exactly what you can see.
-    pub fn start_bulk_shop(&mut self, cap: usize) -> bool {
+    /// Selection rather than "everything visible": a filter can match hundreds of
+    /// rows, and each track is a full fan-out across every backend.
+    pub fn shop_selected(&mut self, cap: usize) -> bool {
+        if self.src.selected.is_empty() {
+            self.status
+                .warn("nothing selected — press space on the source rows you want, then 'S'.");
+            return false;
+        }
+        // Selection order is not meaningful, so follow the visible order.
         let rows: Vec<TrackRow> = self
             .src
             .visible
             .iter()
             .filter_map(|&i| self.rows.get(i))
+            .filter(|r| self.src.selected.contains(&r.id))
             .cloned()
             .collect();
-        let specs: Vec<_> = rows.iter().filter_map(|r| self.spec_for(r)).collect();
 
-        if specs.is_empty() {
-            self.status
-                .warn("nothing to search for — no visible source track has a title.");
-            return false;
-        }
-        let total = specs.len();
-        let specs: Vec<_> = specs.into_iter().take(cap).collect();
-        if total > specs.len() {
+        let total = rows.len();
+        let rows: Vec<TrackRow> = rows.into_iter().take(cap).collect();
+        if total > rows.len() {
             self.status.warn(format!(
-                "{total} visible; searching the first {} — narrow with '/' for the rest.",
-                specs.len()
+                "{total} selected; queueing the first {}.",
+                rows.len()
             ));
         }
-        self.submit_shop(specs)
+        self.enqueue_shop(&rows)
     }
 
-    fn submit_shop(&mut self, specs: Vec<crate::acquire::shop::QuerySpec>) -> bool {
+    fn submit_shop_queued(&mut self, specs: Vec<crate::acquire::shop::QuerySpec>) -> bool {
         let opts = crate::acquire::shop::SearchOpts {
             timeout: std::time::Duration::from_secs(self.cfg.search.timeout_secs.max(1)),
             enrich_top_n: self.cfg.search.enrich_top_n,
@@ -562,16 +639,6 @@ impl App {
                 .err("the search thread is not running; restart the TUI.");
             return false;
         };
-        if worker.is_busy() {
-            self.status.warn("something is already running.");
-            // Still open the overlay, so there is a way to watch it.
-            self.mode = InputMode::Shop;
-            return false;
-        }
-        let what = match specs.len() {
-            1 => specs[0].label.clone(),
-            n => format!("{n} tracks"),
-        };
         if !worker.submit(super::worker::Job::Shop {
             specs: specs.clone(),
             opts: Box::new(opts),
@@ -579,18 +646,44 @@ impl App {
             self.status.err("could not start the search.");
             return false;
         }
+        let outstanding = worker.outstanding();
 
-        self.status.info(format!("searching for {what} …"));
-        let total = specs.len();
-        self.shop = ShopState::Searching {
-            since: Instant::now(),
-            what,
-            done: 0,
-            total,
-            specs,
+        for spec in &specs {
+            if let Some(id) = &spec.src_id {
+                self.shop_queued.push(id.clone());
+            }
+        }
+        let what = match specs.len() {
+            1 => specs[0].label.clone(),
+            n => format!("{n} tracks"),
         };
+        self.status.info(if outstanding > 1 {
+            format!("queued {what} — {outstanding} search(es) pending.")
+        } else {
+            format!("searching for {what} …")
+        });
+
+        // Keep existing results on screen while more arrive; only show the
+        // searching pane when there is nothing to look at yet.
+        if self.shop.is_empty() {
+            let total = specs.len();
+            self.shop = ShopState::Searching {
+                since: Instant::now(),
+                what,
+                done: 0,
+                total,
+                specs,
+            };
+        } else if let ShopState::Results { specs: have, .. } = &mut self.shop {
+            have.extend(specs);
+        }
         self.mode = InputMode::Shop;
         true
+    }
+
+    /// Searches submitted but not yet answered.
+    pub fn shop_outstanding(&self) -> usize {
+        self.worker.as_ref().map(|w| w.outstanding()).unwrap_or(0)
     }
 
     pub fn shop_busy(&self) -> bool {

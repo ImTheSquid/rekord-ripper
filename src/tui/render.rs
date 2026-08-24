@@ -60,7 +60,14 @@ fn draw_top_bar(f: &mut Frame, area: Rect, app: &App) {
 
 fn draw_column(f: &mut Frame, area: Rect, app: &App, which: Focus) {
     let (state, label, extras) = match which {
-        Focus::Src => (&app.src, "SOURCES", String::new()),
+        Focus::Src => {
+            let t = if app.src.selected.is_empty() {
+                String::new()
+            } else {
+                format!(" [{} picked]", app.src.selected.len())
+            };
+            (&app.src, "SOURCES", t)
+        }
         Focus::Dst => {
             let mut tags = Vec::new();
             if app.dst_filters.auto {
@@ -117,10 +124,12 @@ fn draw_column(f: &mut Frame, area: Rect, app: &App, which: Focus) {
     let mut items: Vec<ListItem> = Vec::with_capacity(state.visible.len() * 2);
     for (visible_pos, &row_idx) in state.visible.iter().enumerate() {
         let row = &app.rows[row_idx];
-        let marked = match which {
-            Focus::Src => visible_pos == state.cursor,
-            Focus::Dst => state.selected.contains(&row.id),
-        };
+        // A tick means "this row is in the batch": the cursor for sources when
+        // nothing is picked, plus anything explicitly selected in either column.
+        let marked = state.selected.contains(&row.id)
+            || (matches!(which, Focus::Src)
+                && state.selected.is_empty()
+                && visible_pos == state.cursor);
         // "Active" = would participate in apply: src cursor row, or dst
         // selections (or dst cursor row if no explicit selection).
         let active = match which {
@@ -452,17 +461,17 @@ fn draw_shop(f: &mut Frame, app: &App) {
             let mut seen: Vec<String> = Vec::new();
             for g in groups.iter() {
                 for r in g.outcome.failures() {
-                    if let Some(e) = &r.error {
-                        if !e.is_silently_skippable() {
-                            let msg = format!("degraded: {}: {e}", r.backend);
-                            if !seen.contains(&msg) {
-                                seen.push(msg.clone());
-                                lines.push(Line::from(Span::styled(
-                                    msg,
-                                    Style::new().fg(Color::Yellow),
-                                )));
-                            }
-                        }
+                    let Some(e) = &r.error else { continue };
+                    if e.is_silently_skippable() {
+                        continue;
+                    }
+                    let msg = format!("degraded: {}: {e}", r.backend);
+                    if !seen.contains(&msg) {
+                        seen.push(msg.clone());
+                        lines.push(Line::from(Span::styled(
+                            msg,
+                            Style::new().fg(Color::Yellow),
+                        )));
                     }
                 }
             }
@@ -724,14 +733,15 @@ Tab / Shift-Tab    Switch focus between SOURCES and DESTINATIONS
 PgUp / PgDn        Page
 g / G              Jump top / bottom
 /                  Search the focused column (Esc/Enter to leave)
-s                  Shop online for the highlighted source track. Reopens the
-                   last results instead of re-searching; Esc steps away from a
-                   search in progress and s brings it back
-S                  Bulk shop: search for every source row the filter shows
-                   (narrow with / first)
+s                  Add the highlighted source track to the shopping list. Tap it
+                   on several tracks and they search one after another, results
+                   accumulating. On an already-searched track it just shows the
+                   results again
+S                  Add every SELECTED source track to the shopping list
+Space              Select rows: destinations are copy targets, sources are what
+                   S shops for
 Ctrl-U             Clear search query (in search mode)
-Space              Toggle destination selection (multi-select)
-c                  Clear destination selection
+c                  Clear the focused column's selection
 a                  Toggle dest auto-mode (unlocked + cueless + audio)
 f                  Toggle dest fuzzy-match-from-source filter
 r                  Toggle --replace
@@ -744,7 +754,8 @@ Enter / f          (Shop) Download the highlighted offer, and queue an analysis
                    transfer from the selected source track onto it
 o                  (Shop) Open the offer's page in a browser (to buy it)
 y                  (Shop) Show the offer's stable ref, for use with the CLI
-r                  (Shop) Re-run the search, discarding the current results
+r                  (Shop) Re-run the search for the highlighted track only,
+                   keeping results for the others
 j / k              (Shop) Move; full details for the highlighted row are shown
                    below the table
 ?                  This help
@@ -912,7 +923,13 @@ mod tests {
 
     #[test]
     fn the_help_lists_the_shop_keys() {
-        for expected in ["s ", "Shop online", "(Shop) Download", "(Shop) Open"] {
+        for expected in [
+            "s ",
+            "shopping list",
+            "(Shop) Download",
+            "(Shop) Open",
+            "S  ",
+        ] {
             assert!(HELP_BODY.contains(expected), "help is missing {expected:?}");
         }
     }

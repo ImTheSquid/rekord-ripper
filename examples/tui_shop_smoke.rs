@@ -144,18 +144,97 @@ fn main() -> anyhow::Result<()> {
         assert!(!app.shop_busy(), "reopening must not start a new search");
     }
 
+    // The queue: tap 's' on several tracks and let them run one after another.
+    if std::env::var("RR_SMOKE_QUEUE").is_ok() {
+        use rekord_ripper::tui::app::ShopState as S;
+        app.src.query = std::env::var("RR_SMOKE_QUEUE").unwrap_or_default();
+        app.recompute_visible();
+        let picks: Vec<usize> = app.src.visible.iter().take(3).copied().collect();
+        println!("tapping s on {} tracks", picks.len());
+
+        let before = app.shop.len();
+        for (n, _) in picks.iter().enumerate() {
+            app.src.cursor = n;
+            app.recompute_visible();
+            app.src.cursor = n;
+            let label = app
+                .current_src()
+                .map(|r| format!("{} — {}", r.artist, r.title))
+                .unwrap_or_default();
+            let ok = app.open_shop();
+            println!(
+                "  s on {label:<48} accepted={ok} outstanding={}",
+                app.shop_outstanding()
+            );
+        }
+        // Pressing s again on the same track must not queue it twice.
+        app.src.cursor = 0;
+        app.recompute_visible();
+        app.src.cursor = 0;
+        let dup = app.shop_outstanding();
+        app.open_shop();
+        println!(
+            "  s again on the first track: outstanding {dup} -> {}",
+            app.shop_outstanding()
+        );
+
+        let t = Instant::now();
+        let mut seen_counts = Vec::new();
+        loop {
+            term.draw(|f| render::draw(f, &app))?;
+            app.pump_worker();
+            let n = app.shop.len();
+            if seen_counts.last().copied() != Some(n) {
+                seen_counts.push(n);
+            }
+            if !app.shop_busy() {
+                break;
+            }
+            if t.elapsed() > Duration::from_secs(240) {
+                println!("queue timed out");
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        println!("  offer count over time: {seen_counts:?} (started at {before})");
+        if let S::Results { groups, .. } = &app.shop {
+            println!("  accumulated {} groups:", groups.len());
+            for g in groups.iter() {
+                println!("    {:<48} {} offers", g.label, g.outcome.offers.len());
+            }
+        }
+    }
+
     // Bulk: search for several visible source tracks at once.
     if std::env::var("RR_SMOKE_BULK").is_ok() {
         use rekord_ripper::tui::app::ShopState as S;
         app.src.query = std::env::var("RR_SMOKE_BULK").unwrap_or_default();
         app.recompute_visible();
-        println!("bulk over {} visible sources", app.src.visible.len());
-        if app.start_bulk_shop(3) {
+        // Select a few of the filtered rows, the way space does.
+        let picks: Vec<String> = app
+            .src
+            .visible
+            .iter()
+            .take(3)
+            .filter_map(|&i| app.rows.get(i))
+            .map(|r| r.id.clone())
+            .collect();
+        for id in &picks {
+            app.src.selected.insert(id.clone());
+        }
+        println!(
+            "bulk over {} selected of {} visible",
+            app.src.selected.len(),
+            app.src.visible.len()
+        );
+        if app.shop_selected(3) {
             let t = Instant::now();
             loop {
                 term.draw(|f| render::draw(f, &app))?;
                 app.pump_worker();
-                if matches!(app.shop, S::Results { .. } | S::Failed(_)) {
+                // Wait on the worker, not on the state: results may already be
+                // showing from an earlier search.
+                if !app.shop_busy() {
                     break;
                 }
                 if t.elapsed() > Duration::from_secs(180) {

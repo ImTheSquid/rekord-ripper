@@ -5,11 +5,11 @@ use crate::db::safety_preflight;
 
 use super::app::{App, Focus, InputMode, PendingBatch};
 
-/// Most tracks one `S` will search for.
+/// Most tracks one `S` will queue at once.
 ///
-/// Each track is a full fan-out across every backend, so an unbounded bulk
-/// search over a 4000-track library would be thousands of requests and a certain
-/// rate limit. Narrow with `/` and press `S` again for the rest.
+/// Each track is a full fan-out across every backend, so this is a guard against
+/// selecting half the library by accident, not a limit on how many you can shop
+/// for — tap `s` on individual tracks and they queue up behind each other.
 const BULK_SHOP_CAP: usize = 25;
 
 pub fn handle_key(app: &mut App, key: KeyEvent) {
@@ -108,29 +108,28 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
         (KeyCode::Char('s'), _) => {
             app.open_shop();
         }
-        // Bulk: shop for every source row the current filter shows.
+        // Bulk: shop for the selected source rows.
         (KeyCode::Char('S'), _) => {
-            app.start_bulk_shop(BULK_SHOP_CAP);
+            app.shop_selected(BULK_SHOP_CAP);
         }
+        // Multi-select works in both columns: destinations pick the copy targets,
+        // sources pick what to shop for with 'S'.
         (KeyCode::Char(' '), _) => {
-            if let Focus::Dst = app.focus {
-                let id = app
-                    .dst
-                    .visible
-                    .get(app.dst.cursor)
-                    .and_then(|&i| app.rows.get(i))
-                    .map(|r| r.id.clone());
-                if let Some(id) = id {
-                    if !app.dst.selected.remove(&id) {
-                        app.dst.selected.insert(id);
-                    }
+            let col = app.focused_column();
+            let id = col
+                .visible
+                .get(col.cursor)
+                .and_then(|&i| app.rows.get(i))
+                .map(|r| r.id.clone());
+            if let Some(id) = id {
+                let col = app.focused_column_mut();
+                if !col.selected.remove(&id) {
+                    col.selected.insert(id);
                 }
             }
         }
         (KeyCode::Char('c'), _) => {
-            if matches!(app.focus, Focus::Dst) {
-                app.dst.selected.clear();
-            }
+            app.focused_column_mut().selected.clear();
         }
         (KeyCode::Char('a'), _) => {
             app.dst_filters.auto = !app.dst_filters.auto;
@@ -345,7 +344,7 @@ fn handle_shop(app: &mut App, key: KeyEvent) {
             app.start_shop();
         }
         (KeyCode::Char('S'), _) => {
-            app.start_bulk_shop(BULK_SHOP_CAP);
+            app.shop_selected(BULK_SHOP_CAP);
         }
         // Enter does the useful thing: download it.
         (KeyCode::Enter, _) | (KeyCode::Char('f'), _) => {

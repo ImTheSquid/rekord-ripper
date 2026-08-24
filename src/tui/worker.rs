@@ -80,9 +80,12 @@ impl Update {
 pub struct Worker {
     jobs: Option<Sender<Job>>,
     updates: Receiver<Update>,
-    /// True between submitting a job and its result arriving, so the UI can
-    /// refuse to queue a second search rather than silently stacking them.
-    busy: bool,
+    /// Jobs submitted but not yet finished.
+    ///
+    /// A count rather than a flag: the thread takes one job at a time off the
+    /// channel, so submitting several just runs them in order. That is what makes
+    /// "tap `s` on each track you care about" work.
+    outstanding: usize,
 }
 
 impl Worker {
@@ -155,22 +158,25 @@ impl Worker {
         Ok(Self {
             jobs: Some(job_tx),
             updates: up_rx,
-            busy: false,
+            outstanding: 0,
         })
     }
 
     pub fn is_busy(&self) -> bool {
-        self.busy
+        self.outstanding > 0
     }
 
-    /// Queue a job. Returns false when one is already running.
+    /// How many jobs are submitted but not yet finished.
+    pub fn outstanding(&self) -> usize {
+        self.outstanding
+    }
+
+    /// Queue a job behind any already running. Returns false only if the thread
+    /// is gone.
     pub fn submit(&mut self, job: Job) -> bool {
-        if self.busy {
-            return false;
-        }
         match self.jobs.as_ref().map(|tx| tx.send(job)) {
             Some(Ok(())) => {
-                self.busy = true;
+                self.outstanding += 1;
                 true
             }
             // The thread died; report it rather than looking stuck forever.
@@ -185,14 +191,16 @@ impl Worker {
             match self.updates.try_recv() {
                 Ok(u) => {
                     if u.is_terminal() {
-                        self.busy = false;
+                        self.outstanding = self.outstanding.saturating_sub(1);
                     }
                     out.push(u);
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    if self.busy {
-                        self.busy = false;
+                    // Report one failure per lost job, so nothing sits pending
+                    // forever waiting on a thread that has gone.
+                    while self.outstanding > 0 {
+                        self.outstanding -= 1;
                         out.push(Update::Failed("the search thread stopped".into()));
                     }
                     break;
@@ -243,7 +251,9 @@ mod tests {
     }
 
     #[test]
-    fn submitting_marks_it_busy_and_refuses_a_second_job() {
+    fn several_jobs_queue_behind_each_other() {
+        // The point of the counter: tapping `s` on a few tracks should build a
+        // list that works through itself, not get refused.
         let mut w = worker();
         let job = || Job::Shop {
             // An empty query short-circuits in every backend, so this does no
@@ -252,11 +262,10 @@ mod tests {
             opts: Box::new(SearchOpts::default()),
         };
         assert!(w.submit(job()));
+        assert!(w.submit(job()));
+        assert!(w.submit(job()));
         assert!(w.is_busy());
-        assert!(
-            !w.submit(job()),
-            "queueing a second search would stack work the user cannot see"
-        );
+        assert_eq!(w.outstanding(), 3);
     }
 
     #[test]
@@ -291,6 +300,7 @@ mod tests {
             "never got a terminal update"
         );
         assert!(!w.is_busy(), "busy must clear so another search can run");
+        assert_eq!(w.outstanding(), 0);
     }
 
     #[test]
