@@ -158,6 +158,31 @@ fn main() -> anyhow::Result<()> {
         assert!(!app.shop_busy(), "reopening must not start a new search");
     }
 
+    // The reported dead key: browsing offers must not drag the track cursor with
+    // it, or 's' silently lands on an already-searched track every time.
+    {
+        use rekord_ripper::tui::app::ShopFocus;
+        app.shop_focus = ShopFocus::Tracks;
+        app.shop_list.cursor = 0;
+        let chosen = app.current_shop_track().map(|r| r.id.clone());
+        app.shop_focus = ShopFocus::Offers;
+        app.shop_move(4);
+        let after = app.current_shop_track().map(|r| r.id.clone());
+        println!(
+            "track cursor after moving 4 offers: {} (was {})",
+            after.clone().unwrap_or_default(),
+            chosen.clone().unwrap_or_default()
+        );
+        assert_eq!(
+            after, chosen,
+            "browsing offers must leave the track cursor alone"
+        );
+        println!(
+            "  offer now highlighted belongs to src {:?}",
+            app.shop_offer_src()
+        );
+    }
+
     // The queue: tap 's' on several tracks and let them run one after another.
     if std::env::var("RR_SMOKE_QUEUE").is_ok() {
         use rekord_ripper::tui::app::ShopState as S;
@@ -237,7 +262,25 @@ fn main() -> anyhow::Result<()> {
             app.shop_list.selected.len(),
             app.shop_list.visible.len()
         );
-        if app.shop_selected(3) {
+
+        // The reported bug: narrow the filter after filling the basket. The
+        // search used to be built from the visible rows, so everything the
+        // filter hid was silently dropped.
+        app.shop_list.query = "zzz-matches-nothing".into();
+        app.recompute_visible();
+        println!(
+            "  after hiding them: {} visible, basket {}, hidden {}",
+            app.shop_list.visible.len(),
+            app.shop_list.selected.len(),
+            app.basket_hidden()
+        );
+        assert_eq!(
+            app.basket_hidden(),
+            picks.len(),
+            "the filter should be hiding the whole basket"
+        );
+
+        if app.shop_selected(25) {
             let t = Instant::now();
             loop {
                 term.draw(|f| render::draw(f, &app))?;
@@ -258,6 +301,20 @@ fn main() -> anyhow::Result<()> {
                 for g in groups.iter() {
                     println!("  {:<44} {} offers", g.label, g.outcome.offers.len());
                 }
+                let answered = picks
+                    .iter()
+                    .filter(|id| {
+                        groups
+                            .iter()
+                            .any(|g| g.src_id.as_deref() == Some(id.as_str()))
+                    })
+                    .count();
+                println!("  answered {answered} of the {} basket picks", picks.len());
+                assert_eq!(
+                    answered,
+                    picks.len(),
+                    "a filter must not drop basket items from the search"
+                );
             }
             println!("total offers: {}", app.shop.len());
         } else {
