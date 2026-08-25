@@ -166,8 +166,16 @@ pub struct Soulseek {
     /// transfer running in slskd; the next `fetch` attaches to it.
     pub fetch_timeout_secs: u64,
     /// Remove our staging directory from slskd's download directory once a file
-    /// has been collected and its size verified. Needs slskd's
-    /// `remote_file_management` enabled; without it this is skipped quietly.
+    /// has been collected and its size verified.
+    ///
+    /// Off by default, for two reasons. Sharing what you have downloaded is the
+    /// norm on Soulseek — and the thing that gets your own searches answered —
+    /// so deleting it again would work against you if the download directory is
+    /// in `shares`. And deleting files on another machine is a surprising
+    /// default. Turn it on if slskd's disk matters more than your share ratio.
+    ///
+    /// Needs slskd's `remote_file_management` enabled either way; without it the
+    /// delete is refused and skipped quietly.
     pub clean_up_remote: bool,
 }
 
@@ -248,7 +256,7 @@ impl Default for Soulseek {
             search_window_secs: 8,
             search_limit: 50,
             fetch_timeout_secs: 1800,
-            clean_up_remote: true,
+            clean_up_remote: false,
         }
     }
 }

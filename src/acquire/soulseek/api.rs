@@ -262,10 +262,34 @@ impl FilesystemDirectory {
 #[serde(rename_all = "camelCase")]
 pub struct FilesystemFile {
     pub name: String,
-    /// Absolute path on the slskd host.
+    /// Relative to whatever was listed — the leaf name when a subdirectory was
+    /// listed, a path from the download root when the root was. Deliberately
+    /// *not* used as a filesystem path: compose one from
+    /// [`Directories::downloads`] instead.
+    #[serde(default)]
     pub full_name: String,
     #[serde(default)]
     pub length: u64,
+}
+
+/// The directories slskd is configured with, from `GET /api/v0/options`.
+///
+/// Needed because a completed download's location is only knowable as
+/// `downloads` + the destination we asked for + the name slskd gave it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Options {
+    #[serde(default)]
+    pub directories: Directories,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Directories {
+    #[serde(default)]
+    pub downloads: String,
+    #[serde(default)]
+    pub incomplete: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -368,6 +392,11 @@ impl Client {
 
     pub fn batch(&self, id: &str) -> Result<Batch> {
         self.get_json(&format!("transfers/downloads/batches/{id}"), "batch")
+    }
+
+    /// slskd's running configuration, for the download directory.
+    pub fn options(&self) -> Result<Options> {
+        self.get_json("options", "options")
     }
 
     /// List slskd's download directory. `subdirectory` is relative to it.

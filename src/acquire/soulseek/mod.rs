@@ -20,7 +20,7 @@
 
 pub mod api;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use super::error::{BackendError, Result};
@@ -392,6 +392,37 @@ fn check_size(got: u64, expected: u64) -> Result<()> {
     Ok(())
 }
 
+/// Turn a 404 from the file route into the diagnosis it actually is.
+///
+/// The mistake this exists for: `files_url` serving a *different* directory
+/// than the one slskd downloads into. slskd reports the download as succeeded,
+/// the file genuinely exists, and the bare 404 gives no hint that two paths
+/// need to agree — so say which two.
+fn explain_missing(
+    client: &api::Client,
+    e: BackendError,
+    staging: &str,
+    name: &str,
+) -> BackendError {
+    if !matches!(e, BackendError::Http { status: 404, .. }) {
+        return e;
+    }
+    let dir = client
+        .options()
+        .map(|o| o.directories.downloads)
+        .unwrap_or_default();
+    let dir = if dir.is_empty() {
+        "its download directory".to_string()
+    } else {
+        format!("its download directory ({dir})")
+    };
+    BackendError::Other(anyhow::anyhow!(
+        "slskd has this file at {staging}/{name} inside {dir}, but files_url answered 404 \
+         for it. files_url has to serve that same directory — check that the web route's \
+         root and slskd's own `directories.downloads` are the same place."
+    ))
+}
+
 /// One progress line per change, so an hour in a queue is legible without being
 /// thousands of identical lines.
 fn progress_line(t: &api::Transfer) -> String {
@@ -726,12 +757,17 @@ impl super::AcquisitionBackend for Soulseek {
             // slskd's download directory is reachable as a path: a local slskd,
             // or a mounted share. `place` already falls back to copy-then-delete
             // across filesystems, which is exactly the mounted case.
-            let produced = PathBuf::from(&found.full_name);
+            //
+            // Composed from the configured directory rather than the listing's
+            // `fullName`, which is only a leaf name when a subdirectory was
+            // listed and so is not a usable path.
+            let downloads = client.options()?.directories.downloads;
+            let produced = Path::new(&downloads).join(&staging).join(&found.name);
             if !produced.is_file() {
                 return Err(BackendError::Other(anyhow::anyhow!(
-                    "slskd put the file at {} but that path is not readable from here — \
-                     set [soulseek] files_url if slskd is on another machine",
-                    found.full_name
+                    "slskd downloaded the file to {} on its own host, which is not readable \
+                     from here — set [soulseek] files_url if slskd is on another machine",
+                    produced.display()
                 )));
             }
             let bytes = std::fs::metadata(&produced)?.len();
@@ -752,7 +788,9 @@ impl super::AcquisitionBackend for Soulseek {
             } else {
                 super::fs::unique_path(&desired)
             };
-            let bytes = self.http_collect(&staging, &found.name, &target, deadline)?;
+            let bytes = self
+                .http_collect(&staging, &found.name, &target, deadline)
+                .map_err(|e| explain_missing(&client, e, &staging, &found.name))?;
             if let Err(e) = check_size(bytes, done.size) {
                 // A short file under a .flac name is exactly what the
                 // atomic-write rule exists to keep out of the library.
@@ -1567,18 +1605,62 @@ mod server_tests {
 
         let asked = d.asked();
         assert!(asked.iter().any(|a| a.ends_with("/batches")));
-        // Cleaned up after itself, but only once the bytes were here.
+        // Left in place by default, so a download directory that is in slskd's
+        // shares keeps sharing what it just fetched.
+        assert!(
+            !asked
+                .iter()
+                .any(|a| a.starts_with("DELETE /api/v0/files/downloads/directories")),
+            "the staging directory should be left for resharing: {asked:?}"
+        );
+
+        std::fs::remove_dir_all(&dest).ok();
+    }
+
+    #[test]
+    fn opting_in_to_cleanup_deletes_the_staging_dir_but_only_after_collecting() {
+        let d = Fake::start(|method, path| {
+            if method == "POST" && path.ends_with("/batches") {
+                return json_reply(201, json!({"batch": {"id": "b", "transfers": []}}));
+            }
+            if method == "GET" && path.contains("/downloads/batches/") {
+                return json_reply(
+                    200,
+                    json!({"id": "b", "transfers": [transfer("Completed, Succeeded", SIZE)]}),
+                );
+            }
+            if method == "GET" && path.contains("/files/downloads/directories") {
+                return json_reply(200, listing());
+            }
+            if method == "GET" && path.starts_with("/files/") {
+                return bytes_reply(AUDIO);
+            }
+            empty_reply(204)
+        });
+
+        let dest = std::env::temp_dir().join(format!("rr-slskd-{}", uuid::Uuid::new_v4()));
+        d.backend(|c| c.clean_up_remote = true)
+            .fetch(
+                &ItemRef::new(ID, item_key(SIZE, 1006, "peer", TRACK)),
+                &FetchOpts {
+                    dest_dir: dest.clone(),
+                    format_pref: vec![AudioFormat::Flac],
+                    retention: Retention::Keep,
+                    overwrite: false,
+                    deadline: Instant::now() + Duration::from_secs(60),
+                },
+            )
+            .unwrap();
+
+        let asked = d.asked();
         let del = asked
             .iter()
             .position(|a| a.starts_with("DELETE /api/v0/files/downloads/directories"));
-        let get = asked.iter().position(|a| a.starts_with("GET /files/"));
+        let got = asked.iter().position(|a| a.starts_with("GET /files/"));
+        assert!(del.is_some(), "staging dir should be removed: {asked:?}");
         assert!(
-            del.is_some(),
-            "staging directory should be removed: {asked:?}"
-        );
-        assert!(
-            get < del,
-            "the file must be collected before cleanup: {asked:?}"
+            got < del,
+            "never delete before the bytes are here: {asked:?}"
         );
 
         std::fs::remove_dir_all(&dest).ok();
@@ -1759,11 +1841,18 @@ mod server_tests {
     #[test]
     fn a_local_slskd_reads_the_file_off_disk_instead_of_over_http() {
         // files_url empty means the download directory is a path we can reach.
+        //
+        // The file goes exactly where slskd would put it — the configured
+        // download directory, plus the staging destination we asked for, plus
+        // the name. `fullName` is deliberately the bare leaf here, which is what
+        // slskd actually returns when a subdirectory is listed, so a path
+        // composed from it would not resolve.
         let dir = std::env::temp_dir().join(format!("rr-slskd-local-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let on_disk = dir.join("02 - Archangel.flac");
+        let staging = Soulseek::staging(&batch_id("peer", TRACK));
+        let on_disk = dir.join(&staging).join("02 - Archangel.flac");
+        std::fs::create_dir_all(on_disk.parent().unwrap()).unwrap();
         std::fs::write(&on_disk, AUDIO).unwrap();
-        let full = on_disk.to_string_lossy().into_owned();
+        let downloads = dir.to_string_lossy().into_owned();
 
         let d = Fake::start(move |method, path| {
             if method == "POST" && path.ends_with("/batches") {
@@ -1779,9 +1868,12 @@ mod server_tests {
                 return json_reply(
                     200,
                     json!({"files": [{"name": "02 - Archangel.flac",
-                                      "fullName": full, "length": SIZE}],
+                                      "fullName": "02 - Archangel.flac", "length": SIZE}],
                            "directories": []}),
                 );
+            }
+            if method == "GET" && path == "/api/v0/options" {
+                return json_reply(200, json!({"directories": {"downloads": downloads}}));
             }
             empty_reply(204)
         });
@@ -1811,6 +1903,54 @@ mod server_tests {
 
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&dest).ok();
+    }
+
+    #[test]
+    fn a_files_url_serving_the_wrong_directory_says_so() {
+        // The mistake a new setup actually makes: the web route's root and
+        // slskd's `directories.downloads` are different places. slskd reports
+        // success, the file exists, and a bare 404 explains nothing.
+        let d = Fake::start(|method, path| {
+            if method == "POST" && path.ends_with("/batches") {
+                return json_reply(201, json!({"batch": {"id": "b", "transfers": []}}));
+            }
+            if method == "GET" && path.contains("/downloads/batches/") {
+                return json_reply(
+                    200,
+                    json!({"id": "b", "transfers": [transfer("Completed, Succeeded", SIZE)]}),
+                );
+            }
+            if method == "GET" && path.contains("/files/downloads/directories") {
+                return json_reply(200, listing());
+            }
+            if method == "GET" && path == "/api/v0/options" {
+                return json_reply(200, json!({"directories": {"downloads": "/app/downloads"}}));
+            }
+            // The file route is pointed somewhere else entirely.
+            if method == "GET" && path.starts_with("/files/") {
+                return empty_reply(404);
+            }
+            empty_reply(204)
+        });
+
+        let err = d
+            .backend(|_| {})
+            .fetch(
+                &ItemRef::new(ID, item_key(SIZE, 1006, "peer", TRACK)),
+                &FetchOpts {
+                    dest_dir: std::env::temp_dir().join("rr-slskd-404"),
+                    format_pref: vec![AudioFormat::Flac],
+                    retention: Retention::Keep,
+                    overwrite: false,
+                    deadline: Instant::now() + Duration::from_secs(60),
+                },
+            )
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("/app/downloads"), "names slskd's dir: {err}");
+        assert!(err.contains("files_url"), "names the setting: {err}");
+        assert!(err.contains("same directory"), "says what to fix: {err}");
     }
 
     #[test]
