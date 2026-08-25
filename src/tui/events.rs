@@ -34,11 +34,33 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         InputMode::Normal => match app.screen {
             Screen::Transfer => handle_normal(app, key),
             Screen::Shop => handle_shop(app, key),
+            Screen::Pending => handle_pending(app, key),
         },
         InputMode::Search(focus) => handle_search(app, key, focus),
         InputMode::ShopSearch => handle_shop_search(app, key),
         InputMode::Confirm => handle_confirm(app, key),
         InputMode::Help => handle_help(app, key),
+    }
+}
+
+/// The queue of downloads that have not become transfers yet.
+///
+/// Read-only for now: navigation, and the state each entry is in.
+fn handle_pending(app: &mut App, key: KeyEvent) {
+    match (key.code, key.modifiers) {
+        // Esc leaves the screen rather than quitting, matching the shop screen.
+        (KeyCode::Esc, _) | (KeyCode::Char('q'), _) => {
+            app.screen = Screen::Transfer;
+        }
+        (KeyCode::Char('?'), _) => app.mode = InputMode::Help,
+        (KeyCode::Up, _) | (KeyCode::Char('k'), _) => app.queue.move_by(-1),
+        (KeyCode::Down, _) | (KeyCode::Char('j'), _) => app.queue.move_by(1),
+        (KeyCode::PageUp, _) => app.queue.move_by(-10),
+        (KeyCode::PageDown, _) => app.queue.move_by(10),
+        (KeyCode::Char('g'), _) => app.queue.jump_top(),
+        (KeyCode::Char('G'), _) => app.queue.jump_bottom(),
+        (KeyCode::Char('R'), _) => app.reload_queue(),
+        _ => {}
     }
 }
 
@@ -142,6 +164,9 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
         // Cross to the shop screen, landing on this track.
         (KeyCode::Char('s'), _) => {
             app.open_shop();
+        }
+        (KeyCode::Char('p'), _) => {
+            app.open_queue();
         }
         // Selection here means one thing only: the copy targets. A source is
         // always the highlighted row, so there is nothing to select on that side.
@@ -393,6 +418,10 @@ fn handle_shop(app: &mut App, key: KeyEvent) {
         // Add to the shopping list, or show what it already found.
         (KeyCode::Char('s'), _) => {
             app.shop_track();
+        }
+        // Where a download goes after it lands.
+        (KeyCode::Char('p'), _) => {
+            app.open_queue();
         }
         (KeyCode::Char('S'), _) => {
             app.shop_selected(BULK_SHOP_CAP);

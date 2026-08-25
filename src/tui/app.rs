@@ -27,6 +27,8 @@ pub enum Focus {
 pub enum Screen {
     Transfer,
     Shop,
+    /// Downloads that have not become transfers yet.
+    Pending,
 }
 
 /// Which pane of the shop screen the keys go to.
@@ -351,6 +353,14 @@ pub struct App {
     pub cfg: crate::config::Config,
     pub pending: Option<PendingBatch>,
     pub unresolved_errors: bool,
+    /// The download queue, and the store behind it.
+    ///
+    /// `None` means the queue is unavailable, not that the TUI failed to start
+    /// — the same treatment `worker` gets. Held open rather than reopened per
+    /// keypress: `open()` re-runs the schema setup and has nowhere to report a
+    /// failure from inside a key handler.
+    pub queue: super::queue::QueueState,
+    pub store: Option<crate::pending::PendingStore>,
     /// First visible line of the help popup. Clamped during render, which is
     /// the only place the popup's height is known.
     pub help_scroll: u16,
@@ -394,6 +404,8 @@ impl App {
             cfg,
             pending: None,
             unresolved_errors: false,
+            queue: super::queue::QueueState::default(),
+            store: crate::pending::PendingStore::open().ok(),
             help_scroll: 0,
             quit_pending: false,
             should_quit: false,
@@ -922,6 +934,44 @@ impl App {
     }
 
     /// Searches submitted but not yet answered.
+    /// Open the queue screen, retiring anything that can no longer progress.
+    pub fn open_queue(&mut self) {
+        self.screen = Screen::Pending;
+        self.reload_queue();
+    }
+
+    /// Re-read the store, sweeping first.
+    ///
+    /// `sweep` is what the CLI runs on every `pending` invocation: it retires
+    /// entries whose file or source track went away. Entries vanishing from the
+    /// list with no explanation would be worse than the noise, so each one is
+    /// reported.
+    pub fn reload_queue(&mut self) {
+        let Some(store) = self.store.as_ref() else {
+            self.status
+                .err("the pending queue could not be opened — downloads cannot be finished here.");
+            return;
+        };
+        // Collected before reporting: the store borrow has to end before the
+        // status line can be written to.
+        let swept = store.sweep(&self.db);
+        let listed = self.store.as_ref().map(|s| s.all());
+
+        match swept {
+            Ok(retired) => {
+                for (id, state, why) in retired {
+                    self.status.warn(format!("#{id} → {state}: {why}"));
+                }
+            }
+            Err(e) => self.status.warn(format!("sweep failed: {e}")),
+        }
+        match listed {
+            Some(Ok(entries)) => self.queue.reload(entries),
+            Some(Err(e)) => self.status.err(format!("could not read the queue: {e}")),
+            None => {}
+        }
+    }
+
     /// Searches outstanding — not every job. The shop screen's counter and the
     /// quit guard both phrase themselves as "search(es)", so counting
     /// fingerprints here would make them lie.

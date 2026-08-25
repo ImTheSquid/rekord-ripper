@@ -16,6 +16,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     match app.screen {
         Screen::Transfer => draw_transfer(f, app),
         Screen::Shop => draw_shop_screen(f, app),
+        Screen::Pending => draw_pending_screen(f, app),
     }
     match app.mode {
         InputMode::Confirm => draw_confirm(f, app),
@@ -243,8 +244,9 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
             "tab focus  / search  s shop  space pick dest  a auto  f fuzzy  r replace  l lock  enter apply  ? help  q quit"
         }
         Screen::Shop => {
-            "tab pane  / filter  s search  space basket  S search basket  r re-search  enter download  o buy page  y ref  esc back"
+            "tab pane  / filter  s search  space basket  S search basket  r re-search  enter download  o buy page  y ref  p queue  esc back"
         }
+        Screen::Pending => "↑↓ move  R refresh  ? help  esc back",
     };
     f.render_widget(
         Paragraph::new(hints).style(Style::new().fg(Color::DarkGray)),
@@ -356,6 +358,129 @@ fn draw_shop_screen(f: &mut Frame, app: &App) {
     draw_shop_tracks(f, cols[0], app);
     draw_shop_offers(f, cols[1], app);
     draw_status(f, outer[2], app);
+}
+
+/// The queue of downloads that have not become transfers yet.
+fn draw_pending_screen(f: &mut Frame, app: &App) {
+    let outer = Layout::vertical([
+        Constraint::Length(1), // top bar
+        Constraint::Min(0),    // the queue
+        Constraint::Length(2), // status bar
+    ])
+    .split(f.area());
+
+    let mut spans = vec![Span::styled("pending", Style::new().bold().magenta())];
+    spans.push(Span::raw(format!("  {} queued", app.queue.entries.len())));
+    if app.queue.any_in_flight() {
+        spans.push(Span::styled("  working…", Style::new().fg(Color::Cyan)));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), outer[0]);
+
+    draw_pending_list(f, outer[1], app);
+    draw_status(f, outer[2], app);
+}
+
+fn draw_pending_list(f: &mut Frame, area: Rect, app: &App) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(Color::Cyan))
+        .title(format!(" DOWNLOADS ({}) ", app.queue.entries.len()));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if app.queue.entries.is_empty() {
+        let empty = if app.store.is_none() {
+            "the queue could not be opened."
+        } else {
+            "nothing queued. Download something on the shop screen and it lands here."
+        };
+        f.render_widget(Paragraph::new(empty).style(Style::new().dim()), inner);
+        return;
+    }
+
+    let items: Vec<ListItem> = app
+        .queue
+        .entries
+        .iter()
+        .flat_map(|entry| {
+            let artist = entry.src_artist.as_deref().unwrap_or("—");
+            let title = entry.src_title.as_deref().unwrap_or("(untitled)");
+            let file = entry
+                .acquired_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+
+            let first = Line::from(vec![
+                Span::styled(
+                    format!("#{:<4}", entry.id),
+                    Style::new().fg(Color::DarkGray),
+                ),
+                Span::styled(title.to_string(), Style::new().bold()),
+                Span::styled(format!("  —  {artist}"), Style::new().fg(Color::Gray)),
+            ]);
+            let second = Line::from(vec![
+                Span::raw("     "),
+                pending_state_span(app, entry),
+                Span::styled(format!("  ·  {file}"), Style::new().fg(Color::DarkGray)),
+            ]);
+            [ListItem::new(first), ListItem::new(second)]
+        })
+        .collect();
+
+    let mut state = ListState::default();
+    state.select(Some(app.queue.cursor * 2));
+    let list = List::new(items)
+        .highlight_style(Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD));
+    f.render_stateful_widget(list, inner, &mut state);
+}
+
+/// What this entry is waiting on, or what it decided.
+///
+/// In-flight work is per row rather than one screen-wide spinner: a gate against
+/// a streaming source rips it before decoding, so a queue of five would sit on a
+/// single spinner for minutes and look hung.
+fn pending_state_span(app: &App, entry: &crate::pending::Entry) -> Span<'static> {
+    use crate::tui::queue::EntryWork;
+
+    if let Some(work) = app.queue.work_for(entry.id) {
+        let text = match work {
+            EntryWork::Failed(why) => format!("failed — {why}"),
+            other => match other.since() {
+                Some(since) => format!("{} {}", spinner(Some(since)), other.tag()),
+                None => other.tag().to_string(),
+            },
+        };
+        let colour = match work {
+            EntryWork::Failed(_) => Color::Red,
+            EntryWork::Ready { .. } | EntryWork::Planned(_) => Color::Green,
+            _ => Color::Cyan,
+        };
+        return Span::styled(text, Style::new().fg(colour));
+    }
+
+    let (text, colour) = stored_state_label(entry.state, entry.verdict.as_deref());
+    Span::styled(text, Style::new().fg(colour))
+}
+
+/// How a stored state reads on the row, kept free of `App` so it can be tested.
+fn stored_state_label(state: crate::pending::State, verdict: Option<&str>) -> (String, Color) {
+    use crate::pending::State;
+    let (label, colour) = match state {
+        State::AwaitingImport => ("awaiting import", Color::Yellow),
+        State::Matched => ("ready to apply", Color::Green),
+        State::Applied => ("applied", Color::Green),
+        State::Rejected => ("rejected", Color::Red),
+        State::Expired => ("expired", Color::DarkGray),
+        State::Cancelled => ("cancelled", Color::DarkGray),
+    };
+    // The verdict is why an entry is rejected or ready; hiding it would leave
+    // the user guessing at the one thing that decided the outcome.
+    let verdict = verdict
+        .filter(|v| !v.is_empty())
+        .map(|v| format!(" — {v}"))
+        .unwrap_or_default();
+    (format!("{label}{verdict}"), colour)
 }
 
 fn draw_shop_top_bar(f: &mut Frame, area: Rect, app: &App) {
@@ -1133,6 +1258,8 @@ TRANSFER SCREEN — copy analysis from one track onto others
   l                Toggle --lock (set lock on dst after copy)
   R                Force-reload tracks from master.db
   s                Go shopping for the highlighted source track
+  p                The download queue — what has been fetched but not yet
+                   turned into a transfer
   Enter            Build plans and open the confirm modal
   y / Enter        (Confirm) Apply the batch
   n / Esc / q      (Confirm) Cancel
@@ -1159,6 +1286,15 @@ SHOP SCREEN — find and download better copies
   The tag after them is what its search found: a count, · for nothing,
   … for still queued.
   's' and 'S' always act on the TRACKS list, whichever pane has focus.
+
+PENDING SCREEN — downloads that have not become transfers yet
+  ↑ ↓ / k j        Move cursor
+  R                Re-read the queue, retiring anything stale
+  Esc / q          Back to the transfer screen
+
+  A download queued by 'f' on the shop screen lands here. Each row shows
+  where it has got to: awaiting import until rekordbox (or this tool) has
+  a row for the file, then the fingerprint verdict, then applied.
 
 ?                  This help. ↑ ↓ / k j / PgUp / PgDn / g / G scroll it,
                    Esc or q closes it
@@ -1410,6 +1546,28 @@ mod tests {
             "help would be clipped horizontally"
         );
         assert!(r.height >= rows + 2, "help would be clipped vertically");
+    }
+
+    #[test]
+    fn every_queue_state_reads_as_something() {
+        use crate::pending::State;
+        // All six, so a state added later cannot render as a blank row.
+        for state in [
+            State::AwaitingImport,
+            State::Matched,
+            State::Applied,
+            State::Rejected,
+            State::Expired,
+            State::Cancelled,
+        ] {
+            let (text, _) = stored_state_label(state, None);
+            assert!(!text.is_empty(), "{state:?} renders as nothing");
+        }
+        // The verdict is appended when there is one, and never as a bare dash.
+        let (with, _) = stored_state_label(State::Rejected, Some("duration differs by 9s"));
+        assert!(with.contains("rejected") && with.contains("9s"));
+        let (without, _) = stored_state_label(State::Rejected, Some(""));
+        assert_eq!(without, "rejected");
     }
 
     #[test]
