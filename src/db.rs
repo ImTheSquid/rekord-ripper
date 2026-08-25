@@ -40,22 +40,7 @@ fn resolve_key() -> Result<String> {
     deobfuscate()
 }
 
-pub fn rekordbox_app_dir() -> Result<PathBuf> {
-    #[cfg(target_os = "windows")]
-    {
-        var("APPDATA")
-            .map(|appdata| PathBuf::from(appdata).join("Pioneer/rekordbox"))
-            .map_err(|_| anyhow!("APPDATA env var not found"))
-    }
-    #[cfg(target_os = "macos")]
-    {
-        var("HOME")
-            .map(|home| PathBuf::from(home).join("Library/Pioneer/rekordbox"))
-            .map_err(|_| anyhow!("HOME env var not found"))
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    compile_error!("Rekordbox only runs on macOS and Windows.");
-}
+pub use crate::paths::rekordbox_app_dir;
 
 pub struct MasterDb {
     pub conn: Connection,
@@ -142,24 +127,7 @@ impl MasterDb {
     }
 }
 
-/// Where backups live. Created on first use.
-fn backup_dir() -> Result<PathBuf> {
-    #[cfg(target_os = "windows")]
-    {
-        var("LOCALAPPDATA")
-            .map(|d| PathBuf::from(d).join("rekord-ripper").join("backups"))
-            .map_err(|_| anyhow!("LOCALAPPDATA env var not found"))
-    }
-    #[cfg(target_os = "macos")]
-    {
-        var("HOME")
-            .map(|h| {
-                PathBuf::from(h)
-                    .join("Library/Application Support/rekord-ripper/backups")
-            })
-            .map_err(|_| anyhow!("HOME env var not found"))
-    }
-}
+use crate::paths::backup_dir;
 
 /// True if a `rekordbox` process is currently running.
 pub fn rekordbox_running() -> bool {

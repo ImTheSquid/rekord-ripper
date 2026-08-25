@@ -1,6 +1,7 @@
 # Rekord Ripper
 
-A utility to transfer Rekordbox analysis data across songs.
+A utility to transfer Rekordbox analysis data across songs, and to find better
+copies of the tracks you already have.
 
 https://github.com/user-attachments/assets/0c9d8a70-0058-4870-9988-0bb712931234
 
@@ -10,6 +11,233 @@ https://github.com/user-attachments/assets/0c9d8a70-0058-4870-9988-0bb712931234
 cargo install rekord-ripper
 ```
 
-## Usage
+`shop`, `buy` and `fetch` also want `yt-dlp` and `ffmpeg` on your PATH:
 
-The basic version is `rekord-ripper tui`, which just drops you into the TUI. You can also manually copy with `rekord-ripper cp`, auto copy with `rekord-ripper auto`, and dump the database with `rekord-ripper dump`. See the help pages for more information.
+```bash
+brew install yt-dlp ffmpeg
+```
+
+The Soulseek backend needs a reachable [slskd](https://github.com/slskd/slskd).
+It is optional — until you configure one, Soulseek reports itself as unconfigured
+and the other backends carry on. Running it somewhere always-on is the point: a
+Soulseek queue position can take hours, and a laptop that sleeps loses it.
+
+Run `rekord-ripper backends` at any time to see what is configured and what is
+missing.
+
+## Transferring analysis
+
+The basic version is `rekord-ripper tui`, which just drops you into the TUI. You
+can also manually copy with `rekord-ripper cp`, auto copy with
+`rekord-ripper auto`, and dump the database with `rekord-ripper dump`. See the
+help pages for more information.
+
+## Acquisition backends
+
+Most of a library ends up on SoundCloud, where the audio is a 128kbps transcode.
+The same tracks are usually buyable in lossless on Bandcamp, and the ones that
+were never for sale anywhere are usually on Soulseek. These commands find them,
+help you buy them, fetch the file, and move your cue points and beat grid onto
+it.
+
+```bash
+# Search every backend at once and compare what is on offer.
+rekord-ripper shop "burial untrue"
+rekord-ripper shop --track-id 12345678 --lossless-only
+
+# Bulk: shop for several tracks in one run, grouped per track.
+rekord-ripper shop --track-id 12345678 --track-id 87654321 --json
+
+# Open the purchase page in your browser. Payment is never automated.
+rekord-ripper buy "burial untrue"
+
+# Download something free, or something you have bought, and queue the transfer.
+rekord-ripper fetch --offer bandcamp:a:856850876 --src-track-id 12345678
+rekord-ripper fetch https://soundcloud.com/artist/track --src-track-id 12345678
+
+# Apply queued transfers once rekordbox has imported the files.
+rekord-ripper pending --list
+rekord-ripper pending --apply
+```
+
+### In the TUI
+
+The TUI has two screens, and each one's selection means exactly one thing.
+
+The **transfer screen** is the src → dst view. `Space` picks destinations, and
+that is all it does — the source is always the highlighted row. `s` crosses to
+the shop screen, landing on the track you were on.
+
+The **shop screen** is a track list beside an offer table. `s` searches the
+highlighted track; tap it on several and they search one after another, results
+accumulating into one grouped table — nothing is discarded and nothing is
+searched twice. `Space` fills a basket and `S` searches all of it. Each track
+carries a tag showing what its search found: a count, `·` for nothing, `…` for
+still queued. `Enter` on an offer downloads it and queues an analysis transfer
+against that offer's *own* source track, which after a batch of searches is not
+necessarily the one under the list cursor. `Esc` goes back.
+
+Searches run on a background thread, so leaving the screen loses nothing and `s`
+brings it back. They run sequentially rather than in parallel: each track is
+already a fan-out across every backend, so firing several at once would multiply
+requests per backend and invite a rate limit.
+
+Backends implement the `AcquisitionBackend` trait, so adding another is a matter
+of implementing search, enrich, purchase and fetch. Bandcamp, SoundCloud and
+Soulseek ship with it.
+
+### Soulseek
+
+Soulseek offers are free and carry their real format — slskd reports the
+extension, the bitrate, and whether a lossy encode is VBR — so a FLAC from
+Soulseek competes with a Bandcamp purchase on the same row and can win. There is
+nothing to buy, so `buy` has nothing to do with them. Files a peer has locked
+behind their own sharing rules are never offered, since a fetch could not
+deliver one.
+
+```toml
+[soulseek]
+url = "https://slskd.example.com:5030"   # the slskd API
+files_url = "https://slskd.example.com/files"
+```
+
+```toml
+# credentials.toml, mode 600
+[soulseek]
+api_key = "..."            # slskd --generate-secret 32, role readwrite
+files_user = "ripper"      # only if the files route is protected
+files_password = "..."
+```
+
+**`files_url` is the part that needs explaining.** slskd's API can list and
+delete files in its download directory but cannot hand over their bytes — there
+is no endpoint for it. So when slskd is on another machine, point `files_url` at
+that directory served over HTTP and rekord-ripper fetches from there. One Caddy
+route next to the API does it:
+
+```
+handle_path /files/* {
+    root * /var/slskd/downloads
+    basicauth { ripper <bcrypt hash> }
+    file_server
+}
+```
+
+**The route has to serve the same directory slskd downloads into** — whatever
+`directories.downloads` is set to in `slskd.yml`. Getting those two out of step
+is the easy mistake, and it fails confusingly: slskd reports the download as
+succeeded because it *did* succeed, and the file route then 404s. rekord-ripper
+names both paths when that happens.
+
+Leave `files_url` empty when the download directory is reachable as a path — a
+local slskd, or a mounted share — and the file is moved rather than downloaded.
+
+Each fetch stages into `rekord-ripper/<id>/` under slskd's download directory.
+That staging directory is **left in place** by default, so if you have the
+download directory in slskd's `shares` the file keeps being shared — which is
+the norm on Soulseek, and the thing that gets your own searches answered. Set
+`clean_up_remote = true` to delete it instead (which also needs slskd's
+`remote_file_management` enabled; without it the delete is refused and skipped
+quietly).
+
+Two behaviours worth knowing:
+
+- **A search blocks, and `search_limit` is what bounds it.**
+  `search_window_secs` (8, minimum 5) is slskd's *idle* timeout — it restarts on
+  every response — so on a popular query the peer cap is what actually stops it.
+- **`fetch_timeout_secs` (1800) is when rekord-ripper stops waiting, not when the
+  transfer stops.** It is left running in slskd, and fetching the same offer
+  again attaches to it rather than starting over, because the batch id is derived
+  from the offer. A queue position you have already waited hours for is not worth
+  throwing away.
+
+### Things it deliberately does not do
+
+- **Buy anything for you.** Bandcamp checkout is a card flow in their web UI with
+  no API behind it. `buy` gets you to the right page; you pay.
+- **Compare prices across currencies.** Prices come in each seller's own
+  currency and there is no exchange-rate source here, so prices are always shown
+  with their ISO code and any "cheapest" line is per-currency.
+- **Pretend a SoundCloud rip is an upgrade.** Free tracks cap at MP3-128 unless
+  the artist enabled the original file, and Go+ tracks are DRM'd and simply fail.
+  `fetch` reports the format it actually got and says when it is a downgrade.
+- **Vouch for a Soulseek file's quality.** All a search result carries is a peer's
+  filename and their claimed bitrate, and a `.flac` upscaled from a 128kbps MP3
+  looks identical to a real one from here. The fingerprint gate proves it is the
+  same recording, not that it is a better master.
+- **Run slskd for you.** `backends` says what is missing; managing a long-lived
+  logged-in process is not this tool's job.
+
+### The fingerprint gate
+
+A transfer only fires when an audio fingerprint says the two files are the same
+recording **and** that they are time-aligned. The second half matters: cue points
+are copied as absolute timestamps and the beat grid is copied as opaque ANLZ
+binary, so a same-but-shifted pair would put every cue in the wrong place with no
+way to compensate. It fails closed on either axis.
+
+The thresholds ship deliberately loose. Calibrate them against your own library:
+
+```bash
+rekord-ripper fp path/to/soundcloud-rip.mp3 path/to/bandcamp.flac
+```
+
+That prints the per-segment scores, coverage, and the implied time offset. Run it
+over pairs you know are the same track and pairs you know are not, then set
+`score_max` and `coverage_min` in `config.toml` from the gap between them.
+
+Known limit: one fingerprint item is ~124ms, so shifts below about **62ms** are
+invisible and a ~50ms offset will be accepted. That is the resolution floor, not
+a bug — the accept message states it.
+
+## Configuration
+
+```bash
+rekord-ripper config            # where it lives
+rekord-ripper config --init     # write a starter file
+```
+
+Bandcamp downloads need the `identity` cookie from a logged-in browser session,
+in `credentials.toml` next to `config.toml` (or `BANDCAMP_IDENTITY` in the
+environment). Keep that file mode 600 — it is a full-account credential, not a
+read-only API key.
+
+Soulseek needs an slskd API key in the same file, as `[soulseek] api_key` or
+`api_key_file` (or `SLSKD_API_KEY`), plus `files_user`/`files_password` if the
+files route is protected. Both are shown under "Acquisition backends" above. Put
+slskd behind TLS if it is reachable from the internet — an API key in a header
+over plain HTTP is a credential in the clear, and it never expires.
+
+Rekordbox has no watch-folder feature, so by default importing a downloaded file
+is a manual drag of the download directory. That costs one drag per batch, not per
+file — or turn on row insertion below and skip it.
+
+## Creating rekordbox rows directly
+
+`rekord-ripper import` writes the `djmdContent` row itself, so a downloaded file
+appears in your collection without the drag. With `--src-track-id` it also runs
+the fingerprint-gated transfer in the same command:
+
+```bash
+rekord-ripper import "new.flac"                            # dry-run: shows every value
+rekord-ripper import "new.flac" --src-track-id 12345678 --apply
+rekord-ripper import --undo 3052064790 --apply             # changed your mind
+```
+
+It reads the file's embedded tags and reuses existing artist/album/genre rows
+rather than duplicating them. Three gates stand in front of it: the config key
+`insert_content_rows` (off by default), `--apply`, and a confirmation showing the
+full row — plus the same running-rekordbox refusal and automatic backup as `cp`.
+
+Undo is a tombstone (`rb_local_deleted = 1` with a USN bump), not a delete,
+because on a cloud-synced library a hard delete would leave your other devices
+holding a row for a file they don't have. Every insert also writes an
+`<backup>.inserted.json` note next to the backup so it can be undone later.
+
+Worth knowing: this is not as exotic as it sounds. `cp` already inserts rows into
+five tables and clears `rb_local_synced`, so it has always written rows your cloud
+agent pushes. The genuinely new part is that a *track* row points at a file, so
+under Cloud Library Sync rekordbox may upload that audio and rewrite `FolderPath`.
+
+`REKORDBOX_DIR` overrides the rekordbox directory, which is how the write paths
+are tested against a copy of `master.db` rather than the real thing.

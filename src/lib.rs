@@ -1,5 +1,14 @@
+pub mod acquire;
 pub mod analysis;
+pub mod audio;
+pub mod config;
 pub mod db;
 pub mod dump;
+pub mod fingerprint;
 pub(crate) mod format;
+pub mod import;
+pub mod paths;
+pub mod pending;
+pub(crate) mod proc;
+pub mod transfer;
 pub mod tui;
