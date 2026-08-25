@@ -7,7 +7,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use crate::format::{file_type_name, format_bpm, format_length};
 
 use super::app::{App, Focus, InputMode, Screen, ShopFocus, ShopTrackState, StatusLevel};
-use super::data::TrackRow;
+use crate::library::TrackRow;
 use super::diff::render_pair;
 
 /// Takes `&mut App` for one reason: the help popup's scroll offset can only be

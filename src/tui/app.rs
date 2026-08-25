@@ -4,7 +4,9 @@ use std::time::Instant;
 use crate::analysis::{CopyOpts, Plan};
 use crate::db::{MasterDb, SafetyOpts, rekordbox_running};
 
-use super::data::{TrackRow, dst_visible, load_rows, src_visible};
+use crate::library::{TrackRow, load_rows};
+
+use super::data::{dst_visible, src_visible};
 
 pub const DURATION_TOL_SECS: i64 = 1;
 

@@ -7,6 +7,7 @@ pub mod dump;
 pub mod fingerprint;
 pub(crate) mod format;
 pub mod import;
+pub mod library;
 pub mod paths;
 pub mod pending;
 pub mod playlists;

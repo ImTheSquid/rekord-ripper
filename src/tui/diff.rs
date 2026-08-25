@@ -1,7 +1,7 @@
 use crate::analysis::CopyOpts;
 use crate::format::{file_type_name, format_bpm, format_length};
 
-use super::data::TrackRow;
+use crate::library::TrackRow;
 
 /// Compact two-or-three-line summary of the (src, dst) pair for the preview
 /// pane. Returns a vec of lines. No ratatui types here — keep this testable.
@@ -55,7 +55,7 @@ mod tests {
     use super::*;
 
     fn fixture(bpm: Option<i64>, length: Option<i64>, cue_count: i64, locked: bool) -> TrackRow {
-        use crate::tui::data::TrackRow;
+        use crate::library::TrackRow;
         TrackRow {
             id: "id".into(),
             title: "T".into(),

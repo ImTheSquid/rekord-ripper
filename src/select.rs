@@ -1,15 +1,10 @@
 //! Pick tracks out of the library with the filter language.
-//!
-//! Reuses the TUI's row loader rather than issuing a third variant of the
-//! library query: it is the one place that already assembles titles, playlist
-//! membership and keywords into what `query` matches against, so a CLI
-//! selection and a `/` box answer identically by construction.
 
 use anyhow::{Result, bail};
 
 use crate::db::MasterDb;
+use crate::library::load_rows;
 use crate::query::Query;
-use crate::tui::data::load_rows;
 
 /// One matched track, with the little the callers need.
 pub struct Hit {
