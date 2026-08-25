@@ -249,7 +249,9 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         Screen::Shop => {
             "tab pane  / filter  s search  space basket  S search basket  r re-search  enter download  o buy page  y ref  p queue  esc back"
         }
-        Screen::Pending => "↑↓ move  R refresh  ? help  esc back",
+        Screen::Pending => {
+            "↑↓ move  i import  a apply  r retry  c forget  R refresh  ? help  esc back"
+        }
     };
     f.render_widget(
         Paragraph::new(hints).style(Style::new().fg(Color::DarkGray)),
@@ -1359,12 +1361,26 @@ SHOP SCREEN — find and download better copies
 
 PENDING SCREEN — downloads that have not become transfers yet
   ↑ ↓ / k j        Move cursor
+  i                Create the rekordbox rows for downloads that have none,
+                   after showing you every value it would write. Needs
+                   insert_content_rows = true under [import] in your config
+  a                Fingerprint what has a row, then apply what passes. One
+                   at a time: a check against a streaming source downloads
+                   it first, so a queue of them takes minutes
+  r                Put the highlighted entry back in the queue — a rejection
+                   is meant to be retryable after re-encoding or after
+                   loosening score_max
+  c                Forget the highlighted entry (a hard delete, no undo)
   R                Re-read the queue, retiring anything stale
   Esc / q          Back to the transfer screen
 
   A download queued by 'f' on the shop screen lands here. Each row shows
   where it has got to: awaiting import until rekordbox (or this tool) has
   a row for the file, then the fingerprint verdict, then applied.
+
+  Nothing here bypasses a gate: the fingerprint still has to agree the two
+  files are the same recording and time-aligned, master.db is still backed
+  up first, and it still refuses to write while rekordbox is running.
 
 ?                  This help. ↑ ↓ / k j / PgUp / PgDn / g / G scroll it,
                    Esc or q closes it

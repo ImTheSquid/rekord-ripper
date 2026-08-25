@@ -138,12 +138,24 @@ impl QueueState {
         self.generation
     }
 
+    pub fn current_generation(&self) -> u64 {
+        self.generation
+    }
+
     pub fn set_work(&mut self, id: i64, work: EntryWork) {
         self.work.insert(id, work);
     }
 
     pub fn clear_work(&mut self, id: i64) {
         self.work.remove(&id);
+    }
+
+    /// Take the work out, so the caller owns what it carries.
+    ///
+    /// `Plan` is not `Clone`, so applying it means owning it — and taking it
+    /// also clears the entry, which is the right thing on success.
+    pub fn take_work(&mut self, id: i64) -> Option<EntryWork> {
+        self.work.remove(&id)
     }
 
     /// Accept an arriving result only if it is for a live entry and the round

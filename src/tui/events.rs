@@ -61,6 +61,9 @@ fn handle_pending(app: &mut App, key: KeyEvent) {
         (KeyCode::Char('G'), _) => app.queue.jump_bottom(),
         (KeyCode::Char('R'), _) => app.reload_queue(),
         (KeyCode::Char('i'), _) => app.start_import(),
+        (KeyCode::Char('a'), _) => app.start_apply(),
+        (KeyCode::Char('r'), _) => app.retry_selected(),
+        (KeyCode::Char('c'), _) => app.forget_selected(),
         _ => {}
     }
 }
