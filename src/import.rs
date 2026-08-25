@@ -504,13 +504,13 @@ pub fn tombstone(db: &mut MasterDb, content_id: &str, expect_uuid: Option<&str>)
         bail!("track {content_id} is not in the database");
     };
     // Guard against a recycled ID pointing at somebody else's track by now.
-    if let Some(expected) = expect_uuid {
-        if uuid != expected {
-            bail!(
-                "track {content_id} is no longer the row that was inserted \
-                 (uuid {uuid} != {expected}) — refusing to touch it"
-            );
-        }
+    if let Some(expected) = expect_uuid
+        && uuid != expected
+    {
+        bail!(
+            "track {content_id} is no longer the row that was inserted \
+             (uuid {uuid} != {expected}) — refusing to touch it"
+        );
     }
     if deleted == Some(1) {
         return Ok(());

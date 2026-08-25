@@ -157,13 +157,12 @@ pub fn build_plan(db: &MasterDb, src_id: &str, dst_id: &str, opts: &CopyOpts) ->
     let src = load_snapshot(db, src_id).map_err(|e| anyhow!("source {src_id}: {e}"))?;
     let dst = load_snapshot(db, dst_id).map_err(|e| anyhow!("destination {dst_id}: {e}"))?;
 
-    let src_has_analysis_path = src
+    let src_has_analysis_path = !src
         .header
         .analysis_data_path
         .as_deref()
         .unwrap_or("")
-        .is_empty()
-        == false;
+        .is_empty();
     if src.cue_count == 0 && !src_has_analysis_path {
         bail!(
             "source {src_id} ({}) has no analysis to copy",
@@ -963,10 +962,10 @@ pub fn find_auto_matches(db: &MasterDb, filter: AutoFilter) -> Result<Vec<AutoMa
             dst_artist: dst.artist.clone(),
         });
 
-        if let Some(lim) = filter.limit {
-            if matches.len() >= lim as usize {
-                break;
-            }
+        if let Some(lim) = filter.limit
+            && matches.len() >= lim as usize
+        {
+            break;
         }
     }
     Ok(matches)
@@ -1086,6 +1085,10 @@ fn now_iso_string() -> String {
         .to_string()
 }
 
+// Suppress unused import warning when not building the bin
+#[allow(dead_code)]
+fn _path_marker(_: &Path) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1151,7 +1154,3 @@ mod tests {
         assert!(!artist_matches(Some("GRRL"), None));
     }
 }
-
-// Suppress unused import warning when not building the bin
-#[allow(dead_code)]
-fn _path_marker(_: &Path) {}

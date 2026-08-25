@@ -9,6 +9,9 @@ use crate::analysis::artist_matches;
 use crate::library::TrackRow;
 use crate::query::Query;
 
+#[cfg(test)]
+use crate::library::RowInput;
+
 /// Filter composition for the destination column. AND of four predicates:
 /// typed search, auto-mode, fuzzy-match-from-source, and "not the current src"
 /// (you can't copy a track onto itself, so it never belongs in the dst list).
@@ -69,34 +72,35 @@ pub fn fuzzy_match(src: &TrackRow, dst: &TrackRow, tol_secs: i64) -> bool {
 mod tests {
     use super::*;
 
-    fn row(
-        id: &str,
-        title: &str,
-        artist: &str,
-        bpm: i64,
-        length: i64,
-        cue_count: i64,
-        file_type: i64,
-        locked: bool,
-    ) -> TrackRow {
-        TrackRow::from_db(
-            id.to_string(),
-            Some(title.to_string()),
-            Some(artist.to_string()),
-            Some(bpm),
-            Some(length),
-            Some(if locked { 233 } else { 105 }),
-            Some(file_type),
-            cue_count,
-        )
+    /// An ordinary track: unlocked, cueless, an audio file, 120.00 BPM, 200s.
+    /// Tests override only the fields whose rule they are exercising.
+    fn input(id: &str, title: &str, artist: &str) -> RowInput {
+        RowInput {
+            id: id.to_string(),
+            title: Some(title.to_string()),
+            artist: Some(artist.to_string()),
+            bpm: Some(12000),
+            length: Some(200),
+            analysed: Some(UNLOCKED),
+            file_type: Some(AUDIO),
+            cue_count: 0,
+        }
     }
+
+    fn row(id: &str, title: &str, artist: &str) -> TrackRow {
+        TrackRow::from_db(input(id, title, artist))
+    }
+
+    /// `Analysed` with bit 7 set, and without.
+    const LOCKED: i64 = 233;
+    const UNLOCKED: i64 = 105;
+    /// A FLAC, and rekordbox's "this is a stream" file type.
+    const AUDIO: i64 = 5;
+    const STREAM: i64 = 19;
 
     #[test]
     fn substring_search_is_case_insensitive_on_title_and_artist() {
-        let rows = vec![
-            row("1", "Apple", "Banana", 12000, 200, 0, 5, false),
-            row("2", "Orange", "Tangerine", 12000, 200, 0, 5, false),
-        ];
+        let rows = vec![row("1", "Apple", "Banana"), row("2", "Orange", "Tangerine")];
         assert_eq!(src_visible(&rows, "apple"), vec![0]);
         assert_eq!(src_visible(&rows, "BANANA"), vec![0]);
         assert_eq!(src_visible(&rows, "tang"), vec![1]);
@@ -107,10 +111,9 @@ mod tests {
     #[test]
     fn playlist_terms_filter_both_columns() {
         let rows = vec![
-            row("1", "Apple", "Banana", 12000, 200, 0, 5, false)
-                .with_playlists(&["Jack Night/JN4"]),
-            row("2", "Apple", "Cherry", 12000, 200, 0, 5, false).with_playlists(&["Archive"]),
-            row("3", "Orange", "Banana", 12000, 200, 0, 5, false),
+            row("1", "Apple", "Banana").with_playlists(&["Jack Night/JN4"]),
+            row("2", "Apple", "Cherry").with_playlists(&["Archive"]),
+            row("3", "Orange", "Banana"),
         ];
         assert_eq!(src_visible(&rows, "p:jn4"), vec![0]);
         assert_eq!(src_visible(&rows, "p:\"jack night\" apple"), vec![0]);
@@ -125,15 +128,14 @@ mod tests {
     #[test]
     fn keyword_terms_filter_the_columns_too() {
         let rows = vec![
-            row("1", "Apple", "Banana", 12000, 200, 0, 5, false)
+            row("1", "Apple", "Banana")
                 .with_playlists(&["Jack Night/JN4"])
                 .with_tags(&["local", "present", "flac", "lossless"]),
-            row("2", "Apple", "Cherry", 12000, 200, 0, 19, false)
+            row("2", "Apple", "Cherry")
                 .with_playlists(&["Jack Night/JN4"])
                 .with_tags(&["stream"]),
-            row("3", "Orange", "Banana", 12000, 200, 0, 5, false).with_tags(&["cloud", "flac"]),
-            row("4", "Pear", "Damson", 12000, 200, 0, 5, false)
-                .with_tags(&["local", "missing", "flac"]),
+            row("3", "Orange", "Banana").with_tags(&["cloud", "flac"]),
+            row("4", "Pear", "Damson").with_tags(&["local", "missing", "flac"]),
         ];
         assert_eq!(src_visible(&rows, "p:jn4 is:stream"), vec![1]);
         assert_eq!(src_visible(&rows, "-is:stream"), vec![0, 2, 3]);
@@ -152,10 +154,19 @@ mod tests {
     #[test]
     fn dst_auto_mode_filters_to_unlocked_cueless_audio() {
         let rows = vec![
-            row("1", "Track", "A", 12000, 200, 0, 5, false), // eligible
-            row("2", "Track", "B", 12000, 200, 3, 5, false), // has cues
-            row("3", "Track", "C", 12000, 200, 0, 5, true),  // locked
-            row("4", "Track", "D", 12000, 200, 0, 19, false), // streaming
+            row("1", "Track", "A"), // eligible
+            TrackRow::from_db(RowInput {
+                cue_count: 3,
+                ..input("2", "Track", "B")
+            }),
+            TrackRow::from_db(RowInput {
+                analysed: Some(LOCKED),
+                ..input("3", "Track", "C")
+            }),
+            TrackRow::from_db(RowInput {
+                file_type: Some(STREAM),
+                ..input("4", "Track", "D")
+            }),
         ];
         assert_eq!(dst_visible(&rows, "", true, None, false, 1), vec![0]);
         assert_eq!(
@@ -166,21 +177,27 @@ mod tests {
 
     #[test]
     fn fuzzy_from_src_narrows_to_normalized_title_and_length() {
-        let src = row("1", "Ritual Pharmacy", "porf0d", 14600, 221, 4, 19, false);
+        // Only length is compared, so the BPMs differ on purpose: a fuzzy match
+        // must not depend on them.
+        let at = |id, title, artist, length| RowInput {
+            length: Some(length),
+            ..input(id, title, artist)
+        };
+        let src = TrackRow::from_db(RowInput {
+            bpm: Some(14600),
+            cue_count: 4,
+            file_type: Some(STREAM),
+            ..at("1", "Ritual Pharmacy", "porf0d", 221)
+        });
         let rows = vec![
-            row(
-                "2",
-                "Ritual Pharmacy (Edit)",
-                "porf0d",
-                15000,
-                221,
-                0,
-                5,
-                false,
-            ), // matches: parens stripped
-            row("3", "Other Song", "porf0d", 14600, 221, 0, 5, false), // wrong title
-            row("4", "Ritual Pharmacy", "Different", 14600, 221, 0, 5, false), // wrong artist
-            row("5", "Ritual Pharmacy", "porf0d", 14600, 230, 0, 5, false), // length too far
+            // Matches: the parenthetical is stripped from the title.
+            TrackRow::from_db(RowInput {
+                bpm: Some(15000),
+                ..at("2", "Ritual Pharmacy (Edit)", "porf0d", 221)
+            }),
+            TrackRow::from_db(at("3", "Other Song", "porf0d", 221)), // wrong title
+            TrackRow::from_db(at("4", "Ritual Pharmacy", "Different", 221)), // wrong artist
+            TrackRow::from_db(at("5", "Ritual Pharmacy", "porf0d", 230)), // length too far
         ];
         let vis = dst_visible(&rows, "", false, Some(&src), true, 1);
         assert_eq!(vis, vec![0]); // only row index 0 (id=2) matches
@@ -188,10 +205,10 @@ mod tests {
 
     #[test]
     fn src_is_excluded_from_dst_even_when_fuzzy_off() {
-        let src = row("1", "Same", "A", 12000, 200, 0, 5, false);
+        let src = row("1", "Same", "A");
         let rows = vec![
-            row("1", "Same", "A", 12000, 200, 0, 5, false), // the src itself
-            row("2", "Other", "A", 12000, 200, 0, 5, false),
+            row("1", "Same", "A"), // the src itself
+            row("2", "Other", "A"),
         ];
         let vis = dst_visible(&rows, "", false, Some(&src), false, 1);
         assert_eq!(vis, vec![1]);
@@ -199,13 +216,23 @@ mod tests {
 
     #[test]
     fn filters_compose_as_and() {
-        let src = row("1", "Foo", "Bar", 12000, 200, 4, 19, false);
+        let src = TrackRow::from_db(RowInput {
+            cue_count: 4,
+            file_type: Some(STREAM),
+            ..input("1", "Foo", "Bar")
+        });
         let rows = vec![
-            row("2", "Foo", "Bar", 12000, 200, 0, 5, false), // matches all
-            row("3", "Foo", "Bar", 12000, 200, 3, 5, false), // fails auto
-            row("4", "Foo", "Bar", 12000, 200, 0, 5, true),  // fails auto (locked)
-            row("5", "Baz", "Bar", 12000, 200, 0, 5, false), // fails fuzzy
-            row("6", "Foo", "Bar", 12000, 200, 0, 5, false), // matches; will fail text
+            row("2", "Foo", "Bar"), // matches all
+            TrackRow::from_db(RowInput {
+                cue_count: 3,
+                ..input("3", "Foo", "Bar")
+            }), // fails auto
+            TrackRow::from_db(RowInput {
+                analysed: Some(LOCKED),
+                ..input("4", "Foo", "Bar")
+            }), // fails auto (locked)
+            row("5", "Baz", "Bar"), // fails fuzzy and text
+            row("6", "Foo", "Bar"), // matches all
         ];
         // Text filter: just "Foo".
         let vis = dst_visible(&rows, "foo", true, Some(&src), true, 1);

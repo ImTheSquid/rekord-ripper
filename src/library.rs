@@ -40,19 +40,38 @@ pub struct TrackRow {
 
 const AUDIO_FILE_TYPES: &[i64] = &[0, 1, 4, 5, 11];
 
+/// The `djmdContent` columns a row is built from.
+///
+/// A struct rather than eight positional arguments: at the call site those were
+/// eight `r.get(…)` calls in a row, where transposing `bpm` and `length` would
+/// have compiled and been wrong. Naming them also lets a test fixture set the
+/// two fields it cares about and default the rest.
+#[derive(Default)]
+pub(crate) struct RowInput {
+    pub id: String,
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub bpm: Option<i64>,
+    pub length: Option<i64>,
+    pub analysed: Option<i64>,
+    pub file_type: Option<i64>,
+    pub cue_count: i64,
+}
+
 impl TrackRow {
     /// `pub(crate)` for the sake of test fixtures in the modules that filter
     /// these rows; `load_rows` is the only caller that matters.
-    pub(crate) fn from_db(
-        id: String,
-        title: Option<String>,
-        artist: Option<String>,
-        bpm: Option<i64>,
-        length: Option<i64>,
-        analysed: Option<i64>,
-        file_type: Option<i64>,
-        cue_count: i64,
-    ) -> Self {
+    pub(crate) fn from_db(input: RowInput) -> Self {
+        let RowInput {
+            id,
+            title,
+            artist,
+            bpm,
+            length,
+            analysed,
+            file_type,
+            cue_count,
+        } = input;
         let title = title.unwrap_or_default();
         let artist = artist.unwrap_or_default();
         let norm_title = normalize_title(&title);
@@ -96,16 +115,11 @@ impl TrackRow {
     /// which rows a rule picks.
     #[cfg(test)]
     pub(crate) fn stub(id: &str, title: &str) -> Self {
-        Self::from_db(
-            id.to_string(),
-            Some(title.to_string()),
-            None,
-            None,
-            None,
-            None,
-            None,
-            0,
-        )
+        Self::from_db(RowInput {
+            id: id.to_string(),
+            title: Some(title.to_string()),
+            ..Default::default()
+        })
     }
 
     #[cfg(test)]
@@ -136,16 +150,16 @@ pub fn load_rows(db: &MasterDb) -> Result<Vec<TrackRow>> {
 
     let mut stmt = db.conn.prepare(sql)?;
     let rows = stmt.query_map([], |r: &Row<'_>| {
-        let mut row = TrackRow::from_db(
-            r.get("ID")?,
-            r.get("Title")?,
-            r.get("Artist")?,
-            r.get("BPM")?,
-            r.get("Length")?,
-            r.get("Analysed")?,
-            r.get("FileType")?,
-            r.get("cue_count")?,
-        );
+        let mut row = TrackRow::from_db(RowInput {
+            id: r.get("ID")?,
+            title: r.get("Title")?,
+            artist: r.get("Artist")?,
+            bpm: r.get("BPM")?,
+            length: r.get("Length")?,
+            analysed: r.get("Analysed")?,
+            file_type: r.get("FileType")?,
+            cue_count: r.get("cue_count")?,
+        });
         let path = r.get::<_, Option<String>>("FolderPath")?;
         let path = path.as_deref();
         let origin = crate::format::origin(row.file_type, path, r.get("ServiceID")?);

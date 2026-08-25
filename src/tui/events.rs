@@ -271,12 +271,11 @@ fn build_pending(app: &mut App) {
 
     // Destinations: explicit multi-selection, or cursor row if selection empty.
     let mut dst_ids: Vec<String> = app.dst.selected.iter().cloned().collect();
-    if dst_ids.is_empty() {
-        if let Some(r) = app.current_dst() {
-            if r.id != src_id {
-                dst_ids.push(r.id.clone());
-            }
-        }
+    if dst_ids.is_empty()
+        && let Some(r) = app.current_dst()
+        && r.id != src_id
+    {
+        dst_ids.push(r.id.clone());
     }
     if dst_ids.is_empty() {
         app.status.err("no destinations selected");

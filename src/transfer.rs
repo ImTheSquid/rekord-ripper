@@ -213,9 +213,13 @@ pub enum Processed {
     Rejected(String),
     /// A plan is ready. Held rather than applied so the caller can honour
     /// `--apply` and the running-rekordbox refuse.
+    ///
+    /// The plan is boxed because it is a kilobyte next to the 24 bytes of the
+    /// other variants, and every `Processed` — most of them `NotImported` —
+    /// would otherwise be sized for it.
     Ready {
         dst_content_id: String,
-        plan: analysis::Plan,
+        plan: Box<analysis::Plan>,
         verdict: Verdict,
     },
 }
@@ -261,7 +265,7 @@ pub fn process(
 
     Ok(Processed::Ready {
         dst_content_id: dst_id,
-        plan,
+        plan: Box::new(plan),
         verdict: outcome.verdict,
     })
 }

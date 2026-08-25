@@ -819,7 +819,7 @@ mod tests {
 
     #[test]
     fn cost_class_ordering_puts_owned_first_and_unavailable_last() {
-        let mut v = vec![
+        let mut v = [
             CostClass::Unavailable,
             CostClass::Paid,
             CostClass::AlreadyOwned,
