@@ -63,6 +63,22 @@ impl TrackRow {
             search_blob,
         }
     }
+
+    /// A row with just an identity and a title, for tests that only care about
+    /// which rows a rule picks.
+    #[cfg(test)]
+    pub(crate) fn stub(id: &str, title: &str) -> Self {
+        Self::from_db(
+            id.to_string(),
+            Some(title.to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            0,
+        )
+    }
 }
 
 /// Re-issue the full track-list query. ~3600 rows, sub-100ms.

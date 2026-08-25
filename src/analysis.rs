@@ -54,6 +54,34 @@ pub struct TrackHeader {
     pub analysis_data_path: Option<String>,
     pub file_type: Option<i64>,
     pub cue_count: i64,
+    /// The audio file's path. For a cloud-synced row this is rewritten to a
+    /// `/contents_<dbid>/…` form, with the original kept in `org_folder_path` —
+    /// so both have to be consulted when matching a path to a row.
+    pub folder_path: Option<String>,
+    pub org_folder_path: Option<String>,
+}
+
+impl TrackHeader {
+    /// The first path that looks like a real local file.
+    ///
+    /// A streaming row holds a service URI here instead (`soundcloud:tracks:…`),
+    /// which is not a path, so this returns `None` for those.
+    pub fn local_path(&self) -> Option<&str> {
+        [
+            self.folder_path.as_deref(),
+            self.org_folder_path.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|p| p.starts_with('/') || p.contains(":\\") || p.contains(":/"))
+    }
+
+    /// The service URI of a streaming row, e.g. `soundcloud:tracks:123`.
+    pub fn streaming_uri(&self) -> Option<&str> {
+        self.folder_path
+            .as_deref()
+            .filter(|p| !p.starts_with('/') && p.contains(':') && !p.contains('\\'))
+    }
 }
 
 pub struct FileCopy {
@@ -264,6 +292,16 @@ pub fn build_plan(db: &MasterDb, src_id: &str, dst_id: &str, opts: &CopyOpts) ->
     })
 }
 
+/// Load one track's header by `djmdContent.ID`.
+///
+/// The public single-track read the acquisition path needs to turn a local track
+/// into a search query.
+pub fn load_track(db: &MasterDb, id: &str) -> Result<TrackHeader> {
+    load_snapshot(db, id)
+        .map(|s| s.header)
+        .map_err(|e| anyhow!("track {id}: {e}"))
+}
+
 fn load_snapshot(db: &MasterDb, id: &str) -> Result<TrackSnapshot> {
     let cue_count: i64 = db.conn.query_row(
         "SELECT COUNT(*) FROM djmdCue WHERE ContentID = ?1 AND (rb_local_deleted = 0 OR rb_local_deleted IS NULL)",
@@ -275,7 +313,8 @@ fn load_snapshot(db: &MasterDb, id: &str) -> Result<TrackSnapshot> {
         .conn
         .query_row(
             "SELECT c.ID, c.UUID, c.Title, c.BPM, c.Length, c.Analysed,
-                    c.AnalysisDataPath, c.FileType, a.Name AS Artist
+                    c.AnalysisDataPath, c.FileType, c.FolderPath, c.OrgFolderPath,
+                    a.Name AS Artist
              FROM djmdContent c
              LEFT JOIN djmdArtist a ON a.ID = c.ArtistID
              WHERE c.ID = ?1",
@@ -292,6 +331,8 @@ fn load_snapshot(db: &MasterDb, id: &str) -> Result<TrackSnapshot> {
                     analysis_data_path: r.get("AnalysisDataPath")?,
                     file_type: r.get("FileType")?,
                     cue_count,
+                    folder_path: r.get("FolderPath")?,
+                    org_folder_path: r.get("OrgFolderPath")?,
                 })
             },
         )
@@ -1033,7 +1074,7 @@ pub fn derive_anlz_path(uuid: &str) -> String {
     format!("/PIONEER/USBANLZ/{prefix}/{rest}/ANLZ0000.DAT")
 }
 
-fn random_numeric_id() -> String {
+pub(crate) fn random_numeric_id() -> String {
     // djmdCue.ID is a uint32 stored as a decimal string. Use a v4 UUID's first
     // 4 bytes for randomness — adequate; collision rate vs the existing 1816
     // cue IDs is on the order of 10^-6 per insertion.
