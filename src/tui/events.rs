@@ -38,9 +38,34 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         InputMode::Search(focus) => handle_search(app, key, focus),
         InputMode::ShopSearch => handle_shop_search(app, key),
         InputMode::Confirm => handle_confirm(app, key),
-        InputMode::Help => {
+        InputMode::Help => handle_help(app, key),
+    }
+}
+
+/// The help popup is longer than most terminals, so it scrolls.
+///
+/// It used to close on any key at all. That cannot survive scrolling — `j` has
+/// to mean "down" — so closing is now the explicit keys, and the popup's title
+/// says which.
+fn handle_help(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('?') => {
             app.mode = InputMode::Normal;
+            // Reopening starts at the top rather than wherever you left off.
+            app.help_scroll = 0;
         }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.help_scroll = app.help_scroll.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.help_scroll = app.help_scroll.saturating_add(1);
+        }
+        KeyCode::PageUp => app.help_scroll = app.help_scroll.saturating_sub(10),
+        KeyCode::PageDown => app.help_scroll = app.help_scroll.saturating_add(10),
+        KeyCode::Home | KeyCode::Char('g') => app.help_scroll = 0,
+        // Render clamps this to the real last page.
+        KeyCode::End | KeyCode::Char('G') => app.help_scroll = u16::MAX,
+        _ => {}
     }
 }
 

@@ -69,6 +69,8 @@ mod tests {
             locked,
             is_unlocked_cueless_audio: !locked && cue_count == 0,
             search_blob: "t a".into(),
+            playlist_blob: String::new(),
+            tags: String::new(),
         }
     }
 

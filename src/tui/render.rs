@@ -10,14 +10,16 @@ use super::app::{App, Focus, InputMode, Screen, ShopFocus, ShopTrackState, Statu
 use super::data::TrackRow;
 use super::diff::render_pair;
 
-pub fn draw(f: &mut Frame, app: &App) {
+/// Takes `&mut App` for one reason: the help popup's scroll offset can only be
+/// clamped here, where the popup's final height is known.
+pub fn draw(f: &mut Frame, app: &mut App) {
     match app.screen {
         Screen::Transfer => draw_transfer(f, app),
         Screen::Shop => draw_shop_screen(f, app),
     }
     match app.mode {
         InputMode::Confirm => draw_confirm(f, app),
-        InputMode::Help => draw_help(f),
+        InputMode::Help => draw_help(f, app),
         _ => {}
     }
 }
@@ -105,7 +107,8 @@ fn draw_column(f: &mut Frame, area: Rect, app: &App, which: Focus) {
 
     let inner_layout = Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).split(inner);
 
-    // Search bar
+    // Search bar. The second line is spare, so an empty box advertises the
+    // playlist filter rather than leaving it to the help page.
     let search_active = matches!(app.mode, InputMode::Search(f0) if f0 == which);
     let search_caret = if search_active { "_" } else { "" };
     let search = format!(" / {}{}", state.query, search_caret);
@@ -114,7 +117,11 @@ fn draw_column(f: &mut Frame, area: Rect, app: &App, which: Focus) {
     } else {
         Style::new().dim()
     };
-    f.render_widget(Paragraph::new(search).style(style), inner_layout[0]);
+    let mut bar = vec![Line::styled(search, style)];
+    if search_active && state.query.is_empty() {
+        bar.push(Line::styled(SEARCH_HINT, Style::new().dim()));
+    }
+    f.render_widget(Paragraph::new(bar), inner_layout[0]);
 
     // List — two lines per row. The first line carries a green ✓ when the row
     // is the "apply target" for its column: for SOURCES that's the cursor row
@@ -1032,18 +1039,56 @@ fn clip_cell(s: &str, width: usize) -> String {
     }
 }
 
-fn draw_help(f: &mut Frame) {
+fn draw_help(f: &mut Frame, app: &mut App) {
     // Sized to the content rather than a percentage: at 70% of an 80-column
-    // terminal the later lines were being cut off entirely.
+    // terminal the later lines were being cut off entirely. Taller than the
+    // frame it still cannot be, which is what the scrolling is for.
     let area = content_popup(f.area(), HELP_BODY);
     f.render_widget(Clear, area);
+
+    let total = HELP_BODY.lines().count();
+    let viewport = area.height.saturating_sub(2) as usize; // borders
+    // The only place that knows how tall the popup ended up, so the clamp lives
+    // here and is written back. That is what lets `G` ask for u16::MAX and lets
+    // scrolling up respond on the first keypress rather than the hundredth.
+    let scroll = clamp_help_scroll(app.help_scroll as usize, viewport, total);
+    app.help_scroll = scroll as u16;
+
+    let title = if total <= viewport {
+        " HELP — esc closes ".to_string()
+    } else {
+        let last = (scroll + viewport).min(total);
+        format!(
+            " HELP {}–{last} of {total} — ↑↓ scroll, esc closes ",
+            scroll + 1
+        )
+    };
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::new().fg(Color::Cyan))
-        .title(" HELP ");
-    f.render_widget(Paragraph::new(HELP_BODY).block(block), area);
+        .title(title);
+    f.render_widget(
+        Paragraph::new(HELP_BODY)
+            .block(block)
+            .scroll((scroll as u16, 0)),
+        area,
+    );
 }
+
+/// First visible help line, clamped so the last page cannot be scrolled past.
+fn clamp_help_scroll(scroll: usize, viewport: usize, total: usize) -> usize {
+    scroll.min(total.saturating_sub(viewport))
+}
+
+/// Shown under an empty search box: one example of each operator, and the
+/// explaining left to `?`.
+const SEARCH_HINT: &str = " words \"…\" -not OR p: is: bpm: len:";
+
+/// The inner width of a column on an 80-column terminal: half the screen, less
+/// its two border cells. `SEARCH_HINT` has to fit inside it.
+#[cfg(test)]
+const NARROWEST_COLUMN: usize = 38;
 
 const HELP_BODY: &str = "\
 Two screens. Each one's selection means exactly one thing.
@@ -1054,6 +1099,24 @@ TRANSFER SCREEN — copy analysis from one track onto others
   PgUp / PgDn      Page
   g / G            Jump top / bottom
   /                Filter the focused column (Esc/Enter to leave, Ctrl-U clears)
+                   Searches like a web box: words are ANDed against title and
+                   artist, \"quoted words\" must be adjacent, -word excludes,
+                   OR alternates. p:name (or p:\"a name\") is a playlist or a
+                   folder of them. is:name is a keyword —
+                     local / cloud / stream   where the audio lives
+                     present / missing        whether the file is on this
+                                              machine (local rows only —
+                                              a cloud path cannot be checked)
+                     lossy / lossless         and mp3 m4a flac aiff wav
+                     cues / locked            what the track already has
+                   bpm: and len: take a number, a comparison or a span —
+                     bpm:128          128-something, so 128.02 counts
+                     bpm:>=128 bpm:<130   comparisons mean what you typed
+                     bpm:120-130      a span, inclusive at both ends
+                     len:3m len:>6m len:3m-6m len:4:30 len:210
+                   e.g. p:\"jn next\" is:stream — what to go shopping for
+                        is:local is:missing   — what moved or got deleted
+                        bpm:170-176 is:lossless — tracks for the fast half
   Space            Pick a DESTINATION. The source is always the highlighted
                    SOURCES row, so there is nothing to select on that side
   c                Clear the destination selection
@@ -1070,7 +1133,7 @@ TRANSFER SCREEN — copy analysis from one track onto others
 SHOP SCREEN — find and download better copies
   Tab              Switch focus between TRACKS and OFFERS
   ↑ ↓ / k j        Move cursor in the focused pane
-  /                Filter the track list (Ctrl-U clears)
+  /                Filter the track list, same syntax (Ctrl-U clears)
   s                Search for the highlighted track. Tap it on several and they
                    search one after another, results accumulating. On an
                    already-searched track it just shows what it found
@@ -1090,7 +1153,8 @@ SHOP SCREEN — find and download better copies
   … for still queued.
   's' and 'S' always act on the TRACKS list, whichever pane has focus.
 
-?                  This help
+?                  This help. ↑ ↓ / k j / PgUp / PgDn / g / G scroll it,
+                   Esc or q closes it
 q / Esc            Quit (from the transfer screen)
 ";
 
@@ -1277,6 +1341,15 @@ mod tests {
     }
 
     #[test]
+    fn the_search_hint_fits_the_column_it_sits_under() {
+        assert!(
+            SEARCH_HINT.chars().count() <= NARROWEST_COLUMN,
+            "hint is {} wide, column is {NARROWEST_COLUMN}",
+            SEARCH_HINT.chars().count()
+        );
+    }
+
+    #[test]
     fn wrapping_keeps_words_intact_and_loses_nothing() {
         let s = "Jane Remover - Music Baby Hurricane Edit";
         let lines = wrap(s, 16);
@@ -1313,11 +1386,14 @@ mod tests {
         // bottom and the right.
         let widest = HELP_BODY.lines().map(|l| l.chars().count()).max().unwrap();
         let rows = HELP_BODY.lines().count() as u16;
+        // Sized off the content, so the frame has to be bigger than the help
+        // rather than a fixed guess — the help grows as keys are added, and
+        // scrolling is what covers the terminals it outgrows.
         let big = Rect {
             x: 0,
             y: 0,
             width: 200,
-            height: 60,
+            height: rows + 10,
         };
         let r = content_popup(big, HELP_BODY);
         assert!(
@@ -1325,6 +1401,31 @@ mod tests {
             "help would be clipped horizontally"
         );
         assert!(r.height >= rows + 2, "help would be clipped vertically");
+    }
+
+    #[test]
+    fn help_scroll_stops_at_the_last_page() {
+        // 56 lines in a 20-line viewport: the last useful offset is 36, which
+        // still fills the viewport rather than leaving it half blank.
+        assert_eq!(clamp_help_scroll(0, 20, 56), 0);
+        assert_eq!(clamp_help_scroll(36, 20, 56), 36);
+        assert_eq!(clamp_help_scroll(999, 20, 56), 36);
+        // `G` asks for the maximum and lets this decide what that means.
+        assert_eq!(clamp_help_scroll(u16::MAX as usize, 20, 56), 36);
+        // Content that fits never scrolls at all.
+        assert_eq!(clamp_help_scroll(999, 60, 56), 0);
+        // A viewport of zero (a frame with no room) must not panic or wrap.
+        assert_eq!(clamp_help_scroll(999, 0, 56), 56);
+    }
+
+    #[test]
+    fn the_help_scrolls_far_enough_to_reach_its_last_line() {
+        // The regression this guards: the shop keys and the query reference sit
+        // at the bottom, and were simply unreachable on a short terminal.
+        let short = 24usize.saturating_sub(2);
+        let total = HELP_BODY.lines().count();
+        let last_offset = clamp_help_scroll(usize::MAX, short, total);
+        assert_eq!(last_offset + short, total, "bottom line must be reachable");
     }
 
     #[test]
