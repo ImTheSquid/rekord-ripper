@@ -25,15 +25,21 @@ use serde::{Deserialize, Serialize};
 pub enum BackendId {
     Bandcamp,
     SoundCloud,
+    Soulseek,
 }
 
 impl BackendId {
-    pub const ALL: &'static [BackendId] = &[BackendId::Bandcamp, BackendId::SoundCloud];
+    pub const ALL: &'static [BackendId] = &[
+        BackendId::Bandcamp,
+        BackendId::SoundCloud,
+        BackendId::Soulseek,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Bandcamp => "bandcamp",
             Self::SoundCloud => "soundcloud",
+            Self::Soulseek => "soulseek",
         }
     }
 
@@ -43,6 +49,7 @@ impl BackendId {
         match self {
             Self::Bandcamp => 0,
             Self::SoundCloud => 1,
+            Self::Soulseek => 2,
         }
     }
 }
@@ -59,7 +66,8 @@ impl FromStr for BackendId {
         match s.trim().to_ascii_lowercase().as_str() {
             "bandcamp" | "bc" => Ok(Self::Bandcamp),
             "soundcloud" | "sc" => Ok(Self::SoundCloud),
-            other => bail!("unknown backend '{other}' (known: bandcamp, soundcloud)"),
+            "soulseek" | "slsk" | "sl" => Ok(Self::Soulseek),
+            other => bail!("unknown backend '{other}' (known: bandcamp, soundcloud, soulseek)"),
         }
     }
 }

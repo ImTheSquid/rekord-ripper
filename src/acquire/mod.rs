@@ -12,6 +12,7 @@ pub mod pick;
 pub mod render;
 pub mod report;
 pub mod shop;
+pub mod soulseek;
 pub mod soundcloud;
 pub mod types;
 
@@ -45,6 +46,13 @@ impl Registry {
             backends.push(Box::new(soundcloud::SoundCloud::new(
                 &cfg.soundcloud.yt_dlp_path,
                 cfg.soundcloud.extra_args.clone(),
+                budget,
+            )));
+        }
+        if cfg.soulseek.enabled {
+            backends.push(Box::new(soulseek::Soulseek::new(
+                &cfg.soulseek,
+                creds,
                 budget,
             )));
         }
@@ -111,17 +119,36 @@ mod tests {
     fn default_config_registers_the_enabled_backends() {
         let reg = Registry::from_config(&Config::default(), &Credentials::default());
         assert!(!reg.is_empty());
-        assert!(reg.get(BackendId::Bandcamp).is_some());
+        for id in BackendId::ALL {
+            assert!(reg.get(*id).is_some(), "{id} should be enabled by default");
+        }
         // Search must be available before anything is configured.
         assert!(reg.searchable().any(|b| b.id() == BackendId::Bandcamp));
+        assert!(reg.searchable().any(|b| b.id() == BackendId::Soulseek));
     }
 
     #[test]
     fn a_disabled_backend_is_absent_entirely() {
         let mut cfg = Config::default();
         cfg.bandcamp.enabled = false;
+        cfg.soulseek.enabled = false;
         let reg = Registry::from_config(&cfg, &Credentials::default());
         assert!(reg.get(BackendId::Bandcamp).is_none());
+        assert!(reg.get(BackendId::Soulseek).is_none());
+        assert!(reg.get(BackendId::SoundCloud).is_some());
+    }
+
+    #[test]
+    fn backends_claim_only_their_own_urls() {
+        let reg = Registry::from_config(&Config::default(), &Credentials::default());
+        // First-match-wins across the registry, so each predicate has to be
+        // narrow enough not to steal another backend's URL.
+        let (b, _) = reg.claim_url(r"slsk://peer/@@a\b - c.flac").unwrap();
+        assert_eq!(b.id(), BackendId::Soulseek);
+        let (b, _) = reg
+            .claim_url("https://soundcloud.com/artist/track")
+            .unwrap();
+        assert_eq!(b.id(), BackendId::SoundCloud);
     }
 
     #[test]

@@ -980,8 +980,13 @@ fn run_config(path: &std::path::Path, init: bool, force: bool) -> Result<()> {
     std::fs::write(path, &body)?;
     println!("wrote {}", path.display());
     eprintln!(
-        "note: the Bandcamp identity cookie goes in {} (mode 600), not here.",
+        "note: secrets go in {} (mode 600), not here — the Bandcamp identity cookie \
+         and the slskd API key.",
         paths::credentials_path()?.display()
+    );
+    eprintln!(
+        "note: soulseek needs [soulseek] url pointing at an slskd instance; it is never \
+         started for you."
     );
     Ok(())
 }
