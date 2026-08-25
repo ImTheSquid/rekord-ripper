@@ -123,12 +123,22 @@ handle_path /files/* {
 }
 ```
 
+**The route has to serve the same directory slskd downloads into** — whatever
+`directories.downloads` is set to in `slskd.yml`. Getting those two out of step
+is the easy mistake, and it fails confusingly: slskd reports the download as
+succeeded because it *did* succeed, and the file route then 404s. rekord-ripper
+names both paths when that happens.
+
 Leave `files_url` empty when the download directory is reachable as a path — a
 local slskd, or a mounted share — and the file is moved rather than downloaded.
-Each fetch stages into `rekord-ripper/<id>/` under slskd's download directory and
-removes it again once the bytes are here and the size checks out; that cleanup
-needs slskd's `remote_file_management` enabled and is skipped quietly without it
-(`clean_up_remote = false` turns it off).
+
+Each fetch stages into `rekord-ripper/<id>/` under slskd's download directory.
+That staging directory is **left in place** by default, so if you have the
+download directory in slskd's `shares` the file keeps being shared — which is
+the norm on Soulseek, and the thing that gets your own searches answered. Set
+`clean_up_remote = true` to delete it instead (which also needs slskd's
+`remote_file_management` enabled; without it the delete is refused and skipped
+quietly).
 
 Two behaviours worth knowing:
 
