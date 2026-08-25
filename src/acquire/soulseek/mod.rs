@@ -673,7 +673,10 @@ impl super::AcquisitionBackend for Soulseek {
                 file_limit: self.search_limit.saturating_mul(20).max(query.limit),
                 filter_responses: true,
             },
-            self.search_window,
+            // Room for the idle window to expire plus a little slack, but never
+            // past the fan-out's own budget — a scoped thread cannot be
+            // abandoned, so overrunning here would hang the whole shop.
+            Instant::now() + (self.search_window + POLL_EVERY).min(self.budget),
         )?;
 
         // slskd keeps searches in its history for the web UI; ours are noise.
@@ -1422,12 +1425,15 @@ mod server_tests {
     }
 
     #[test]
-    fn a_search_posts_once_reads_the_responses_and_tidies_up() {
+    fn a_search_waits_for_completion_then_reads_the_responses_and_tidies_up() {
         let d = Fake::start(|method, path| match (method, path) {
             ("POST", "/api/v0/searches") => {
-                json_reply(200, json!({"id": "s", "state": "Completed"}))
+                json_reply(200, json!({"isComplete": false, "state": "InProgress"}))
             }
             (_, p) if p.ends_with("/responses") => json_reply(200, responses()),
+            ("GET", p) if p.starts_with("/api/v0/searches/") => {
+                json_reply(200, json!({"isComplete": true, "responseCount": 1}))
+            }
             _ => empty_reply(204),
         });
 
@@ -1444,12 +1450,58 @@ mod server_tests {
 
         let asked = d.asked();
         assert_eq!(asked[0], "POST /api/v0/searches");
-        assert!(asked[1].starts_with("GET /api/v0/searches/"));
+        // The state poll has to happen before the responses are read: the POST
+        // returns while the search is still InProgress with nothing in it.
+        let state = asked
+            .iter()
+            .position(|a| a.starts_with("GET /api/v0/searches/") && !a.ends_with("/responses"));
+        let read = asked.iter().position(|a| a.ends_with("/responses"));
+        assert!(state.is_some(), "must poll for completion: {asked:?}");
+        assert!(state < read, "must poll before reading results: {asked:?}");
         assert!(
             asked
                 .iter()
                 .any(|a| a.starts_with("DELETE /api/v0/searches/")),
             "our search should not be left in slskd's history: {asked:?}"
+        );
+    }
+
+    #[test]
+    fn a_search_still_in_progress_is_waited_out_rather_than_read_early() {
+        // The bug this guards, found against a real slskd: POST /searches returns
+        // immediately with `state: InProgress` and an empty response list, so
+        // reading results straight away returns nothing at all.
+        let polls = Arc::new(Mutex::new(0u32));
+        let d = Fake::start(move |method, path| {
+            if method == "POST" {
+                return json_reply(200, json!({"isComplete": false}));
+            }
+            if path.ends_with("/responses") {
+                return json_reply(200, responses());
+            }
+            if method == "GET" && path.starts_with("/api/v0/searches/") {
+                let mut n = polls.lock().unwrap();
+                *n += 1;
+                // Not settled until the third ask.
+                return json_reply(200, json!({"isComplete": *n >= 3}));
+            }
+            empty_reply(204)
+        });
+
+        let offers = d
+            .backend(|_| {})
+            .search(&SearchQuery::from_text("burial untrue", 10))
+            .unwrap();
+        assert_eq!(offers.len(), 1, "results are read once the search settles");
+
+        let state_polls = d
+            .asked()
+            .iter()
+            .filter(|a| a.starts_with("GET /api/v0/searches/") && !a.ends_with("/responses"))
+            .count();
+        assert!(
+            state_polls >= 3,
+            "should have polled until complete, got {state_polls}"
         );
     }
 
