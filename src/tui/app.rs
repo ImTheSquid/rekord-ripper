@@ -563,8 +563,29 @@ impl App {
                         self.fetch = FetchState::Failed(why);
                     }
                 },
+                // The queue screen consumes these; until it exists they only
+                // prove the work runs off the event thread.
+                super::worker::Update::Probed(r) => {
+                    let (entry_id, _generation, result) = *r;
+                    match result {
+                        Ok(info) => self.status.ok(format!(
+                            "#{entry_id}: read {}s of audio",
+                            info.length_secs()
+                        )),
+                        Err(why) => self.status.err(format!("#{entry_id}: {why}")),
+                    }
+                }
+                super::worker::Update::Fingerprinted(r) => {
+                    let (entry_id, _generation, result) = *r;
+                    match result {
+                        Ok(outcome) => self
+                            .status
+                            .ok(format!("#{entry_id}: {}", outcome.verdict.summary())),
+                        Err(why) => self.status.err(format!("#{entry_id}: {why}")),
+                    }
+                }
                 super::worker::Update::Failed(why) => {
-                    self.status.err(format!("search failed: {why}"));
+                    self.status.err(format!("worker failed: {why}"));
                     if matches!(self.fetch, FetchState::Running { .. }) {
                         self.fetch = FetchState::Failed(why);
                     } else {
@@ -901,8 +922,28 @@ impl App {
     }
 
     /// Searches submitted but not yet answered.
+    /// Searches outstanding — not every job. The shop screen's counter and the
+    /// quit guard both phrase themselves as "search(es)", so counting
+    /// fingerprints here would make them lie.
     pub fn shop_outstanding(&self) -> usize {
-        self.worker.as_ref().map(|w| w.outstanding()).unwrap_or(0)
+        self.outstanding_of(super::worker::JobKind::Search)
+    }
+
+    pub fn outstanding_of(&self, kind: super::worker::JobKind) -> usize {
+        self.worker
+            .as_ref()
+            .map(|w| w.outstanding_of(kind))
+            .unwrap_or(0)
+    }
+
+    /// Everything in flight, for the quit guard.
+    pub fn work_in_flight(&self) -> Vec<(super::worker::JobKind, usize)> {
+        use super::worker::JobKind::*;
+        [Search, Fetch, Probe, Fingerprint]
+            .into_iter()
+            .map(|k| (k, self.outstanding_of(k)))
+            .filter(|(_, n)| *n > 0)
+            .collect()
     }
 
     /// When the work currently in flight started, for the spinner.
@@ -963,8 +1004,11 @@ impl App {
             self.status.err("the worker thread is not running.");
             return false;
         };
-        if worker.is_busy() {
-            self.status.warn("something is already running.");
+        // Only a download conflicts with a download. A fingerprint can take
+        // minutes, and blocking on the shared counter made `f` a dead key with
+        // nothing on screen to explain why.
+        if worker.outstanding_of(super::worker::JobKind::Fetch) > 0 {
+            self.status.warn("a download is already running.");
             return false;
         }
         if !worker.submit(super::worker::Job::Fetch {

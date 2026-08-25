@@ -71,7 +71,9 @@ fn handle_help(app: &mut App, key: KeyEvent) {
 
 /// Return true if quitting now would discard work the user might want.
 fn has_pending_work(app: &App) -> bool {
-    !app.dst.selected.is_empty() || app.unresolved_errors || app.shop_outstanding() > 0
+    // Any kind of job, not just searches: quitting mid-fingerprint throws away
+    // minutes of decoding with nothing to show for it.
+    !app.dst.selected.is_empty() || app.unresolved_errors || !app.work_in_flight().is_empty()
 }
 
 fn try_quit(app: &mut App) {
@@ -90,11 +92,10 @@ fn try_quit(app: &mut App) {
     if app.unresolved_errors {
         bits.push("unresolved apply errors".into());
     }
-    if app.shop_outstanding() > 0 {
-        bits.push(format!(
-            "{} search(es) still running",
-            app.shop_outstanding()
-        ));
+    // Named per kind: a fingerprint reported as a search is a lie, and this is
+    // the one message standing between the user and losing minutes of work.
+    for (kind, n) in app.work_in_flight() {
+        bits.push(format!("{n} {}(s) still running", kind.label()));
     }
     app.status.warn(format!(
         "{}. Press 'q' again to confirm quit.",
