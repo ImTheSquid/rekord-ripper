@@ -169,9 +169,11 @@ rekord-ripper buy "burial untrue"
 rekord-ripper fetch --offer bandcamp:a:856850876 --src-track-id 12345678
 rekord-ripper fetch https://soundcloud.com/artist/track --src-track-id 12345678
 
-# Apply queued transfers once rekordbox has imported the files.
+# Apply queued transfers. --import creates the rekordbox rows too, so nothing
+# has to be dragged in first; the queue already knows each file's source track.
 rekord-ripper pending --list
-rekord-ripper pending --apply
+rekord-ripper pending --apply --import
+rekord-ripper pending --apply          # if you dragged them in yourself
 ```
 
 ### In the TUI
@@ -322,9 +324,10 @@ files route is protected. Both are shown under "Acquisition backends" above. Put
 slskd behind TLS if it is reachable from the internet — an API key in a header
 over plain HTTP is a credential in the clear, and it never expires.
 
-Rekordbox has no watch-folder feature, so by default importing a downloaded file
-is a manual drag of the download directory. That costs one drag per batch, not per
-file — or turn on row insertion below and skip it.
+Rekordbox has no watch-folder feature, so out of the box importing a downloaded
+file is a manual drag of the download directory — one drag per batch, not per
+file. Turning on row insertion below removes even that: `pending --apply --import`
+creates the rows itself and then runs the transfers.
 
 ## Creating rekordbox rows directly
 
@@ -333,6 +336,7 @@ appears in your collection without the drag. With `--src-track-id` it also runs
 the fingerprint-gated transfer in the same command:
 
 ```bash
+rekord-ripper pending --apply --import                     # the whole download queue
 rekord-ripper import "new.flac"                            # dry-run: shows every value
 rekord-ripper import "new.flac" --src-track-id 12345678 --apply
 rekord-ripper import --undo 3052064790 --apply             # changed your mind

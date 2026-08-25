@@ -233,6 +233,16 @@ enum Cmd {
         /// fingerprint gate. Without this, prints proposals only.
         #[arg(long)]
         apply: bool,
+        /// Create the rekordbox rows for downloads that have not been imported,
+        /// instead of waiting for them to be dragged in. The queue already
+        /// knows each file's source track, so this needs no other argument.
+        ///
+        /// Needs `insert_content_rows = true` under [import] in your config.
+        #[arg(long, conflicts_with_all = ["list", "clear"])]
+        import: bool,
+        /// Skip the confirmation in front of --import's row creation.
+        #[arg(short = 'y', long)]
+        yes: bool,
         /// Forget a queued transfer.
         #[arg(long, value_name = "ID")]
         clear: Option<i64>,
@@ -418,12 +428,22 @@ fn main() -> Result<()> {
                 },
             )?
         }
-        Cmd::Pending { list, apply, clear } => {
+        Cmd::Pending {
+            list,
+            apply,
+            import,
+            yes,
+            clear,
+        } => {
             let cfg = Config::load(&config_path)?;
             let action = match (clear, list) {
                 (Some(id), _) => acquire::cmd::PendingAction::Clear { id },
                 (None, true) => acquire::cmd::PendingAction::List,
-                (None, false) => acquire::cmd::PendingAction::Apply { dry_run: !apply },
+                (None, false) => acquire::cmd::PendingAction::Apply {
+                    dry_run: !apply,
+                    import,
+                    yes,
+                },
             };
             acquire::cmd::pending(
                 db.as_mut().expect("pending needs the db"),
