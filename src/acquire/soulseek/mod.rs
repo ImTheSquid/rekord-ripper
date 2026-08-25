@@ -38,6 +38,10 @@ const POLL_EVERY: Duration = Duration::from_secs(2);
 /// uses locally.
 const STAGING_ROOT: &str = "rekord-ripper";
 
+/// How many spent batch ids to step past before giving up. Small on purpose:
+/// needing more than a couple means something else is wrong.
+const ATTACH_ATTEMPTS: u32 = 4;
+
 /// Namespace for the deterministic batch id. Fixed forever: changing it would
 /// orphan every in-flight transfer a previous build queued.
 const BATCH_NAMESPACE: uuid::Uuid = uuid::Uuid::from_bytes([
@@ -137,12 +141,15 @@ fn parse_item_key(key: &str) -> Option<(u64, Option<u32>, &str, &str)> {
 
 /// A batch id derived from the offer, so re-fetching the same file attaches to
 /// the transfer already queued instead of starting a second one.
-fn batch_id(username: &str, filename: &str) -> String {
-    uuid::Uuid::new_v5(
-        &BATCH_NAMESPACE,
-        format!("{username}\u{1f}{filename}").as_bytes(),
-    )
-    .to_string()
+fn batch_id(username: &str, filename: &str, attempt: u32) -> String {
+    // Attempt 0 hashes the bare pair, so a batch queued by an earlier build is
+    // still recognised and attached to rather than orphaned.
+    let name = if attempt == 0 {
+        format!("{username}\u{1f}{filename}")
+    } else {
+        format!("{username}\u{1f}{filename}\u{1f}{attempt}")
+    };
+    uuid::Uuid::new_v5(&BATCH_NAMESPACE, name.as_bytes()).to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -460,39 +467,85 @@ impl Soulseek {
     /// The batch id is derived from the offer, so a second attempt collides on
     /// purpose: slskd answers 409 and we attach rather than queueing the same
     /// file twice and losing the place already waited for.
+    /// Start the transfer, or attach to one slskd already has, and return the
+    /// batch id that ended up in play.
+    ///
+    /// The batch id is derived from the offer, so a second fetch of the same
+    /// file collides on purpose and slskd answers 409 — that is how we inherit a
+    /// queue position instead of joining the back of the queue again.
+    ///
+    /// The wrinkle is a *spent* batch: slskd remembers a transfer as succeeded
+    /// long after the file has gone, because a successful fetch takes it away.
+    /// Attaching to one of those would find nothing to collect and dead-end, so
+    /// a spent id is skipped and the next attempt gets a fresh one.
     fn start_or_attach(
         &self,
         client: &api::Client,
-        id: &str,
         username: &str,
         filename: &str,
         size: u64,
-    ) -> Result<()> {
-        let req = api::BatchRequest {
-            id: id.to_string(),
-            username,
-            files: vec![api::BatchItem { filename, size }],
-            options: api::BatchOptions {
-                destination: &Self::staging(id),
-            },
-        };
-        match client.enqueue(&req) {
-            Ok(resp) => {
-                // We only ever enqueue one file, so any failure is total.
-                if let Some(f) = resp.failures.first() {
-                    let msg = f.message.clone().unwrap_or_else(|| "rejected".into());
-                    return Err(BackendError::Other(anyhow::anyhow!(
-                        "slskd refused this download: {msg}"
-                    )));
+    ) -> Result<String> {
+        for attempt in 0..ATTACH_ATTEMPTS {
+            let id = batch_id(username, filename, attempt);
+            let staging = Self::staging(&id);
+            let req = api::BatchRequest {
+                id: id.clone(),
+                username,
+                files: vec![api::BatchItem { filename, size }],
+                options: api::BatchOptions {
+                    destination: &staging,
+                },
+            };
+
+            match client.enqueue(&req) {
+                Ok(resp) => {
+                    // We only ever enqueue one file, so any failure is total.
+                    if let Some(f) = resp.failures.first() {
+                        let msg = f.message.clone().unwrap_or_else(|| "rejected".into());
+                        return Err(BackendError::Other(anyhow::anyhow!(
+                            "slskd refused this download: {msg}"
+                        )));
+                    }
+                    return Ok(id);
                 }
-                Ok(())
+                Err(e) if api::is_conflict(&e) => {
+                    if self.is_reusable(client, &id, &staging)? {
+                        eprintln!("soulseek: attaching to a transfer slskd already has");
+                        return Ok(id);
+                    }
+                    // Spent: finished, with nothing left behind. Queue it again.
+                    eprintln!("soulseek: the earlier copy is gone; downloading it again");
+                }
+                Err(e) => return Err(e),
             }
-            Err(e) if api::is_conflict(&e) => {
-                eprintln!("soulseek: attaching to a transfer slskd already has");
-                Ok(())
-            }
-            Err(e) => Err(e),
         }
+        Err(BackendError::Other(anyhow::anyhow!(
+            "slskd already holds {ATTACH_ATTEMPTS} finished-but-empty downloads of this file; \
+             clear them from its transfer list and try again"
+        )))
+    }
+
+    /// Whether an existing batch can still produce the file.
+    ///
+    /// Either it is still working — in which case waiting is exactly right — or
+    /// it succeeded and the file is still in its staging directory.
+    fn is_reusable(&self, client: &api::Client, id: &str, staging: &str) -> Result<bool> {
+        let batch = client.batch(id)?;
+        if batch.transfers.is_empty() {
+            return Ok(false);
+        }
+        if batch.transfers.iter().any(|t| !t.state.is_terminal()) {
+            return Ok(true);
+        }
+        if !batch.transfers.iter().all(|t| t.state.succeeded()) {
+            return Ok(false);
+        }
+        // A missing staging directory answers 404, which is the common case
+        // here rather than an error worth propagating.
+        Ok(client
+            .list_downloads(staging)
+            .map(|l| !l.walk().is_empty())
+            .unwrap_or(false))
     }
 
     /// Poll until the transfer finishes, fails, or runs out of time.
@@ -744,10 +797,8 @@ impl super::AcquisitionBackend for Soulseek {
 
         let client = self.client()?;
         let deadline = opts.deadline.min(Instant::now() + self.fetch_timeout);
-        let id = batch_id(username, filename);
+        let id = self.start_or_attach(&client, username, filename, size)?;
         let staging = Self::staging(&id);
-
-        self.start_or_attach(&client, &id, username, filename, size)?;
         let done = Self::await_transfer(&client, &id, filename, deadline)?;
         let found = Self::locate(&client, &staging, &done)?;
 
@@ -870,18 +921,34 @@ mod tests {
     #[test]
     fn a_batch_id_is_stable_for_the_same_file_and_differs_across_files() {
         // This is what makes a re-fetch attach instead of queueing a duplicate.
-        let a = batch_id("peer", r"@@x\a - b.flac");
-        assert_eq!(a, batch_id("peer", r"@@x\a - b.flac"));
-        assert_ne!(a, batch_id("peer2", r"@@x\a - b.flac"));
-        assert_ne!(a, batch_id("peer", r"@@x\a - c.flac"));
+        let a = batch_id("peer", r"@@x\a - b.flac", 0);
+        assert_eq!(a, batch_id("peer", r"@@x\a - b.flac", 0));
+        assert_ne!(a, batch_id("peer2", r"@@x\a - b.flac", 0));
+        assert_ne!(a, batch_id("peer", r"@@x\a - c.flac", 0));
         // A valid uuid, since slskd parses it as one.
         assert!(uuid::Uuid::parse_str(&a).is_ok());
     }
 
     #[test]
+    fn each_attempt_gets_its_own_id_but_the_first_stays_put() {
+        // Attempt 0 must keep hashing the bare pair, or a batch queued by an
+        // earlier build would be orphaned instead of attached to.
+        let base = batch_id("peer", "f.flac", 0);
+        assert_eq!(
+            base,
+            uuid::Uuid::new_v5(&BATCH_NAMESPACE, "peer\u{1f}f.flac".as_bytes()).to_string()
+        );
+        let ids: Vec<String> = (0..4).map(|n| batch_id("peer", "f.flac", n)).collect();
+        let mut uniq = ids.clone();
+        uniq.sort();
+        uniq.dedup();
+        assert_eq!(uniq.len(), 4, "every attempt needs a distinct id: {ids:?}");
+    }
+
+    #[test]
     fn the_separator_stops_a_username_and_filename_from_colliding() {
         // "ab" + "c" must not hash the same as "a" + "bc".
-        assert_ne!(batch_id("ab", "c"), batch_id("a", "bc"));
+        assert_ne!(batch_id("ab", "c", 0), batch_id("a", "bc", 0));
     }
 
     #[test]
@@ -1710,6 +1777,131 @@ mod server_tests {
     }
 
     #[test]
+    fn a_spent_batch_is_stepped_over_and_the_download_queued_again() {
+        // slskd remembers a transfer as succeeded long after the file is gone,
+        // because a successful fetch takes it away. Attaching to that record
+        // would find nothing to collect, so a fresh batch id is used instead.
+        let spent = Soulseek::staging(&batch_id("peer", TRACK, 0));
+        let fresh = Soulseek::staging(&batch_id("peer", TRACK, 1));
+        let enqueued = Arc::new(Mutex::new(Vec::<String>::new()));
+        let log = Arc::clone(&enqueued);
+        let (spent2, fresh2) = (spent.clone(), fresh.clone());
+
+        let d = Fake::start(move |method, path| {
+            if method == "POST" && path.ends_with("/batches") {
+                // Only the first id is already taken.
+                let n = {
+                    let mut g = log.lock().unwrap();
+                    g.push(path.to_string());
+                    g.len()
+                };
+                if n == 1 {
+                    return json_reply(409, json!("already exists"));
+                }
+                return json_reply(201, json!({"batch": {"id": "b", "transfers": []}}));
+            }
+            if method == "GET" && path.contains("/downloads/batches/") {
+                return json_reply(
+                    200,
+                    json!({"id": "b", "transfers": [transfer("Completed, Succeeded", SIZE)]}),
+                );
+            }
+            if method == "GET" && path.contains("/files/downloads/directories") {
+                // The spent staging dir is gone; the fresh one has the file.
+                let want = api::encode_path_segment(&api::base64_standard(spent2.as_bytes()));
+                if path.contains(&want) {
+                    return empty_reply(404);
+                }
+                let ok = api::encode_path_segment(&api::base64_standard(fresh2.as_bytes()));
+                if path.contains(&ok) {
+                    return json_reply(200, listing());
+                }
+                return json_reply(200, listing());
+            }
+            if method == "GET" && path.starts_with("/files/") {
+                return bytes_reply(AUDIO);
+            }
+            empty_reply(204)
+        });
+
+        let dest = std::env::temp_dir().join(format!("rr-slskd-{}", uuid::Uuid::new_v4()));
+        let files = d
+            .backend(|_| {})
+            .fetch(
+                &ItemRef::new(ID, item_key(SIZE, 1006, "peer", TRACK)),
+                &FetchOpts {
+                    dest_dir: dest.clone(),
+                    format_pref: vec![AudioFormat::Flac],
+                    retention: Retention::Keep,
+                    overwrite: false,
+                    deadline: Instant::now() + Duration::from_secs(60),
+                },
+            )
+            .expect("a spent batch should be re-queued, not a dead end");
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(std::fs::read(&files[0].path).unwrap(), AUDIO);
+        // Two enqueues: the collision, then the fresh id.
+        assert_eq!(enqueued.lock().unwrap().len(), 2);
+        // And the file came from the fresh staging directory.
+        assert!(
+            d.asked()
+                .iter()
+                .any(|a| a.starts_with("GET /files/")
+                    && a.contains(fresh.split('/').nth(1).unwrap())),
+            "collected from the new staging dir: {:?}",
+            d.asked()
+        );
+
+        std::fs::remove_dir_all(&dest).ok();
+    }
+
+    #[test]
+    fn an_in_progress_batch_is_attached_to_rather_than_requeued() {
+        let enqueues = Arc::new(Mutex::new(0u32));
+        let log = Arc::clone(&enqueues);
+        let d = Fake::start(move |method, path| {
+            if method == "POST" && path.ends_with("/batches") {
+                *log.lock().unwrap() += 1;
+                return json_reply(409, json!("already exists"));
+            }
+            if method == "GET" && path.contains("/downloads/batches/") {
+                // Still working, so waiting is exactly right.
+                return json_reply(
+                    200,
+                    json!({"id": "b", "transfers": [transfer("Completed, Succeeded", SIZE)]}),
+                );
+            }
+            if method == "GET" && path.contains("/files/downloads/directories") {
+                return json_reply(200, listing());
+            }
+            if method == "GET" && path.starts_with("/files/") {
+                return bytes_reply(AUDIO);
+            }
+            empty_reply(204)
+        });
+
+        let dest = std::env::temp_dir().join(format!("rr-slskd-{}", uuid::Uuid::new_v4()));
+        d.backend(|_| {})
+            .fetch(
+                &ItemRef::new(ID, item_key(SIZE, 1006, "peer", TRACK)),
+                &FetchOpts {
+                    dest_dir: dest.clone(),
+                    format_pref: vec![AudioFormat::Flac],
+                    retention: Retention::Keep,
+                    overwrite: false,
+                    deadline: Instant::now() + Duration::from_secs(60),
+                },
+            )
+            .unwrap();
+
+        // Succeeded *and* the file is there, so the first id is reused: exactly
+        // one enqueue attempt, no stepping to a fresh id.
+        assert_eq!(*enqueues.lock().unwrap(), 1);
+        std::fs::remove_dir_all(&dest).ok();
+    }
+
+    #[test]
     fn a_failed_transfer_is_reported_and_never_collected() {
         let d = Fake::start(|method, path| {
             if method == "POST" && path.ends_with("/batches") {
@@ -1848,7 +2040,7 @@ mod server_tests {
         // slskd actually returns when a subdirectory is listed, so a path
         // composed from it would not resolve.
         let dir = std::env::temp_dir().join(format!("rr-slskd-local-{}", uuid::Uuid::new_v4()));
-        let staging = Soulseek::staging(&batch_id("peer", TRACK));
+        let staging = Soulseek::staging(&batch_id("peer", TRACK, 0));
         let on_disk = dir.join(&staging).join("02 - Archangel.flac");
         std::fs::create_dir_all(on_disk.parent().unwrap()).unwrap();
         std::fs::write(&on_disk, AUDIO).unwrap();
