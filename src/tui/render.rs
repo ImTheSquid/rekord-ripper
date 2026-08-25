@@ -7,8 +7,8 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use crate::format::{file_type_name, format_bpm, format_length};
 
 use super::app::{App, Focus, InputMode, Screen, ShopFocus, ShopTrackState, StatusLevel};
-use crate::library::TrackRow;
 use super::diff::render_pair;
+use crate::library::TrackRow;
 
 /// Takes `&mut App` for one reason: the help popup's scroll offset can only be
 /// clamped here, where the popup's final height is known.
@@ -375,11 +375,17 @@ fn draw_shop_top_bar(f: &mut Frame, area: Rect, app: &App) {
     let queued = app.shop_outstanding();
     if queued > 0 {
         spans.push(Span::styled(
-            format!("  {} {queued} search(es) running", spinner(app.shop_since())),
+            format!(
+                "  {} {queued} search(es) running",
+                spinner(app.shop_since())
+            ),
             Style::new().fg(Color::Cyan),
         ));
     } else {
-        spans.push(Span::styled("  esc → transfer", Style::new().fg(Color::DarkGray)));
+        spans.push(Span::styled(
+            "  esc → transfer",
+            Style::new().fg(Color::DarkGray),
+        ));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -682,8 +688,9 @@ fn offer_body(app: &App, width: u16, focused: bool) -> OfferView {
                     // Dimmed when the pane is not focused, so it is obvious which
                     // list the arrow keys are driving.
                     let style = match (selected, focused) {
-                        (true, true) => Style::new()
-                            .add_modifier(Modifier::REVERSED | Modifier::BOLD),
+                        (true, true) => {
+                            Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+                        }
                         (true, false) => Style::new().add_modifier(Modifier::BOLD),
                         (false, _) => Style::new(),
                     };
@@ -1300,7 +1307,9 @@ mod tests {
         // By character, not by byte: an em dash in a title shifts every byte
         // offset after it without moving the column at all.
         fn col_of(s: &str, needle: &str) -> usize {
-            let at = s.find(needle).unwrap_or_else(|| panic!("no {needle:?} in {s:?}"));
+            let at = s
+                .find(needle)
+                .unwrap_or_else(|| panic!("no {needle:?} in {s:?}"));
             s[..at].chars().count()
         }
         let header = offer_header(120);

@@ -37,7 +37,9 @@ fn format_row_line(label: &str, r: &TrackRow) -> String {
 
 fn format_diff_line(src: &TrackRow, dst: &TrackRow) -> String {
     let bpm_delta = match (src.bpm, dst.bpm) {
-        (Some(s), Some(d)) if s != d => format!("BPM {:.2} → {:.2}", d as f64 / 100.0, s as f64 / 100.0),
+        (Some(s), Some(d)) if s != d => {
+            format!("BPM {:.2} → {:.2}", d as f64 / 100.0, s as f64 / 100.0)
+        }
         (Some(s), None) => format!("BPM - → {:.2}", s as f64 / 100.0),
         _ => "BPM unchanged".into(),
     };
