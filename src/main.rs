@@ -588,6 +588,9 @@ fn run_import(db: &mut MasterDb, cfg: &Config, safety: SafetyOpts, args: ImportA
         println!();
         planned.push(new);
     }
+    // Several files by the same new artist mint one artist row between them,
+    // not one each — planning happens before any of it is inserted.
+    import::dedupe_lookups(&mut planned);
 
     if !args.apply {
         eprintln!(

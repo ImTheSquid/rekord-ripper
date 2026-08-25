@@ -30,6 +30,7 @@
 //! `rb_local_deleted = 1` plus a USN bump so the deletion itself propagates, and
 //! so does this.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -359,12 +360,59 @@ pub struct UndoNote {
 }
 
 impl UndoNote {
-    /// Write next to `backup` as `<backup>.inserted.json`.
+    /// Write next to `backup` as `<backup>.<content_id>.inserted.json`.
+    ///
+    /// Named per row, not per backup: one backup covers a whole batch of
+    /// inserts, so a name derived from the backup alone meant each note
+    /// overwrote the last and only the final row stayed undoable.
     pub fn write_beside(&self, backup: &Path) -> Result<PathBuf> {
-        let path = backup.with_extension("inserted.json");
+        let mut name = backup.file_name().unwrap_or_default().to_os_string();
+        name.push(format!(".{}.inserted.json", self.content_id));
+        let path = backup.with_file_name(name);
         std::fs::write(&path, serde_json::to_vec_pretty(self)?)
             .with_context(|| format!("writing {}", path.display()))?;
         Ok(path)
+    }
+}
+
+/// Collapse artist/album/genre rows that several plans would each mint.
+///
+/// `resolve_lookup` only asks the *database* whether a name exists, so planning
+/// a batch before inserting any of it means two files by the same new artist
+/// each mint their own `djmdArtist` row — the split-browser outcome
+/// `resolve_lookup` exists to prevent. Planning is always done for the whole
+/// batch up front (the confirmation has to show every row), so the batch has to
+/// be reconciled against itself before the first insert.
+///
+/// Matching is by exact trimmed name, mirroring `resolve_lookup`'s `Name = ?1`.
+pub fn dedupe_lookups(planned: &mut [NewContent]) {
+    let mut seen: HashMap<(&'static str, String), String> = HashMap::new();
+    for p in planned.iter_mut() {
+        // Three disjoint field pairs, so each is reconciled on its own.
+        fold(&mut seen, &mut p.artist_id, &mut p.new_artist);
+        fold(&mut seen, &mut p.album_id, &mut p.new_album);
+        fold(&mut seen, &mut p.genre_id, &mut p.new_genre);
+    }
+}
+
+/// Point `id` at the first plan to mint this name, and drop the duplicate.
+fn fold(
+    seen: &mut HashMap<(&'static str, String), String>,
+    id: &mut Option<String>,
+    minted: &mut Option<NewLookup>,
+) {
+    let Some(lookup) = minted.as_ref() else {
+        return;
+    };
+    let key = (lookup.table, lookup.name.clone());
+    match seen.get(&key) {
+        Some(first) => {
+            *id = Some(first.clone());
+            *minted = None;
+        }
+        None => {
+            seen.insert(key, lookup.id.clone());
+        }
     }
 }
 
@@ -590,6 +638,86 @@ mod tests {
             master_db_id: Some("2768718261".into()),
             device_id: Some("f742efc6-df09-4a29-876e-fdc38806710b".into()),
         }
+    }
+
+    /// A plan that mints a brand-new artist row, as `resolve_lookup` does when
+    /// the name is not already in `djmdArtist`.
+    fn minting(id: &str, artist_row_id: &str, artist: &str) -> NewContent {
+        NewContent {
+            id: id.into(),
+            artist_id: Some(artist_row_id.into()),
+            new_artist: Some(NewLookup {
+                table: "djmdArtist",
+                id: artist_row_id.into(),
+                uuid: format!("uuid-{artist_row_id}"),
+                name: artist.into(),
+            }),
+            ..content()
+        }
+    }
+
+    #[test]
+    fn one_new_artist_across_a_batch_becomes_one_row() {
+        // The split-browser bug: planning happens before inserting, so both
+        // files asked the database, neither saw the other, and each minted.
+        let mut batch = [
+            minting("1", "aaa", "Burial"),
+            minting("2", "bbb", "Burial"),
+            minting("3", "ccc", "Zomby"),
+        ];
+        dedupe_lookups(&mut batch);
+
+        assert!(batch[0].new_artist.is_some(), "the first one still mints");
+        assert!(batch[1].new_artist.is_none(), "the second must not mint");
+        assert_eq!(batch[1].artist_id.as_deref(), Some("aaa"));
+        // A different name is untouched.
+        assert!(batch[2].new_artist.is_some());
+        assert_eq!(batch[2].artist_id.as_deref(), Some("ccc"));
+    }
+
+    #[test]
+    fn dedupe_keeps_the_three_lookup_kinds_apart() {
+        // Same name, different table: an album called "Burial" is not the
+        // artist Burial, and collapsing them would repoint the wrong column.
+        let mut a = minting("1", "aaa", "Burial");
+        a.new_album = Some(NewLookup {
+            table: "djmdAlbum",
+            id: "alb".into(),
+            uuid: "u".into(),
+            name: "Burial".into(),
+        });
+        a.album_id = Some("alb".into());
+        let mut batch = [a];
+        dedupe_lookups(&mut batch);
+        assert!(batch[0].new_artist.is_some());
+        assert!(batch[0].new_album.is_some());
+        assert_eq!(batch[0].album_id.as_deref(), Some("alb"));
+    }
+
+    #[test]
+    fn an_undo_note_is_named_per_row_not_per_backup() {
+        // One backup covers a whole batch, so notes named after it overwrote
+        // each other and only the last row stayed undoable.
+        let dir = std::env::temp_dir().join(format!("rr-note-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let backup = dir.join("master.db.20260101T000000000Z.bak");
+
+        let note = |content_id: &str| UndoNote {
+            content_id: content_id.into(),
+            content_uuid: "u".into(),
+            folder_path: "/x.flac".into(),
+            artist_id: None,
+            created_artist: false,
+            inserted_at: "now".into(),
+            backup: None,
+        };
+        let first = note("111").write_beside(&backup).unwrap();
+        let second = note("222").write_beside(&backup).unwrap();
+
+        assert_ne!(first, second, "two inserts must not share a note file");
+        assert!(first.exists() && second.exists());
+        assert!(first.to_string_lossy().contains("111"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
