@@ -21,6 +21,7 @@
 //! it is in (already bounded by the HTTP timeout) rather than blocking the user's
 //! exit on it.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::time::{Duration, Instant};
@@ -32,6 +33,34 @@ use crate::config::{Config, Credentials};
 
 /// Ceiling for one download, including any wait while bandcamp prepares it.
 const FETCH_BUDGET: Duration = Duration::from_secs(1800);
+
+/// What kind of work a job is, so the UI can say which.
+///
+/// `outstanding` used to be a single count that three call sites read as
+/// "searches". Once fingerprints share the thread, an untagged count makes the
+/// shop screen report phantom searches, makes `f` a dead key with no
+/// explanation, and makes the quit guard name the wrong thing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum JobKind {
+    Search,
+    Fetch,
+    /// Reading a file's headers, before a row can be planned for it.
+    Probe,
+    /// The fingerprint gate. Minutes, when the source has to be ripped first.
+    Fingerprint,
+}
+
+impl JobKind {
+    /// For "3 fingerprint(s) still running".
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Search => "search",
+            Self::Fetch => "download",
+            Self::Probe => "file check",
+            Self::Fingerprint => "fingerprint",
+        }
+    }
+}
 
 /// Work the UI can ask for.
 pub enum Job {
@@ -50,6 +79,39 @@ pub enum Job {
         format_pref: Vec<AudioFormat>,
         overwrite: bool,
     },
+    /// Read one file's headers, so a `djmdContent` row can be planned for it.
+    /// One `ffprobe`, but with a 60 s ceiling — not something a key handler can
+    /// afford to wait on.
+    Probe {
+        entry_id: i64,
+        generation: u64,
+        path: PathBuf,
+    },
+    /// The fingerprint gate for one queued transfer.
+    ///
+    /// `src` is moved in rather than borrowed: `TrackHeader` is plain owned
+    /// data, and the main thread does not need it again — `build_plan` takes
+    /// ids. Boxed because it is twelve fields against the handful every other
+    /// variant carries, and `Job` is sized for its largest.
+    Fingerprint {
+        entry_id: i64,
+        generation: u64,
+        src: Box<crate::analysis::TrackHeader>,
+        dst_path: PathBuf,
+        dst_length: Option<i64>,
+        dst_bpm: Option<i64>,
+    },
+}
+
+impl Job {
+    pub fn kind(&self) -> JobKind {
+        match self {
+            Self::Shop { .. } => JobKind::Search,
+            Self::Fetch { .. } => JobKind::Fetch,
+            Self::Probe { .. } => JobKind::Probe,
+            Self::Fingerprint { .. } => JobKind::Fingerprint,
+        }
+    }
 }
 
 /// What comes back.
@@ -67,13 +129,40 @@ pub enum Update {
     Finished(Box<Vec<GroupOutcome>>),
     /// A fetch finished. `Ok` carries where the files landed.
     Fetched(Box<Result<Vec<AcquiredFile>, String>>),
+    /// `(entry_id, generation, result)`.
+    Probed(Box<(i64, u64, Result<crate::audio::AudioInfo, String>)>),
+    /// `(entry_id, generation, result)`.
+    Fingerprinted(Box<(i64, u64, Result<crate::transfer::GateOutcome, String>)>),
     Failed(String),
 }
 
 impl Update {
     /// True when this ends the job the UI is waiting on.
+    ///
+    /// Every terminal variant must be listed. A new one that is missed here
+    /// never decrements `outstanding`, and the UI stays "busy" forever with no
+    /// error to explain it — see `every_job_kind_finishes`.
     fn is_terminal(&self) -> bool {
-        matches!(self, Self::Finished(_) | Self::Fetched(_) | Self::Failed(_))
+        matches!(
+            self,
+            Self::Finished(_)
+                | Self::Fetched(_)
+                | Self::Probed(_)
+                | Self::Fingerprinted(_)
+                | Self::Failed(_)
+        )
+    }
+
+    /// What kind of job this ends, for the per-kind counter.
+    fn ends(&self) -> Option<JobKind> {
+        match self {
+            Self::Finished(_) => Some(JobKind::Search),
+            Self::Fetched(_) => Some(JobKind::Fetch),
+            Self::Probed(_) => Some(JobKind::Probe),
+            Self::Fingerprinted(_) => Some(JobKind::Fingerprint),
+            // A dead thread ends whatever was in flight; `drain` handles it.
+            Self::Failed(_) | Self::Started | Self::Progress { .. } => None,
+        }
     }
 }
 
@@ -86,6 +175,8 @@ pub struct Worker {
     /// channel, so submitting several just runs them in order. That is what makes
     /// "tap `s` on each track you care about" work.
     outstanding: usize,
+    /// The same count, split by kind, so a message can name what is running.
+    by_kind: HashMap<JobKind, usize>,
 }
 
 impl Worker {
@@ -151,6 +242,40 @@ impl Worker {
                                 return;
                             }
                         }
+                        Job::Probe {
+                            entry_id,
+                            generation,
+                            path,
+                        } => {
+                            if up_tx.send(Update::Started).is_err() {
+                                return;
+                            }
+                            let result = crate::audio::probe(&path).map_err(|e| e.to_string());
+                            let msg = Update::Probed(Box::new((entry_id, generation, result)));
+                            if up_tx.send(msg).is_err() {
+                                return;
+                            }
+                        }
+                        Job::Fingerprint {
+                            entry_id,
+                            generation,
+                            src,
+                            dst_path,
+                            dst_length,
+                            dst_bpm,
+                        } => {
+                            if up_tx.send(Update::Started).is_err() {
+                                return;
+                            }
+                            let result =
+                                crate::transfer::gate(&src, &dst_path, dst_length, dst_bpm, &cfg)
+                                    .map_err(|e| e.to_string());
+                            let msg =
+                                Update::Fingerprinted(Box::new((entry_id, generation, result)));
+                            if up_tx.send(msg).is_err() {
+                                return;
+                            }
+                        }
                     }
                 }
             })?;
@@ -159,6 +284,7 @@ impl Worker {
             jobs: Some(job_tx),
             updates: up_rx,
             outstanding: 0,
+            by_kind: HashMap::new(),
         })
     }
 
@@ -171,12 +297,23 @@ impl Worker {
         self.outstanding
     }
 
+    /// How many of one kind are outstanding.
+    ///
+    /// The plain count cannot answer "are there searches running?" once
+    /// fingerprints share the thread, and every caller that phrases its message
+    /// as "search(es)" needs this instead.
+    pub fn outstanding_of(&self, kind: JobKind) -> usize {
+        self.by_kind.get(&kind).copied().unwrap_or(0)
+    }
+
     /// Queue a job behind any already running. Returns false only if the thread
     /// is gone.
     pub fn submit(&mut self, job: Job) -> bool {
+        let kind = job.kind();
         match self.jobs.as_ref().map(|tx| tx.send(job)) {
             Some(Ok(())) => {
                 self.outstanding += 1;
+                *self.by_kind.entry(kind).or_insert(0) += 1;
                 true
             }
             // The thread died; report it rather than looking stuck forever.
@@ -193,6 +330,11 @@ impl Worker {
                     if u.is_terminal() {
                         self.outstanding = self.outstanding.saturating_sub(1);
                     }
+                    if let Some(kind) = u.ends()
+                        && let Some(n) = self.by_kind.get_mut(&kind)
+                    {
+                        *n = n.saturating_sub(1);
+                    }
                     out.push(u);
                 }
                 Err(TryRecvError::Empty) => break,
@@ -201,8 +343,9 @@ impl Worker {
                     // forever waiting on a thread that has gone.
                     while self.outstanding > 0 {
                         self.outstanding -= 1;
-                        out.push(Update::Failed("the search thread stopped".into()));
+                        out.push(Update::Failed("the worker thread stopped".into()));
                     }
+                    self.by_kind.clear();
                     break;
                 }
             }
@@ -266,6 +409,58 @@ mod tests {
         assert!(w.submit(job()));
         assert!(w.is_busy());
         assert_eq!(w.outstanding(), 3);
+    }
+
+    /// Every job kind must eventually clear the counter.
+    ///
+    /// The trap this guards: `Update::is_terminal` is a `matches!` list, and a
+    /// terminal variant missing from it never decrements `outstanding`. Nothing
+    /// errors — the UI just reports work forever, refuses keys as
+    /// already-queued, and blocks quit. Silent, and invisible to every other
+    /// test here.
+    #[test]
+    fn every_job_kind_finishes() {
+        for job in [
+            Job::Probe {
+                entry_id: 1,
+                generation: 0,
+                // A path that cannot exist: probe fails fast, and a failure
+                // still has to be terminal.
+                path: PathBuf::from("/nonexistent/rr-test.flac"),
+            },
+            Job::Shop {
+                specs: vec![empty_spec()],
+                opts: Box::new(SearchOpts::default()),
+            },
+        ] {
+            let kind = job.kind();
+            let mut w = worker();
+            assert!(w.submit(job));
+            assert_eq!(w.outstanding_of(kind), 1, "{kind:?} was not counted");
+
+            let start = Instant::now();
+            while w.outstanding() > 0 && start.elapsed() < Duration::from_secs(30) {
+                w.drain();
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(w.outstanding(), 0, "{kind:?} never cleared the counter");
+            assert_eq!(w.outstanding_of(kind), 0, "{kind:?} left its own count");
+        }
+    }
+
+    #[test]
+    fn one_kind_of_work_does_not_mask_another() {
+        // What the split is for: a fingerprint must not read as a search, or
+        // the shop screen shows phantom searches and `f` goes dead.
+        let mut w = worker();
+        assert!(w.submit(Job::Probe {
+            entry_id: 1,
+            generation: 0,
+            path: PathBuf::from("/nonexistent/rr-test.flac"),
+        }));
+        assert_eq!(w.outstanding_of(JobKind::Probe), 1);
+        assert_eq!(w.outstanding_of(JobKind::Search), 0);
+        assert_eq!(w.outstanding_of(JobKind::Fetch), 0);
     }
 
     #[test]
