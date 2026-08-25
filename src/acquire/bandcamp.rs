@@ -1135,7 +1135,7 @@ mod tests {
     #[test]
     fn format_preference_picks_flac_over_mp3_from_a_real_page() {
         let links = parse_download_page(DOWNLOAD_PAGE).unwrap();
-        let pref = vec![
+        let pref = [
             AudioFormat::Flac,
             AudioFormat::Aiff,
             AudioFormat::Mp3(Some(320)),

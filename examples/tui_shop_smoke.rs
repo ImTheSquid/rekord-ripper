@@ -90,10 +90,10 @@ fn main() -> anyhow::Result<()> {
             .shop
             .flattened()
             .position(|(_, r)| !r.offer.requires_purchase());
-        if let ShopState::Results { cursor, .. } = &mut app.shop {
-            if let Some(i) = free {
-                *cursor = i;
-            }
+        if let ShopState::Results { cursor, .. } = &mut app.shop
+            && let Some(i) = free
+        {
+            *cursor = i;
         }
         println!(
             "fetching: {:?}",

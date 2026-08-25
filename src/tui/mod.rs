@@ -38,10 +38,10 @@ type Term = Terminal<CrosstermBackend<io::Stdout>>;
 fn event_loop(terminal: &mut Term, app: &mut App) -> Result<()> {
     while !app.should_quit {
         terminal.draw(|f| render::draw(f, app))?;
-        if event::poll(Duration::from_millis(300))? {
-            if let Event::Key(key) = event::read()? {
-                events::handle_key(app, key);
-            }
+        if event::poll(Duration::from_millis(300))?
+            && let Event::Key(key) = event::read()?
+        {
+            events::handle_key(app, key);
         }
         app.poll_rekordbox_if_due();
         // Results from the background search land here, so the UI stays

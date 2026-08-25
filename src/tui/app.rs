@@ -236,23 +236,12 @@ pub struct DstFilters {
     pub fuzzy_from_src: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ColumnState {
     pub query: String,
     pub visible: Vec<usize>,
     pub cursor: usize,
     pub selected: HashSet<String>,
-}
-
-impl Default for ColumnState {
-    fn default() -> Self {
-        Self {
-            query: String::new(),
-            visible: Vec::new(),
-            cursor: 0,
-            selected: HashSet::new(),
-        }
-    }
 }
 
 impl ColumnState {

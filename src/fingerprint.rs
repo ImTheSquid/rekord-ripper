@@ -771,11 +771,14 @@ mod tests {
         );
     }
 
+    // Measured: a 2% tempo change scored 6.44, under SCORE_MAX of 8.0. Score
+    // alone would have accepted it, which is why the duration check exists.
+    // Checked at compile time so that raising SCORE_MAX cannot quietly turn the
+    // test below into one that proves nothing.
+    const _: () = assert!(6.44 < SCORE_MAX);
+
     #[test]
     fn a_speed_change_is_caught_even_at_a_score_that_would_pass() {
-        // Measured: a 2% tempo change scored 6.44, under SCORE_MAX of 8.0. Score
-        // alone would have accepted it, which is why the duration check exists.
-        assert!(6.44 < SCORE_MAX, "the premise of this test");
         let v = judge(
             &[seg(0, 0, items_for(118.0), 6.44)],
             120.0,
