@@ -9,6 +9,7 @@ use rekord_ripper::config::{Config, Credentials};
 use rekord_ripper::db::{self, MasterDb, SafetyOpts};
 use rekord_ripper::dump;
 use rekord_ripper::paths;
+use rekord_ripper::query;
 use rekord_ripper::tui;
 
 #[derive(Parser)]
@@ -34,13 +35,29 @@ struct Cli {
 enum Cmd {
     /// Dump analysis state for tracks. With no query, lists every track.
     ///
-    /// A numeric query is matched against djmdContent.ID; anything else is
-    /// matched as a substring against Title and Artist name.
+    /// A numeric query is an exact djmdContent.ID. Anything else is a search
+    /// box: words are ANDed against title and artist, "quoted words" must be
+    /// adjacent, -word excludes, OR alternates.
+    ///
+    /// p:name (or p:"a name") restricts to a playlist or a folder of them.
+    /// is:name matches a keyword: local, cloud or stream for where the audio
+    /// lives; present or missing for whether a local file is really on this
+    /// machine; lossy or lossless, and mp3 m4a flac aiff wav, for what it is;
+    /// cues and locked for what the track already carries.
+    ///
+    /// bpm: and len: take a number, a comparison or a span — bpm:128,
+    /// bpm:>=128, bpm:120-130, len:>6m, len:3m-6m, len:4:30. A bare number
+    /// covers the precision you typed, so bpm:128 matches 128.02; a comparison
+    /// or a span means exactly the number written.
+    ///
+    /// An excluded term starts with a hyphen, which the flag parser claims
+    /// first, so put those after a `--`:
+    ///   rekord-ripper dump --limit 5 -- p:"jack night" is:stream -remix
     Dump {
-        /// Track ID, or substring of title/artist. Omit to dump everything.
-        query: Option<String>,
-        /// Maximum number of tracks to print. Defaults to 10 when searching by
-        /// substring; unlimited when listing all (no query).
+        /// Track ID, or a search. Omit to dump everything.
+        query: Vec<String>,
+        /// Maximum number of tracks to print. Defaults to 10 when searching;
+        /// unlimited when listing all (no query).
         #[arg(short, long)]
         limit: Option<u32>,
     },
@@ -108,6 +125,17 @@ enum Cmd {
         /// Repeatable, to shop for several tracks in one run.
         #[arg(long, value_name = "ID", conflicts_with = "query")]
         track_id: Vec<String>,
+        /// Shop for every library track matching a search, in the same language
+        /// the TUI's `/` box takes. Combines with --track-id.
+        ///
+        /// e.g. --match 'p:"jn next" is:stream'
+        #[arg(long = "match", value_name = "QUERY", conflicts_with = "query")]
+        match_query: Option<String>,
+        /// Most tracks --match may queue before it refuses. Each one is a
+        /// fan-out across every backend, so this is a guard against shopping
+        /// half the library by accident.
+        #[arg(long, value_name = "N", default_value_t = 25)]
+        match_max: usize,
         /// Restrict to these backends. Repeatable; defaults to all enabled.
         #[arg(long, value_name = "BACKEND")]
         backend: Vec<acquire::BackendId>,
@@ -407,6 +435,8 @@ fn main() -> Result<()> {
         Cmd::Shop {
             query,
             track_id,
+            match_query,
+            match_max,
             backend,
             limit,
             enrich,
@@ -425,6 +455,8 @@ fn main() -> Result<()> {
                 ShopArgs {
                     query: query.join(" "),
                     track_id,
+                    match_query,
+                    match_max,
                     backend,
                     limit,
                     enrich,
@@ -436,11 +468,14 @@ fn main() -> Result<()> {
                 },
             )?
         }
-        Cmd::Dump { query, limit } => dump::run(
-            db.as_ref().expect("dump needs the db"),
-            query.as_deref(),
-            limit,
-        )?,
+        Cmd::Dump { query, limit } => {
+            let query = query::join_argv(&query);
+            dump::run(
+                db.as_ref().expect("dump needs the db"),
+                Some(query.trim()).filter(|q| !q.is_empty()),
+                limit,
+            )?
+        }
         Cmd::Tui => tui::run(db.take().expect("tui needs the db"), safety)?,
         Cmd::Cp {
             src,
@@ -737,7 +772,11 @@ fn needs_database(cmd: &Cmd) -> bool {
     match cmd {
         Cmd::Backends | Cmd::Config { .. } | Cmd::Fp { .. } => false,
         // Only needed to seed the query from an existing track.
-        Cmd::Shop { track_id, .. } => !track_id.is_empty(),
+        Cmd::Shop {
+            track_id,
+            match_query,
+            ..
+        } => !track_id.is_empty() || match_query.is_some(),
         Cmd::Buy { track_id, .. } => track_id.is_some(),
         // Only needed to queue a transfer against an existing track.
         Cmd::Fetch { src_track_id, .. } => src_track_id.is_some(),
@@ -753,6 +792,8 @@ fn needs_database(cmd: &Cmd) -> bool {
 struct ShopArgs {
     query: String,
     track_id: Vec<String>,
+    match_query: Option<String>,
+    match_max: usize,
     backend: Vec<acquire::BackendId>,
     limit: Option<usize>,
     enrich: Option<usize>,
@@ -773,14 +814,28 @@ fn run_shop(
 
     let limit = args.limit.unwrap_or(cfg.search.limit);
 
+    // `--match` is just a way of naming track ids, so it resolves to some and
+    // then takes the same path — one spec builder, one set of labels.
+    let mut track_ids = args.track_id.clone();
+    if let Some(q) = &args.match_query {
+        let db = db.ok_or_else(|| anyhow::anyhow!("--match needs the rekordbox database"))?;
+        let hits = rekord_ripper::select::hits(db, q, args.match_max)?;
+        eprintln!("--match {q:?} selected {} track(s):", hits.len());
+        for h in &hits {
+            let artist = if h.artist.is_empty() { "?" } else { &h.artist };
+            eprintln!("  {} — {}", artist, h.title);
+        }
+        track_ids.extend(hits.into_iter().map(|h| h.id));
+    }
+
     // Seed from a local track when asked, so you don't retype what rekordbox
     // already knows.
     // One spec per thing to look for. A single search is one spec, so bulk needs
     // no separate code path here either.
     let mut specs: Vec<shop::QuerySpec> = Vec::new();
-    if !args.track_id.is_empty() {
+    if !track_ids.is_empty() {
         let db = db.ok_or_else(|| anyhow::anyhow!("--track-id needs the rekordbox database"))?;
-        for id in &args.track_id {
+        for id in &track_ids {
             let t = analysis::load_track(db, id)?;
             let Some(title) = t.title.clone().filter(|s| !s.trim().is_empty()) else {
                 eprintln!("skipping track {id}: no title to search for");

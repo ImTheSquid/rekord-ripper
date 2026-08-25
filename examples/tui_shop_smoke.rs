@@ -54,7 +54,7 @@ fn main() -> anyhow::Result<()> {
     loop {
         // Exactly what event_loop does each iteration, minus the input poll.
         let t0 = Instant::now();
-        term.draw(|f| render::draw(f, &app))?;
+        term.draw(|f| render::draw(f, &mut app))?;
         app.poll_rekordbox_if_due();
         app.pump_worker();
         let elapsed = t0.elapsed();
@@ -104,7 +104,7 @@ fn main() -> anyhow::Result<()> {
             let mut worst = Duration::ZERO;
             loop {
                 let t0 = Instant::now();
-                term.draw(|f| render::draw(f, &app))?;
+                term.draw(|f| render::draw(f, &mut app))?;
                 app.pump_worker();
                 worst = worst.max(t0.elapsed());
                 if matches!(app.fetch, FetchState::Done { .. } | FetchState::Failed(_)) {
@@ -216,7 +216,7 @@ fn main() -> anyhow::Result<()> {
         let t = Instant::now();
         let mut seen_counts = Vec::new();
         loop {
-            term.draw(|f| render::draw(f, &app))?;
+            term.draw(|f| render::draw(f, &mut app))?;
             app.pump_worker();
             let n = app.shop.len();
             if seen_counts.last().copied() != Some(n) {
@@ -283,7 +283,7 @@ fn main() -> anyhow::Result<()> {
         if app.shop_selected(25) {
             let t = Instant::now();
             loop {
-                term.draw(|f| render::draw(f, &app))?;
+                term.draw(|f| render::draw(f, &mut app))?;
                 app.pump_worker();
                 // Wait on the worker, not on the state: results may already be
                 // showing from an earlier search.
@@ -324,7 +324,7 @@ fn main() -> anyhow::Result<()> {
 
     // The help screen, to confirm nothing is clipped off the bottom or right.
     app.mode = rekord_ripper::tui::app::InputMode::Help;
-    term.draw(|f| render::draw(f, &app))?;
+    term.draw(|f| render::draw(f, &mut app))?;
     {
         let buf = term.backend().buffer().clone();
         println!("---- HELP ----");
@@ -343,7 +343,7 @@ fn main() -> anyhow::Result<()> {
     app.mode = rekord_ripper::tui::app::InputMode::Normal;
 
     // Show what the shop screen actually looks like.
-    term.draw(|f| render::draw(f, &app))?;
+    term.draw(|f| render::draw(f, &mut app))?;
     let buf = term.backend().buffer().clone();
     for y in 0..buf.area.height {
         let mut line = String::new();

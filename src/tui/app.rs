@@ -360,6 +360,9 @@ pub struct App {
     pub cfg: crate::config::Config,
     pub pending: Option<PendingBatch>,
     pub unresolved_errors: bool,
+    /// First visible line of the help popup. Clamped during render, which is
+    /// the only place the popup's height is known.
+    pub help_scroll: u16,
     /// Set true on the first `q` press when there's unsaved selection state.
     /// Reset by any other key. A second `q` while this is true actually quits.
     pub quit_pending: bool,
@@ -400,6 +403,7 @@ impl App {
             cfg,
             pending: None,
             unresolved_errors: false,
+            help_scroll: 0,
             quit_pending: false,
             should_quit: false,
         };

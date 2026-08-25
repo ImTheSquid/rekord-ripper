@@ -1,9 +1,12 @@
+use std::collections::HashMap;
+
 use anyhow::{Result, anyhow};
 use owo_colors::OwoColorize;
 use rusqlite::{Row, params};
 
 use crate::db::MasterDb;
 use crate::format::{file_type_name, format_bpm, format_length, format_msec, kind_label};
+use crate::query::{Fields, Query, text_blob};
 
 struct Track {
     id: String,
@@ -19,6 +22,8 @@ struct Track {
     analysis_data_path: Option<String>,
     uuid: Option<String>,
     content_link: Option<i64>,
+    service_id: Option<i64>,
+    cue_count: i64,
 }
 
 impl Track {
@@ -37,6 +42,20 @@ impl Track {
             analysis_data_path: row.get("AnalysisDataPath")?,
             uuid: row.get("UUID")?,
             content_link: row.get("ContentLink")?,
+            service_id: row.get("ServiceID")?,
+            cue_count: row.get("cue_count")?,
+        })
+    }
+
+    fn tags(&self) -> String {
+        let path = self.folder_path.as_deref();
+        let origin = crate::format::origin(self.file_type, path, self.service_id);
+        crate::format::track_tags(crate::format::TrackFacts {
+            origin,
+            file_type: self.file_type,
+            cue_count: self.cue_count,
+            locked: self.analysed.unwrap_or(0) & 0x80 != 0,
+            present: crate::presence::check(origin, path),
         })
     }
 }
@@ -77,11 +96,15 @@ pub fn run(db: &MasterDb, query: Option<&str>, limit: Option<u32>) -> Result<()>
 }
 
 const SELECT_TRACK: &str = "
-    SELECT c.ID, c.Title, c.FolderPath, c.FileType, c.BPM, c.Length, c.Analysed,
-           c.AnalysisUpdated, c.CueUpdated, c.AnalysisDataPath, c.UUID, c.ContentLink,
-           a.Name AS ArtistName
+    SELECT c.ID, c.Title, c.FolderPath, c.FileType, c.ServiceID, c.BPM, c.Length,
+           c.Analysed, c.AnalysisUpdated, c.CueUpdated, c.AnalysisDataPath, c.UUID,
+           c.ContentLink, a.Name AS ArtistName,
+           (SELECT COUNT(*) FROM djmdCue
+             WHERE ContentID = c.ID
+               AND (rb_local_deleted = 0 OR rb_local_deleted IS NULL)) AS cue_count
     FROM djmdContent c
-    LEFT JOIN djmdArtist a ON a.ID = c.ArtistID";
+    LEFT JOIN djmdArtist a ON a.ID = c.ArtistID
+    WHERE (c.rb_local_deleted = 0 OR c.rb_local_deleted IS NULL)";
 
 fn find_tracks(db: &MasterDb, query: Option<&str>, limit: Option<u32>) -> Result<Vec<Track>> {
     match query {
@@ -94,25 +117,60 @@ fn find_tracks(db: &MasterDb, query: Option<&str>, limit: Option<u32>) -> Result
             rows.collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(|e| anyhow!("query failed: {e}"))
         }
-        Some(q) => {
-            // If the query is all digits, match it as an exact ContentID;
-            // otherwise search as a Title/Artist substring.
-            let is_id = !q.is_empty() && q.bytes().all(|b| b.is_ascii_digit());
-            let like = format!("%{q}%");
-            let lim: i64 = limit.unwrap_or(10) as i64;
-            let sql = format!(
-                "{SELECT_TRACK}
-                 WHERE (?1 = 1 AND c.ID = ?2)
-                    OR (?1 = 0 AND (c.Title LIKE ?3 OR a.Name LIKE ?3))
-                 ORDER BY c.Title
-                 LIMIT ?4"
-            );
+        // An all-digit query is an exact ContentID. That one stays exact: it is
+        // how the other subcommands hand you a track, and a fuzzy match on it
+        // would be a worse answer, not a kinder one.
+        Some(q) if !q.is_empty() && q.bytes().all(|b| b.is_ascii_digit()) => {
+            let sql = format!("{SELECT_TRACK} AND c.ID = ?1");
             let mut stmt = db.conn.prepare(&sql)?;
-            let rows = stmt.query_map(params![is_id as i64, q, like, lim], Track::from_row)?;
+            let rows = stmt.query_map(params![q], Track::from_row)?;
             rows.collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(|e| anyhow!("query failed: {e}"))
         }
+        Some(q) => filter_tracks(db, q, limit.unwrap_or(10) as usize),
     }
+}
+
+/// Run the shared filter language over the library.
+///
+/// Filtering here rather than in SQL is what keeps `dump` and the TUI honestly
+/// identical — one parser, one matcher, one answer. The library is a few
+/// thousand rows, so the scan costs less than the ANLZ read that follows it.
+fn filter_tracks(db: &MasterDb, query: &str, limit: usize) -> Result<Vec<Track>> {
+    let parsed = Query::parse(query);
+    let playlists = if parsed.touches_playlists() {
+        crate::playlists::blobs_by_track(db).unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
+
+    let sql = format!("{SELECT_TRACK} ORDER BY c.Title");
+    let mut stmt = db.conn.prepare(&sql)?;
+    let rows = stmt.query_map([], Track::from_row)?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        if out.len() >= limit {
+            break;
+        }
+        let t = row.map_err(|e| anyhow!("query failed: {e}"))?;
+        let text = text_blob(
+            t.title.as_deref().unwrap_or_default(),
+            t.artist.as_deref().unwrap_or_default(),
+        );
+        let tags = t.tags();
+        let fields = Fields {
+            text: &text,
+            playlists: playlists.get(&t.id).map(String::as_str).unwrap_or_default(),
+            tags: &tags,
+            bpm: t.bpm,
+            length: t.length,
+        };
+        if parsed.matches(fields) {
+            out.push(t);
+        }
+    }
+    Ok(out)
 }
 
 fn print_track(db: &MasterDb, t: &Track) -> Result<()> {

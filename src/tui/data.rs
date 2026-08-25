@@ -3,6 +3,7 @@ use rusqlite::Row;
 
 use crate::analysis::{artist_matches, normalize_title};
 use crate::db::MasterDb;
+use crate::query::{Fields, Query};
 
 /// A single row in the TUI's cached track list. Built once per `reload_rows`
 /// call; recomputed only after a successful apply batch.
@@ -23,6 +24,12 @@ pub struct TrackRow {
     pub is_unlocked_cueless_audio: bool,
     /// Lowercased `"{title} {artist}"` for substring search.
     pub search_blob: String,
+    /// Lowercased folder-qualified playlist paths this track is in, one per
+    /// line (`"jack night/jn4"`). Joined rather than kept as a list so a `p:`
+    /// term stays one substring test per row, like `search_blob`.
+    pub playlist_blob: String,
+    /// Space-padded keywords for `is:` / `has:` / `type:`.
+    pub tags: String,
 }
 
 const AUDIO_FILE_TYPES: &[i64] = &[0, 1, 4, 5, 11];
@@ -47,7 +54,7 @@ impl TrackRow {
             .map(|ft| AUDIO_FILE_TYPES.contains(&ft))
             .unwrap_or(false);
         let is_unlocked_cueless_audio = !locked && cue_count == 0 && is_audio;
-        let search_blob = format!("{} {}", title.to_lowercase(), artist.to_lowercase());
+        let search_blob = crate::query::text_blob(&title, &artist);
         Self {
             id,
             title,
@@ -61,6 +68,19 @@ impl TrackRow {
             locked,
             is_unlocked_cueless_audio,
             search_blob,
+            playlist_blob: String::new(),
+            tags: String::new(),
+        }
+    }
+
+    /// The haystacks the filter language searches.
+    pub fn fields(&self) -> Fields<'_> {
+        Fields {
+            text: &self.search_blob,
+            playlists: &self.playlist_blob,
+            tags: &self.tags,
+            bpm: self.bpm,
+            length: self.length,
         }
     }
 
@@ -79,23 +99,36 @@ impl TrackRow {
             0,
         )
     }
+
+    #[cfg(test)]
+    pub(crate) fn with_playlists(mut self, paths: &[&str]) -> Self {
+        self.playlist_blob = paths.join("\n").to_lowercase();
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_tags(mut self, tags: &[&str]) -> Self {
+        self.tags = format!(" {} ", tags.join(" "));
+        self
+    }
 }
 
 /// Re-issue the full track-list query. ~3600 rows, sub-100ms.
 pub fn load_rows(db: &MasterDb) -> Result<Vec<TrackRow>> {
     let sql = "
         SELECT c.ID, c.Title, c.BPM, c.Length, c.Analysed, c.FileType,
-               a.Name AS Artist,
+               c.FolderPath, c.ServiceID, a.Name AS Artist,
                (SELECT COUNT(*) FROM djmdCue
                  WHERE ContentID = c.ID
                    AND (rb_local_deleted = 0 OR rb_local_deleted IS NULL)) AS cue_count
         FROM djmdContent c
         LEFT JOIN djmdArtist a ON a.ID = c.ArtistID
+        WHERE c.rb_local_deleted = 0 OR c.rb_local_deleted IS NULL
         ORDER BY c.Title COLLATE NOCASE";
 
     let mut stmt = db.conn.prepare(sql)?;
     let rows = stmt.query_map([], |r: &Row<'_>| {
-        Ok(TrackRow::from_db(
+        let mut row = TrackRow::from_db(
             r.get("ID")?,
             r.get("Title")?,
             r.get("Artist")?,
@@ -104,9 +137,28 @@ pub fn load_rows(db: &MasterDb) -> Result<Vec<TrackRow>> {
             r.get("Analysed")?,
             r.get("FileType")?,
             r.get("cue_count")?,
-        ))
+        );
+        let path = r.get::<_, Option<String>>("FolderPath")?;
+        let path = path.as_deref();
+        let origin = crate::format::origin(row.file_type, path, r.get("ServiceID")?);
+        row.tags = crate::format::track_tags(crate::format::TrackFacts {
+            origin,
+            file_type: row.file_type,
+            cue_count: row.cue_count,
+            locked: row.locked,
+            present: crate::presence::check(origin, path),
+        });
+        Ok(row)
     })?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    let mut out = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+
+    // A rekordbox version without the playlist tables costs `p:` filtering, not
+    // the track list.
+    let mut playlists = crate::playlists::blobs_by_track(db).unwrap_or_default();
+    for row in &mut out {
+        row.playlist_blob = playlists.remove(&row.id).unwrap_or_default();
+    }
+    Ok(out)
 }
 
 /// Filter composition for the destination column. AND of four predicates:
@@ -120,12 +172,12 @@ pub fn dst_visible(
     fuzzy_from_src: bool,
     duration_tol_secs: i64,
 ) -> Vec<usize> {
-    let q = query.trim().to_lowercase();
+    let q = Query::parse(query);
     let src_id = src.map(|s| s.id.as_str());
     rows.iter()
         .enumerate()
         .filter(|(_, r)| src_id.is_none_or(|id| r.id != id))
-        .filter(|(_, r)| q.is_empty() || r.search_blob.contains(&q))
+        .filter(|(_, r)| q.matches(r.fields()))
         .filter(|(_, r)| !auto || r.is_unlocked_cueless_audio)
         .filter(|(_, r)| match (fuzzy_from_src, src) {
             (true, Some(s)) => fuzzy_match(s, r, duration_tol_secs),
@@ -137,10 +189,10 @@ pub fn dst_visible(
 
 /// Source column filter: just the typed search.
 pub fn src_visible(rows: &[TrackRow], query: &str) -> Vec<usize> {
-    let q = query.trim().to_lowercase();
+    let q = Query::parse(query);
     rows.iter()
         .enumerate()
-        .filter(|(_, r)| q.is_empty() || r.search_blob.contains(&q))
+        .filter(|(_, r)| q.matches(r.fields()))
         .map(|(i, _)| i)
         .collect()
 }
@@ -193,6 +245,51 @@ mod tests {
         assert_eq!(src_visible(&rows, "tang"), vec![1]);
         assert_eq!(src_visible(&rows, ""), vec![0, 1]);
         assert_eq!(src_visible(&rows, "  "), vec![0, 1]);
+    }
+
+    #[test]
+    fn playlist_terms_filter_both_columns() {
+        let rows = vec![
+            row("1", "Apple", "Banana", 12000, 200, 0, 5, false)
+                .with_playlists(&["Jack Night/JN4"]),
+            row("2", "Apple", "Cherry", 12000, 200, 0, 5, false).with_playlists(&["Archive"]),
+            row("3", "Orange", "Banana", 12000, 200, 0, 5, false),
+        ];
+        assert_eq!(src_visible(&rows, "p:jn4"), vec![0]);
+        assert_eq!(src_visible(&rows, "p:\"jack night\" apple"), vec![0]);
+        assert_eq!(src_visible(&rows, "apple"), vec![0, 1]);
+        assert_eq!(src_visible(&rows, "p:jn4 orange"), Vec::<usize>::new());
+        assert_eq!(
+            dst_visible(&rows, "p:archive", false, None, false, 1),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn keyword_terms_filter_the_columns_too() {
+        let rows = vec![
+            row("1", "Apple", "Banana", 12000, 200, 0, 5, false)
+                .with_playlists(&["Jack Night/JN4"])
+                .with_tags(&["local", "present", "flac", "lossless"]),
+            row("2", "Apple", "Cherry", 12000, 200, 0, 19, false)
+                .with_playlists(&["Jack Night/JN4"])
+                .with_tags(&["stream"]),
+            row("3", "Orange", "Banana", 12000, 200, 0, 5, false).with_tags(&["cloud", "flac"]),
+            row("4", "Pear", "Damson", 12000, 200, 0, 5, false)
+                .with_tags(&["local", "missing", "flac"]),
+        ];
+        assert_eq!(src_visible(&rows, "p:jn4 is:stream"), vec![1]);
+        assert_eq!(src_visible(&rows, "-is:stream"), vec![0, 2, 3]);
+        assert_eq!(src_visible(&rows, "type:flac apple"), vec![0]);
+        // Presence is its own axis. A stream has no file and a cloud path
+        // cannot be checked, so neither is swept up by `is:missing`.
+        assert_eq!(src_visible(&rows, "is:missing"), vec![3]);
+        assert_eq!(src_visible(&rows, "is:present"), vec![0]);
+        assert_eq!(src_visible(&rows, "is:local -is:present"), vec![3]);
+        assert_eq!(
+            dst_visible(&rows, "is:cloud", false, None, false, 1),
+            vec![2]
+        );
     }
 
     #[test]

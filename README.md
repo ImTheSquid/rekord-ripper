@@ -32,6 +32,116 @@ can also manually copy with `rekord-ripper cp`, auto copy with
 `rekord-ripper auto`, and dump the database with `rekord-ripper dump`. See the
 help pages for more information.
 
+### Searching your library
+
+Every `/` box in the TUI and `rekord-ripper dump` take the same query, and it
+works the way a web search box does.
+
+```
+burial untrue           both words, anywhere, in any order
+"burial untrue"         the words adjacent, in that order
+burial -remix           has burial, does not have remix
+burial OR zomby         either one (| works too)
+p:jn4                   tracks in the JN4 playlist
+p:"jack night"          quote a name with spaces (playlist: is the long form)
+is:stream               keywords, listed below
+bpm:120-130             numbers, listed below
+p:jn4 burial -is:flac   mix freely — terms are ANDed, OR binds tighter
+```
+
+Two departures from Google. Every term matches as a **substring**, not a whole
+word, because these boxes filter as you type and `buri` has to narrow before
+`burial` is finished. And there is no ranking — a filter keeps a row or drops
+it.
+
+#### Keywords
+
+`is:`, `has:` and `type:` are three spellings of one vocabulary, so whichever
+you reach for first works.
+
+| keyword | matches |
+| --- | --- |
+| `is:local` | rekordbox has a file path for it |
+| `is:cloud` | Cloud Library Sync owns it — a real file, not necessarily downloaded here |
+| `is:stream` | a SoundCloud / Spotify / Apple Music / Beatport link, with no file behind it |
+| `is:present` / `is:missing` | whether that file is actually on this machine |
+| `is:lossless` / `is:lossy` | what you have, when you have a file |
+| `type:flac` etc. | `mp3` `m4a` `flac` `aiff` `wav` |
+| `has:cues` | the track already has cue points |
+| `is:locked` | the lock bit is set |
+
+The three origins are exclusive, so `-is:stream` is how you ask for "has a file
+at all, here or in the cloud". Streaming rows carry no format keyword on
+purpose: `is:lossy` means *you have a lossy file*, which is the question worth
+asking before shopping.
+
+`present` / `missing` is a separate axis, and only local rows get one. A cloud
+path is relative to a sync root this tool cannot locate, and a stream has no
+file, so both are left untagged rather than guessed at. A path belonging to
+another machine — `C:/…` from a synced Windows library, or somebody else's
+`/Users/…` — counts as missing, because this machine genuinely cannot open it.
+The check runs once per load and costs under a millisecond for a few thousand
+tracks; a file deleted behind rekordbox's back shows up after `R`.
+
+The query the shop screen was waiting for:
+
+```
+p:"jn next" is:stream        everything in the next gig that is still a stream
+p:"jn next" is:lossy         …and everything that is only a 128k rip
+is:local is:missing          entries whose file moved or was deleted
+```
+
+`shop --match` takes the same query and shops for everything it selects, so the
+first of those becomes one command:
+
+```bash
+rekord-ripper shop --match 'p:"jn next" is:stream'
+```
+
+It prints what it selected before searching anything, and refuses outright past
+`--match-max` (25 by default) — each track is a fan-out across every backend, so
+the difference between 25 and 2500 is the difference between a minute and a rate
+limit.
+
+#### Numbers
+
+`bpm:` and `len:` (or `length:`) take a value, a comparison, or a span.
+
+```
+bpm:128                 128-something — 128.02 counts, 129.00 does not
+bpm:128.5               more digits, a narrower band
+bpm:>=128  bpm:<130     comparisons
+bpm:120-130             a span, inclusive at both ends (120..130 too)
+len:210  len:3:30  len:3m30s     the same duration, three ways
+len:3m                  three-something minutes
+len:>6m  len:3m-6m      comparisons and spans of duration
+```
+
+A **bare** number covers the precision you typed, because an analysed BPM is
+never exactly 128.00 and a filter that demanded it would be useless. A
+**comparison or span** means exactly the number written — `len:>6m` is "longer
+than six minutes", not "longer than six-something minutes".
+
+A track with no BPM at all matches no `bpm:` term, so `-bpm:>100` keeps the
+unanalysed ones: excluding a property should not also drop the rows that lack
+it.
+
+#### Playlists
+
+Playlist names match against the case-insensitive folder-qualified path, so
+`p:"jack night"` also catches every playlist inside a folder of that name.
+Smart playlists store their membership as a query rekordbox evaluates rather
+than as rows, so they never match.
+
+From the shell, an excluded term's leading `-` is claimed by the flag parser, so
+put the query after a `--`:
+
+```bash
+rekord-ripper dump --limit 5 -- p:"jack night" is:stream -remix
+```
+
+An all-digit query is still an exact track ID, not a search.
+
 ## Acquisition backends
 
 Most of a library ends up on SoundCloud, where the audio is a 128kbps transcode.
@@ -47,6 +157,10 @@ rekord-ripper shop --track-id 12345678 --lossless-only
 
 # Bulk: shop for several tracks in one run, grouped per track.
 rekord-ripper shop --track-id 12345678 --track-id 87654321 --json
+
+# Bulk by search: everything in the next gig that is still a SoundCloud rip.
+rekord-ripper shop --match 'p:"jn next" is:stream'
+rekord-ripper shop --match 'is:lossy bpm:170-176' --match-max 40
 
 # Open the purchase page in your browser. Payment is never automated.
 rekord-ripper buy "burial untrue"
