@@ -749,12 +749,14 @@ impl super::AcquisitionBackend for Soulseek {
             &api::SearchRequest {
                 id: id.clone(),
                 search_text: &text,
-                search_timeout: self.search_window.as_secs(),
+                // Milliseconds on the wire, whatever slskd's docs claim.
+                search_timeout: self.search_window.as_millis() as u64,
                 // Bounding the peers is what bounds the wall time: slskd's
                 // timeout restarts on every response, so a popular query would
-                // otherwise run far past it.
+                // otherwise run far past it. Deliberately no file limit — that
+                // ends the search early and takes whoever was quickest rather
+                // than whoever has the best copy.
                 response_limit: self.search_limit,
-                file_limit: self.search_limit.saturating_mul(20).max(query.limit),
                 filter_responses: true,
             },
             // Room for the idle window to expire plus a little slack, but never
@@ -1374,6 +1376,8 @@ mod server_tests {
     struct Fake {
         base: String,
         seen: Arc<Mutex<Vec<String>>>,
+        /// (path, request body) for every request that carried one.
+        sent: Arc<Mutex<Vec<(String, String)>>>,
         stop: Arc<AtomicBool>,
         handle: Option<std::thread::JoinHandle<()>>,
     }
@@ -1389,8 +1393,10 @@ mod server_tests {
             listener.set_nonblocking(true).unwrap();
 
             let seen = Arc::new(Mutex::new(Vec::new()));
+            let sent = Arc::new(Mutex::new(Vec::new()));
             let stop = Arc::new(AtomicBool::new(false));
             let (log, halt) = (Arc::clone(&seen), Arc::clone(&stop));
+            let bodies = Arc::clone(&sent);
             let mut handler = handler;
 
             let handle = std::thread::spawn(move || {
@@ -1421,9 +1427,12 @@ mod server_tests {
                                 .then(|| v.trim().parse().ok())?
                         })
                         .unwrap_or(0);
+                    let mut body = String::new();
                     if len > 0 {
-                        let mut body = vec![0u8; len];
-                        let _ = sock.read_exact(&mut body);
+                        let mut raw = vec![0u8; len];
+                        if sock.read_exact(&mut raw).is_ok() {
+                            body = String::from_utf8_lossy(&raw).into_owned();
+                        }
                     }
 
                     let request = head.lines().next().unwrap_or_default().to_string();
@@ -1433,6 +1442,9 @@ mod server_tests {
                     // Path only; the handler matches on that.
                     let path = target.split('?').next().unwrap_or_default().to_string();
                     log.lock().unwrap().push(format!("{method} {path}"));
+                    if !body.is_empty() {
+                        bodies.lock().unwrap().push((path.clone(), body));
+                    }
 
                     let reply = handler(&method, &path);
                     let ctype = if reply.json {
@@ -1455,6 +1467,7 @@ mod server_tests {
             Self {
                 base,
                 seen,
+                sent,
                 stop,
                 handle: Some(handle),
             }
@@ -1481,6 +1494,16 @@ mod server_tests {
 
         fn asked(&self) -> Vec<String> {
             self.seen.lock().unwrap().clone()
+        }
+
+        /// The body sent to the first request whose path contains `needle`.
+        fn body_for(&self, needle: &str) -> Option<serde_json::Value> {
+            self.sent
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(p, _)| p.contains(needle))
+                .and_then(|(_, b)| serde_json::from_str(b).ok())
         }
     }
 
@@ -1569,6 +1592,43 @@ mod server_tests {
                 .any(|a| a.starts_with("DELETE /api/v0/searches/")),
             "our search should not be left in slskd's history: {asked:?}"
         );
+    }
+
+    #[test]
+    fn the_search_window_goes_on_the_wire_in_milliseconds() {
+        // The bug this guards, and it cost hours: slskd documents searchTimeout
+        // as seconds but passes it to Soulseek.NET, where it is milliseconds.
+        // Sending 8 asked for an 8ms search, which completes instantly with zero
+        // responses — indistinguishable from a dead connection.
+        let d = Fake::start(|method, path| {
+            if method == "POST" {
+                return json_reply(200, json!({"isComplete": true}));
+            }
+            if path.ends_with("/responses") {
+                return json_reply(200, responses());
+            }
+            if method == "GET" && path.starts_with("/api/v0/searches/") {
+                return json_reply(200, json!({"isComplete": true}));
+            }
+            empty_reply(204)
+        });
+
+        d.backend(|c| c.search_window_secs = 8)
+            .search(&SearchQuery::from_text("burial untrue", 10))
+            .unwrap();
+
+        let body = d.body_for("/searches").expect("the search POST had a body");
+        assert_eq!(
+            body["searchTimeout"], 8000,
+            "8 seconds must be sent as 8000ms, got {}",
+            body["searchTimeout"]
+        );
+        // A file limit ends the search early and takes whoever answered first.
+        assert!(
+            body.get("fileLimit").is_none(),
+            "no fileLimit should be sent: {body}"
+        );
+        assert_eq!(body["responseLimit"], 50);
     }
 
     #[test]
