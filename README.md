@@ -17,6 +17,11 @@ cargo install rekord-ripper
 brew install yt-dlp ffmpeg
 ```
 
+The Soulseek backend needs a reachable [slskd](https://github.com/slskd/slskd).
+It is optional — until you configure one, Soulseek reports itself as unconfigured
+and the other backends carry on. Running it somewhere always-on is the point: a
+Soulseek queue position can take hours, and a laptop that sleeps loses it.
+
 Run `rekord-ripper backends` at any time to see what is configured and what is
 missing.
 
@@ -30,9 +35,10 @@ help pages for more information.
 ## Acquisition backends
 
 Most of a library ends up on SoundCloud, where the audio is a 128kbps transcode.
-The same tracks are usually buyable in lossless on Bandcamp. These commands find
-them, help you buy them, fetch the file, and move your cue points and beat grid
-onto it.
+The same tracks are usually buyable in lossless on Bandcamp, and the ones that
+were never for sale anywhere are usually on Soulseek. These commands find them,
+help you buy them, fetch the file, and move your cue points and beat grid onto
+it.
 
 ```bash
 # Search every backend at once and compare what is on offer.
@@ -77,8 +83,63 @@ already a fan-out across every backend, so firing several at once would multiply
 requests per backend and invite a rate limit.
 
 Backends implement the `AcquisitionBackend` trait, so adding another is a matter
-of implementing search, enrich, purchase and fetch. Bandcamp and SoundCloud ship
-with it.
+of implementing search, enrich, purchase and fetch. Bandcamp, SoundCloud and
+Soulseek ship with it.
+
+### Soulseek
+
+Soulseek offers are free and carry their real format — slskd reports the
+extension, the bitrate, and whether a lossy encode is VBR — so a FLAC from
+Soulseek competes with a Bandcamp purchase on the same row and can win. There is
+nothing to buy, so `buy` has nothing to do with them. Files a peer has locked
+behind their own sharing rules are never offered, since a fetch could not
+deliver one.
+
+```toml
+[soulseek]
+url = "https://slskd.example.com:5030"   # the slskd API
+files_url = "https://slskd.example.com/files"
+```
+
+```toml
+# credentials.toml, mode 600
+[soulseek]
+api_key = "..."            # slskd --generate-secret 32, role readwrite
+files_user = "ripper"      # only if the files route is protected
+files_password = "..."
+```
+
+**`files_url` is the part that needs explaining.** slskd's API can list and
+delete files in its download directory but cannot hand over their bytes — there
+is no endpoint for it. So when slskd is on another machine, point `files_url` at
+that directory served over HTTP and rekord-ripper fetches from there. One Caddy
+route next to the API does it:
+
+```
+handle_path /files/* {
+    root * /var/slskd/downloads
+    basicauth { ripper <bcrypt hash> }
+    file_server
+}
+```
+
+Leave `files_url` empty when the download directory is reachable as a path — a
+local slskd, or a mounted share — and the file is moved rather than downloaded.
+Each fetch stages into `rekord-ripper/<id>/` under slskd's download directory and
+removes it again once the bytes are here and the size checks out; that cleanup
+needs slskd's `remote_file_management` enabled and is skipped quietly without it
+(`clean_up_remote = false` turns it off).
+
+Two behaviours worth knowing:
+
+- **A search blocks, and `search_limit` is what bounds it.**
+  `search_window_secs` (8, minimum 5) is slskd's *idle* timeout — it restarts on
+  every response — so on a popular query the peer cap is what actually stops it.
+- **`fetch_timeout_secs` (1800) is when rekord-ripper stops waiting, not when the
+  transfer stops.** It is left running in slskd, and fetching the same offer
+  again attaches to it rather than starting over, because the batch id is derived
+  from the offer. A queue position you have already waited hours for is not worth
+  throwing away.
 
 ### Things it deliberately does not do
 
@@ -90,6 +151,12 @@ with it.
 - **Pretend a SoundCloud rip is an upgrade.** Free tracks cap at MP3-128 unless
   the artist enabled the original file, and Go+ tracks are DRM'd and simply fail.
   `fetch` reports the format it actually got and says when it is a downgrade.
+- **Vouch for a Soulseek file's quality.** All a search result carries is a peer's
+  filename and their claimed bitrate, and a `.flac` upscaled from a 128kbps MP3
+  looks identical to a real one from here. The fingerprint gate proves it is the
+  same recording, not that it is a better master.
+- **Run slskd for you.** `backends` says what is missing; managing a long-lived
+  logged-in process is not this tool's job.
 
 ### The fingerprint gate
 
@@ -124,6 +191,12 @@ Bandcamp downloads need the `identity` cookie from a logged-in browser session,
 in `credentials.toml` next to `config.toml` (or `BANDCAMP_IDENTITY` in the
 environment). Keep that file mode 600 — it is a full-account credential, not a
 read-only API key.
+
+Soulseek needs an slskd API key in the same file, as `[soulseek] api_key` or
+`api_key_file` (or `SLSKD_API_KEY`), plus `files_user`/`files_password` if the
+files route is protected. Both are shown under "Acquisition backends" above. Put
+slskd behind TLS if it is reachable from the internet — an API key in a header
+over plain HTTP is a credential in the clear, and it never expires.
 
 Rekordbox has no watch-folder feature, so by default importing a downloaded file
 is a manual drag of the download directory. That costs one drag per batch, not per

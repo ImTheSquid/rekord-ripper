@@ -33,6 +33,8 @@ pub struct Config {
     pub bandcamp: Bandcamp,
     #[serde(default)]
     pub soundcloud: SoundCloud,
+    #[serde(default)]
+    pub soulseek: Soulseek,
 
     /// Keys we don't recognise, kept so a round-trip doesn't delete them.
     #[serde(flatten, default, skip_serializing_if = "toml::Table::is_empty")]
@@ -136,6 +138,39 @@ pub struct SoundCloud {
     pub extra_args: Vec<String>,
 }
 
+/// Talks to a running [slskd](https://github.com/slskd/slskd) over its REST
+/// API. We never start or stop one — an absent daemon is reported, not fixed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Soulseek {
+    pub enabled: bool,
+    /// The slskd API root, e.g. `https://slskd.example.com:5030`. Empty means
+    /// the backend is unconfigured and reports itself as such.
+    pub url: String,
+    /// Where slskd's completed downloads are served over HTTP, e.g.
+    /// `https://slskd.example.com/files` pointed at its download directory.
+    ///
+    /// Needed because slskd's API can list and delete downloaded files but
+    /// cannot hand over their bytes. Empty means the download directory is
+    /// reachable as a local path on this machine, which is the case for a local
+    /// slskd and for a mounted share.
+    pub files_url: String,
+    /// Idle seconds slskd waits for more search responses before calling a
+    /// search done. slskd requires at least 5. Counted from the *last* response,
+    /// so a busy query runs longer; `search_limit` is what actually bounds it.
+    pub search_window_secs: u64,
+    /// Peers to accept per search before slskd stops early. The main control on
+    /// how long a `shop` waits.
+    pub search_limit: usize,
+    /// Ceiling on one download, queue time included. Hitting it leaves the
+    /// transfer running in slskd; the next `fetch` attaches to it.
+    pub fetch_timeout_secs: u64,
+    /// Remove our staging directory from slskd's download directory once a file
+    /// has been collected and its size verified. Needs slskd's
+    /// `remote_file_management` enabled; without it this is skipped quietly.
+    pub clean_up_remote: bool,
+}
+
 impl Default for General {
     fn default() -> Self {
         Self {
@@ -199,6 +234,21 @@ impl Default for SoundCloud {
             enabled: true,
             yt_dlp_path: "yt-dlp".into(),
             extra_args: Vec::new(),
+        }
+    }
+}
+
+impl Default for Soulseek {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            url: String::new(),
+            files_url: String::new(),
+            // slskd rejects anything below 5.
+            search_window_secs: 8,
+            search_limit: 50,
+            fetch_timeout_secs: 1800,
+            clean_up_remote: true,
         }
     }
 }
@@ -275,6 +325,8 @@ impl std::fmt::Debug for Secret {
 pub struct Credentials {
     #[serde(default)]
     pub bandcamp: BandcampCredentials,
+    #[serde(default)]
+    pub soulseek: SoulseekCredentials,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -291,21 +343,40 @@ pub struct BandcampCredentials {
     pub identity_cookie_file: Option<String>,
 }
 
-/// Where a credential came from, for `backends` output.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SoulseekCredentials {
+    /// An slskd API key, sent as `X-API-Key`. Generate one with
+    /// `slskd --generate-secret 32` and give it the `readwrite` role.
+    pub api_key: Secret,
+    /// Read the API key from this file instead. Takes precedence over
+    /// `api_key`.
+    pub api_key_file: Option<String>,
+    /// Username for HTTP basic auth on `files_url`, if it is protected. Not a
+    /// secret on its own, but it lives here to keep the pair together.
+    pub files_user: String,
+    /// Password for HTTP basic auth on `files_url`.
+    pub files_password: Secret,
+    /// Read the files password from this file instead.
+    pub files_password_file: Option<String>,
+}
+
+/// Where a credential came from, for `backends` output. Carries the name of the
+/// variable or key it came from, because each backend has its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredentialSource {
-    Env,
-    File,
+    Env(&'static str),
+    File(&'static str),
     Config,
 }
 
 impl std::fmt::Display for CredentialSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Env => "BANDCAMP_IDENTITY env var",
-            Self::File => "identity_cookie_file",
-            Self::Config => "credentials.toml",
-        })
+        match self {
+            Self::Env(var) => write!(f, "{var} env var"),
+            Self::File(key) => f.write_str(key),
+            Self::Config => f.write_str("credentials.toml"),
+        }
     }
 }
 
@@ -330,7 +401,10 @@ impl Credentials {
         if let Ok(v) = std::env::var("BANDCAMP_IDENTITY")
             && !v.trim().is_empty()
         {
-            return Ok(Some((Secret::new(v), CredentialSource::Env)));
+            return Ok(Some((
+                Secret::new(v),
+                CredentialSource::Env("BANDCAMP_IDENTITY"),
+            )));
         }
         if let Some(f) = self.bandcamp.identity_cookie_file.as_deref()
             && !f.trim().is_empty()
@@ -339,7 +413,10 @@ impl Credentials {
             let v = std::fs::read_to_string(&p)
                 .with_context(|| format!("reading identity_cookie_file {}", p.display()))?;
             if !v.trim().is_empty() {
-                return Ok(Some((Secret::new(v), CredentialSource::File)));
+                return Ok(Some((
+                    Secret::new(v),
+                    CredentialSource::File("identity_cookie_file"),
+                )));
             }
         }
         if !self.bandcamp.identity_cookie.is_empty() {
@@ -347,6 +424,59 @@ impl Credentials {
                 self.bandcamp.identity_cookie.clone(),
                 CredentialSource::Config,
             )));
+        }
+        Ok(None)
+    }
+
+    /// The slskd API key, in the same precedence order: `SLSKD_API_KEY`, then
+    /// `api_key_file`, then the inline value.
+    pub fn soulseek_api_key(&self) -> Result<Option<(Secret, CredentialSource)>> {
+        Self::resolve(
+            "SLSKD_API_KEY",
+            self.soulseek.api_key_file.as_deref(),
+            "api_key_file",
+            &self.soulseek.api_key,
+        )
+    }
+
+    /// The basic-auth password for `files_url`, same precedence order.
+    pub fn soulseek_files_password(&self) -> Result<Option<(Secret, CredentialSource)>> {
+        Self::resolve(
+            "SLSKD_FILES_PASSWORD",
+            self.soulseek.files_password_file.as_deref(),
+            "files_password_file",
+            &self.soulseek.files_password,
+        )
+    }
+
+    /// Env var, then a file, then the inline value. Factored out because there
+    /// are now several of these and three hand-rolled copies would drift.
+    fn resolve(
+        var: &'static str,
+        file_key_value: Option<&str>,
+        file_key_name: &'static str,
+        inline: &Secret,
+    ) -> Result<Option<(Secret, CredentialSource)>> {
+        if let Ok(v) = std::env::var(var)
+            && !v.trim().is_empty()
+        {
+            return Ok(Some((Secret::new(v), CredentialSource::Env(var))));
+        }
+        if let Some(f) = file_key_value
+            && !f.trim().is_empty()
+        {
+            let p = paths::expand_tilde(f.trim())?;
+            let v = std::fs::read_to_string(&p)
+                .with_context(|| format!("reading {file_key_name} {}", p.display()))?;
+            if !v.trim().is_empty() {
+                return Ok(Some((
+                    Secret::new(v),
+                    CredentialSource::File(file_key_name),
+                )));
+            }
+        }
+        if !inline.is_empty() {
+            return Ok(Some((inline.clone(), CredentialSource::Config)));
         }
         Ok(None)
     }
@@ -379,6 +509,12 @@ mod tests {
         let cfg: Config = toml::from_str("").unwrap();
         assert!(cfg.bandcamp.enabled);
         assert!(cfg.soundcloud.enabled);
+        assert!(cfg.soulseek.enabled);
+        // Unconfigured by default: there is no sensible default slskd address,
+        // so it reports itself as missing rather than guessing at one.
+        assert!(cfg.soulseek.url.is_empty());
+        assert!(cfg.soulseek.files_url.is_empty());
+        assert_eq!(cfg.soulseek.search_window_secs, 8);
         assert_eq!(cfg.search.enrich_top_n, 5);
         assert_eq!(cfg.fingerprint.window_secs, 120);
         // The two dangerous knobs must both be off without being asked for.
@@ -444,6 +580,7 @@ mod tests {
                 identity_cookie: Secret::new("from-config"),
                 identity_cookie_file: None,
             },
+            ..Default::default()
         };
         // Guard against a stray env var in the developer's shell.
         if std::env::var("BANDCAMP_IDENTITY").is_ok() {
