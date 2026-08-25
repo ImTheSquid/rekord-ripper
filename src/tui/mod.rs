@@ -22,6 +22,11 @@ use crate::db::{MasterDb, SafetyOpts};
 use app::App;
 
 pub fn run(db: MasterDb, safety: SafetyOpts) -> Result<()> {
+    // A fingerprint rips streaming sources into a scratch dir, and quitting
+    // mid-gate kills the thread before it can clean up. Nothing else called
+    // this, so the leftovers accumulated forever.
+    let _ = crate::fingerprint::ScratchDir::sweep_stale(Duration::from_secs(24 * 3600));
+
     let mut app = App::new(db, safety)?;
     let mut terminal = setup_terminal()?;
     install_panic_hook();

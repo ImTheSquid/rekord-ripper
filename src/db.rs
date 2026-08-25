@@ -110,7 +110,7 @@ impl MasterDb {
     pub fn backup(&self) -> Result<PathBuf> {
         let backup_dir = backup_dir()?;
         std::fs::create_dir_all(&backup_dir)?;
-        let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+        let stamp = unique_stamp(&backup_dir);
 
         let live = self.app_dir.join("master.db");
         let target = backup_dir.join(format!("master.db.{stamp}.bak"));
@@ -128,6 +128,25 @@ impl MasterDb {
 }
 
 use crate::paths::backup_dir;
+
+/// A stamp no existing backup already uses.
+///
+/// Seconds were not enough. `apply_plan` backs up once per plan, so applying a
+/// batch wrote several backups inside the same second, and `fs::copy` truncates
+/// — leaving one file that claimed to be the pre-change copy but held the state
+/// after every change but the last. Milliseconds make that unlikely; the counter
+/// makes it impossible.
+fn unique_stamp(dir: &std::path::Path) -> String {
+    let base = chrono::Utc::now().format("%Y%m%dT%H%M%S%3fZ").to_string();
+    let taken = |s: &str| dir.join(format!("master.db.{s}.bak")).exists();
+    if !taken(&base) {
+        return base;
+    }
+    (1..)
+        .map(|n| format!("{base}-{n}"))
+        .find(|s| !taken(s))
+        .unwrap_or(base)
+}
 
 /// True if a `rekordbox` process is currently running.
 pub fn rekordbox_running() -> bool {
@@ -181,4 +200,33 @@ pub fn now_db_string() -> String {
     chrono::Utc::now()
         .format("%Y-%m-%d %H:%M:%S%.3f +00:00")
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn back_to_back_backups_never_share_a_name() {
+        // `apply_plan` backs up once per plan, so a batch of transfers took
+        // several backups inside one second. With a seconds-only stamp they all
+        // resolved to one filename and `fs::copy` truncated, leaving a single
+        // file that claimed to predate changes it actually contained.
+        let dir = std::env::temp_dir().join(format!("rr-stamp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut stamps = Vec::new();
+        for _ in 0..5 {
+            let s = unique_stamp(&dir);
+            // What `backup` does next, and what makes the stamp taken.
+            std::fs::write(dir.join(format!("master.db.{s}.bak")), b"x").unwrap();
+            stamps.push(s);
+        }
+
+        let mut unique = stamps.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), stamps.len(), "collided: {stamps:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -414,6 +414,9 @@ fn import_missing(
     if planned.is_empty() {
         return Ok(());
     }
+    // Two downloads by the same new artist would otherwise mint an artist row
+    // each, since planning happens before any of it is inserted.
+    import::dedupe_lookups(&mut planned);
 
     if dry_run {
         for new in &planned {
