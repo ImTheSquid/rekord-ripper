@@ -3,7 +3,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::analysis;
 use crate::db::safety_preflight;
 
-use super::app::{App, Focus, InputMode, PendingBatch, Screen, ShopFocus};
+use super::app::{App, ConfirmKind, Focus, InputMode, PendingBatch, Screen, ShopFocus};
 
 /// Most tracks one `S` will queue at once.
 ///
@@ -38,7 +38,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         },
         InputMode::Search(focus) => handle_search(app, key, focus),
         InputMode::ShopSearch => handle_shop_search(app, key),
-        InputMode::Confirm => handle_confirm(app, key),
+        InputMode::Confirm(kind) => handle_confirm(app, kind, key),
         InputMode::Help => handle_help(app, key),
     }
 }
@@ -60,6 +60,7 @@ fn handle_pending(app: &mut App, key: KeyEvent) {
         (KeyCode::Char('g'), _) => app.queue.jump_top(),
         (KeyCode::Char('G'), _) => app.queue.jump_bottom(),
         (KeyCode::Char('R'), _) => app.reload_queue(),
+        (KeyCode::Char('i'), _) => app.start_import(),
         _ => {}
     }
 }
@@ -275,13 +276,22 @@ fn handle_search(app: &mut App, key: KeyEvent, focus: Focus) {
     }
 }
 
-fn handle_confirm(app: &mut App, key: KeyEvent) {
+fn handle_confirm(app: &mut App, kind: ConfirmKind, key: KeyEvent) {
     match (key.code, key.modifiers) {
-        (KeyCode::Char('y'), _) | (KeyCode::Enter, _) => apply_pending(app),
+        (KeyCode::Char('y'), _) | (KeyCode::Enter, _) => match kind {
+            ConfirmKind::Transfer => apply_pending(app),
+            ConfirmKind::ImportRows => app.apply_import_batch(),
+        },
         (KeyCode::Char('n'), _) | (KeyCode::Esc, _) | (KeyCode::Char('q'), _) => {
             app.pending = None;
+            app.import_batch = None;
             app.mode = InputMode::Normal;
         }
+        // The row detail runs to about 24 lines each, so the modal scrolls.
+        (KeyCode::Up, _) | (KeyCode::Char('k'), _) => app.scroll_confirm(-1),
+        (KeyCode::Down, _) | (KeyCode::Char('j'), _) => app.scroll_confirm(1),
+        (KeyCode::PageUp, _) => app.scroll_confirm(-10),
+        (KeyCode::PageDown, _) => app.scroll_confirm(10),
         _ => {}
     }
 }
@@ -319,7 +329,7 @@ fn build_pending(app: &mut App) {
     }
 
     app.pending = Some(PendingBatch { plans, failures });
-    app.mode = InputMode::Confirm;
+    app.mode = InputMode::Confirm(ConfirmKind::Transfer);
 }
 
 fn apply_pending(app: &mut App) {
