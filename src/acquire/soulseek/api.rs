@@ -16,7 +16,7 @@
 //! API lists and deletes, and nothing else. Collecting the file is the caller's
 //! problem — see the parent module.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -29,6 +29,9 @@ const ID: BackendId = BackendId::Soulseek;
 
 /// slskd rejects a search timeout below this.
 pub const MIN_SEARCH_WINDOW_SECS: u64 = 5;
+
+/// How often to ask whether a search has settled.
+const SEARCH_POLL: Duration = Duration::from_millis(500);
 
 // ---------------------------------------------------------------------------
 // Wire types
@@ -79,6 +82,23 @@ pub struct Response {
     /// Reported separately by slskd; we never offer these.
     #[serde(default)]
     pub locked_files: Vec<File>,
+}
+
+/// A search as slskd sees it.
+///
+/// `is_complete` is the only reliable signal that peers have stopped answering.
+/// Note `state` reaching `"Completed, TimedOut"` is the *normal* ending for a
+/// search — the idle timer expiring is how a search finishes — so unlike a
+/// transfer, TimedOut here is not a failure.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Search {
+    #[serde(default)]
+    pub is_complete: bool,
+    #[serde(default)]
+    pub response_count: u32,
+    #[serde(default)]
+    pub file_count: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -276,11 +296,9 @@ impl Client {
     ///
     /// Two requests because slskd's POST blocks until the search settles but
     /// does not promise the responses in its reply.
-    pub fn search(&self, req: &SearchRequest<'_>, window: Duration) -> Result<Vec<Response>> {
+    pub fn search(&self, req: &SearchRequest<'_>, deadline: Instant) -> Result<Vec<Response>> {
         let url = self.url("searches");
-        // Deliberately not `http::agent`: that caps every request at 15s, and a
-        // search legitimately blocks for the whole idle window and then some.
-        let agent = http::download_agent(window + self.budget);
+        let agent = http::agent(self.budget);
         http::with_retries(3, || {
             agent
                 .post(&url)
@@ -290,7 +308,23 @@ impl Client {
             Ok(())
         })?;
 
+        // The POST only *registers* the search: it returns at once with
+        // `state: InProgress` and an empty response list, so reading results
+        // straight away reliably returns nothing. Peers answer over the next few
+        // seconds and `isComplete` is what says they have stopped.
+        while Instant::now() < deadline {
+            std::thread::sleep(SEARCH_POLL);
+            let s: Search = self.get_json(&format!("searches/{}", req.id), "search state")?;
+            if s.is_complete {
+                break;
+            }
+        }
+        // Falling out of that loop on the deadline is fine — whatever arrived is
+        // still worth returning.
+
         let url = self.url(&format!("searches/{}/responses", req.id));
+        // A wide search answers with a lot of JSON, so this one is not held to
+        // the 15s per-request ceiling.
         let agent = http::download_agent(self.budget);
         let body = http::with_retries(3, || {
             agent
