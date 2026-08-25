@@ -42,10 +42,37 @@ pub enum ShopFocus {
 pub enum InputMode {
     Normal,
     Search(Focus),
-    Confirm,
+    /// A modal awaiting y/n. Kinded because `handle_key` dispatches on mode
+    /// *before* screen, so a single `Confirm` meant `y` on any screen ran the
+    /// transfer batch.
+    Confirm(ConfirmKind),
     Help,
     /// Typing into the shop screen's track filter.
     ShopSearch,
+}
+
+/// Which modal is open, and therefore what `y` means.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfirmKind {
+    /// The transfer screen's cp batch.
+    Transfer,
+    /// Creating `djmdContent` rows for queued downloads.
+    ImportRows,
+}
+
+/// Rows a confirmed import will write.
+///
+/// A snapshot, taken when the modal opens and never added to. `pump_worker`
+/// runs on every tick regardless of mode, so a probe landing mid-modal would
+/// otherwise grow the batch between the user reading it and pressing `y` —
+/// which is exactly the gate that exists to get a yes *having seen* the rows.
+pub struct ImportBatch {
+    pub rows: Vec<crate::import::NewContent>,
+    /// The entries those rows belong to, in the same order.
+    pub entry_ids: Vec<i64>,
+    /// Clamped during render, like the help popup: `import::render` is ~24 lines
+    /// a row, so a batch of three overflows any terminal.
+    pub scroll: u16,
 }
 
 /// How far along a track is in the shop screen's track list.
@@ -361,6 +388,8 @@ pub struct App {
     /// failure from inside a key handler.
     pub queue: super::queue::QueueState,
     pub store: Option<crate::pending::PendingStore>,
+    /// The snapshot behind `ConfirmKind::ImportRows`.
+    pub import_batch: Option<ImportBatch>,
     /// First visible line of the help popup. Clamped during render, which is
     /// the only place the popup's height is known.
     pub help_scroll: u16,
@@ -406,6 +435,7 @@ impl App {
             unresolved_errors: false,
             queue: super::queue::QueueState::default(),
             store: crate::pending::PendingStore::open().ok(),
+            import_batch: None,
             help_scroll: 0,
             quit_pending: false,
             should_quit: false,
@@ -578,14 +608,8 @@ impl App {
                 // The queue screen consumes these; until it exists they only
                 // prove the work runs off the event thread.
                 super::worker::Update::Probed(r) => {
-                    let (entry_id, _generation, result) = *r;
-                    match result {
-                        Ok(info) => self.status.ok(format!(
-                            "#{entry_id}: read {}s of audio",
-                            info.length_secs()
-                        )),
-                        Err(why) => self.status.err(format!("#{entry_id}: {why}")),
-                    }
+                    let (entry_id, generation, result) = *r;
+                    self.on_probed(entry_id, generation, result);
                 }
                 super::worker::Update::Fingerprinted(r) => {
                     let (entry_id, _generation, result) = *r;
@@ -598,6 +622,10 @@ impl App {
                 }
                 super::worker::Update::Failed(why) => {
                     self.status.err(format!("worker failed: {why}"));
+                    // A dead thread answers nothing. Without this every queued
+                    // row keeps its "working" tag forever and every key is
+                    // refused as already-in-flight.
+                    self.queue.abandon_in_flight(&why);
                     if matches!(self.fetch, FetchState::Running { .. }) {
                         self.fetch = FetchState::Failed(why);
                     } else {
@@ -969,6 +997,205 @@ impl App {
             Some(Ok(entries)) => self.queue.reload(entries),
             Some(Err(e)) => self.status.err(format!("could not read the queue: {e}")),
             None => {}
+        }
+    }
+
+    /// Probe every queued download that rekordbox has no row for.
+    ///
+    /// Gate 1 is checked here rather than at the confirmation: probing a queue
+    /// takes real time, and spending it only to refuse with "edit your config
+    /// file" is not an instruction anyone can act on from inside a TUI.
+    pub fn start_import(&mut self) {
+        if !self.cfg.import.insert_content_rows {
+            self.status.err(
+                "creating rekordbox rows is off — set insert_content_rows = true under [import] \
+                 in your config, or import the files into rekordbox by hand.",
+            );
+            return;
+        }
+        if self.queue.any_in_flight() {
+            self.status.info("already working — give it a moment.");
+            return;
+        }
+
+        // Which entries still need a row. Cheap DB lookups, so they stay here.
+        let needing: Vec<(i64, std::path::PathBuf)> = self
+            .queue
+            .entries
+            .iter()
+            .filter(|e| e.state == crate::pending::State::AwaitingImport)
+            .filter(|e| {
+                crate::pending::find_imported_row(&self.db, &e.acquired_path)
+                    .ok()
+                    .flatten()
+                    .is_none()
+            })
+            .map(|e| (e.id, e.acquired_path.clone()))
+            .collect();
+
+        if needing.is_empty() {
+            self.status
+                .info("every queued download already has a rekordbox row.");
+            return;
+        }
+
+        let generation = self.queue.next_generation();
+        let mut sent = 0;
+        for (entry_id, path) in needing {
+            if !path.exists() {
+                self.queue.set_work(
+                    entry_id,
+                    super::queue::EntryWork::Failed("file is gone".into()),
+                );
+                continue;
+            }
+            let job = super::worker::Job::Probe {
+                entry_id,
+                generation,
+                path,
+            };
+            if self.worker.as_mut().is_some_and(|w| w.submit(job)) {
+                self.queue.set_work(
+                    entry_id,
+                    super::queue::EntryWork::Probing {
+                        since: Instant::now(),
+                        generation,
+                    },
+                );
+                sent += 1;
+            }
+        }
+        if sent == 0 {
+            self.status
+                .err("could not start — the worker is not running.");
+        } else {
+            self.status.info(format!("reading {sent} file(s)…"));
+        }
+    }
+
+    /// A probe came back: plan the row, and open the modal once all are in.
+    pub fn on_probed(
+        &mut self,
+        entry_id: i64,
+        generation: u64,
+        result: Result<crate::audio::AudioInfo, String>,
+    ) {
+        if !self.queue.accepts(entry_id, generation) {
+            return;
+        }
+        let Some(path) = self
+            .queue
+            .entries
+            .iter()
+            .find(|e| e.id == entry_id)
+            .map(|e| e.acquired_path.clone())
+        else {
+            return;
+        };
+
+        let planned = result.and_then(|info| {
+            crate::import::plan_insert(&self.db, &path, &info, None, None)
+                .map_err(|e| e.to_string())
+        });
+        match planned {
+            Ok(new) => self
+                .queue
+                .set_work(entry_id, super::queue::EntryWork::Planned(Box::new(new))),
+            Err(why) => self
+                .queue
+                .set_work(entry_id, super::queue::EntryWork::Failed(why)),
+        }
+        if !self.queue.any_in_flight() {
+            self.open_import_confirm();
+        }
+    }
+
+    /// Snapshot everything planned and show it.
+    fn open_import_confirm(&mut self) {
+        let mut rows = Vec::new();
+        let mut entry_ids = Vec::new();
+        for entry in &self.queue.entries {
+            if let Some(super::queue::EntryWork::Planned(new)) = self.queue.work_for(entry.id) {
+                rows.push((**new).clone());
+                entry_ids.push(entry.id);
+            }
+        }
+        if rows.is_empty() {
+            self.status.warn("nothing could be planned — see the rows.");
+            return;
+        }
+        // One artist row between them, not one each: nothing has been written
+        // yet, so each plan asked the database and none saw the others.
+        crate::import::dedupe_lookups(&mut rows);
+
+        self.import_batch = Some(ImportBatch {
+            rows,
+            entry_ids,
+            scroll: 0,
+        });
+        self.mode = InputMode::Confirm(ConfirmKind::ImportRows);
+    }
+
+    /// Gates 2 and 3 are behind us: write the rows.
+    pub fn apply_import_batch(&mut self) {
+        let Some(batch) = self.import_batch.take() else {
+            self.mode = InputMode::Normal;
+            return;
+        };
+        self.mode = InputMode::Normal;
+
+        if let Err(e) = crate::db::safety_preflight(self.safety) {
+            self.status.err(format!("{e}"));
+            return;
+        }
+        let backup = match self.db.backup() {
+            Ok(p) => p,
+            Err(e) => {
+                self.status
+                    .err(format!("backup failed, nothing written: {e}"));
+                return;
+            }
+        };
+
+        // One insert owns its transaction, so a failure part-way leaves the
+        // earlier rows committed. The backup is the undo; carry on rather than
+        // stranding the rest of the batch.
+        let (mut done, mut failed) = (0usize, Vec::new());
+        for (new, entry_id) in batch.rows.iter().zip(&batch.entry_ids) {
+            match crate::import::insert(&mut self.db, new) {
+                Ok(mut note) => {
+                    note.backup = Some(backup.to_string_lossy().into_owned());
+                    let _ = note.write_beside(&backup);
+                    self.queue.clear_work(*entry_id);
+                    done += 1;
+                }
+                Err(e) => {
+                    failed.push(e.to_string());
+                    self.queue
+                        .set_work(*entry_id, super::queue::EntryWork::Failed(e.to_string()));
+                }
+            }
+        }
+
+        self.reload_queue();
+        let total = batch.rows.len();
+        match failed.first() {
+            None => self.status.ok(format!(
+                "imported {done} row(s). Backup: {}",
+                backup.display()
+            )),
+            Some(first) => {
+                self.unresolved_errors = true;
+                self.status
+                    .err(format!("imported {done}/{total}. Failed → {first}"));
+            }
+        }
+    }
+
+    /// Scroll whichever modal is open.
+    pub fn scroll_confirm(&mut self, delta: i32) {
+        if let Some(batch) = self.import_batch.as_mut() {
+            batch.scroll = (batch.scroll as i32 + delta).max(0) as u16;
         }
     }
 

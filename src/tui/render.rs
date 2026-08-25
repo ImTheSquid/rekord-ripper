@@ -6,7 +6,9 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 
 use crate::format::{file_type_name, format_bpm, format_length};
 
-use super::app::{App, Focus, InputMode, Screen, ShopFocus, ShopTrackState, StatusLevel};
+use super::app::{
+    App, ConfirmKind, Focus, InputMode, Screen, ShopFocus, ShopTrackState, StatusLevel,
+};
 use super::diff::render_pair;
 use crate::library::TrackRow;
 
@@ -19,7 +21,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Screen::Pending => draw_pending_screen(f, app),
     }
     match app.mode {
-        InputMode::Confirm => draw_confirm(f, app),
+        InputMode::Confirm(ConfirmKind::Transfer) => draw_confirm(f, app),
+        InputMode::Confirm(ConfirmKind::ImportRows) => draw_import_confirm(f, app),
         InputMode::Help => draw_help(f, app),
         _ => {}
     }
@@ -262,6 +265,73 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(
         Paragraph::new(app.status.text.as_str()).style(style),
         parts[1],
+    );
+}
+
+/// Gate 2: every row that will be written, before anything is.
+///
+/// It scrolls because `import::render` runs to roughly 24 lines a row, and a
+/// modal that clips would be claiming to show what it is hiding.
+fn draw_import_confirm(f: &mut Frame, app: &mut App) {
+    let Some(batch) = app.import_batch.as_ref() else {
+        return;
+    };
+    let area = popup_area(f.area(), 88, 80);
+    f.render_widget(Clear, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::styled(
+        format!(
+            "{} new row(s) in your rekordbox collection:",
+            batch.rows.len()
+        ),
+        Style::new().bold(),
+    ));
+    lines.push(Line::from(""));
+    for new in &batch.rows {
+        // A one-line summary first, so the common case needs no scrolling.
+        lines.push(Line::styled(
+            format!("  {} — {}", new.title, new.file_name),
+            Style::new().fg(Color::Green).bold(),
+        ));
+        for detail in crate::import::render(new).lines() {
+            lines.push(Line::styled(
+                format!("  {detail}"),
+                Style::new().fg(Color::Gray),
+            ));
+        }
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::styled(
+        "y insert   n cancel   ↑↓ scroll",
+        Style::new().bold(),
+    ));
+
+    let viewport = area.height.saturating_sub(2) as usize;
+    let scroll = clamp_help_scroll(batch.scroll as usize, viewport, lines.len());
+    if let Some(b) = app.import_batch.as_mut() {
+        b.scroll = scroll as u16;
+    }
+
+    let title = if lines.len() > viewport {
+        format!(
+            " CONFIRM IMPORT {}–{} of {} ",
+            scroll + 1,
+            (scroll + viewport).min(lines.len()),
+            lines.len()
+        )
+    } else {
+        " CONFIRM IMPORT ".to_string()
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(Color::Yellow))
+        .title(title);
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .scroll((scroll as u16, 0)),
+        area,
     );
 }
 
