@@ -182,4 +182,3 @@ pub fn now_db_string() -> String {
         .format("%Y-%m-%d %H:%M:%S%.3f +00:00")
         .to_string()
 }
-

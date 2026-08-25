@@ -91,7 +91,10 @@ fn try_quit(app: &mut App) {
         bits.push("unresolved apply errors".into());
     }
     if app.shop_outstanding() > 0 {
-        bits.push(format!("{} search(es) still running", app.shop_outstanding()));
+        bits.push(format!(
+            "{} search(es) still running",
+            app.shop_outstanding()
+        ));
     }
     app.status.warn(format!(
         "{}. Press 'q' again to confirm quit.",
@@ -143,8 +146,9 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
         // always the highlighted row, so there is nothing to select on that side.
         (KeyCode::Char(' '), _) => {
             if !matches!(app.focus, Focus::Dst) {
-                app.status
-                    .info("the source is the highlighted row — 's' shops for it, Tab picks destinations.");
+                app.status.info(
+                    "the source is the highlighted row — 's' shops for it, Tab picks destinations.",
+                );
                 return;
             }
             let id = app

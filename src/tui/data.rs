@@ -69,7 +69,16 @@ pub fn fuzzy_match(src: &TrackRow, dst: &TrackRow, tol_secs: i64) -> bool {
 mod tests {
     use super::*;
 
-    fn row(id: &str, title: &str, artist: &str, bpm: i64, length: i64, cue_count: i64, file_type: i64, locked: bool) -> TrackRow {
+    fn row(
+        id: &str,
+        title: &str,
+        artist: &str,
+        bpm: i64,
+        length: i64,
+        cue_count: i64,
+        file_type: i64,
+        locked: bool,
+    ) -> TrackRow {
         TrackRow::from_db(
             id.to_string(),
             Some(title.to_string()),
@@ -143,9 +152,9 @@ mod tests {
     #[test]
     fn dst_auto_mode_filters_to_unlocked_cueless_audio() {
         let rows = vec![
-            row("1", "Track", "A", 12000, 200, 0, 5, false),  // eligible
-            row("2", "Track", "B", 12000, 200, 3, 5, false),  // has cues
-            row("3", "Track", "C", 12000, 200, 0, 5, true),   // locked
+            row("1", "Track", "A", 12000, 200, 0, 5, false), // eligible
+            row("2", "Track", "B", 12000, 200, 3, 5, false), // has cues
+            row("3", "Track", "C", 12000, 200, 0, 5, true),  // locked
             row("4", "Track", "D", 12000, 200, 0, 19, false), // streaming
         ];
         assert_eq!(dst_visible(&rows, "", true, None, false, 1), vec![0]);
@@ -159,10 +168,19 @@ mod tests {
     fn fuzzy_from_src_narrows_to_normalized_title_and_length() {
         let src = row("1", "Ritual Pharmacy", "porf0d", 14600, 221, 4, 19, false);
         let rows = vec![
-            row("2", "Ritual Pharmacy (Edit)", "porf0d", 15000, 221, 0, 5, false), // matches: parens stripped
-            row("3", "Other Song", "porf0d", 14600, 221, 0, 5, false),              // wrong title
-            row("4", "Ritual Pharmacy", "Different", 14600, 221, 0, 5, false),      // wrong artist
-            row("5", "Ritual Pharmacy", "porf0d", 14600, 230, 0, 5, false),         // length too far
+            row(
+                "2",
+                "Ritual Pharmacy (Edit)",
+                "porf0d",
+                15000,
+                221,
+                0,
+                5,
+                false,
+            ), // matches: parens stripped
+            row("3", "Other Song", "porf0d", 14600, 221, 0, 5, false), // wrong title
+            row("4", "Ritual Pharmacy", "Different", 14600, 221, 0, 5, false), // wrong artist
+            row("5", "Ritual Pharmacy", "porf0d", 14600, 230, 0, 5, false), // length too far
         ];
         let vis = dst_visible(&rows, "", false, Some(&src), true, 1);
         assert_eq!(vis, vec![0]); // only row index 0 (id=2) matches
@@ -183,11 +201,11 @@ mod tests {
     fn filters_compose_as_and() {
         let src = row("1", "Foo", "Bar", 12000, 200, 4, 19, false);
         let rows = vec![
-            row("2", "Foo", "Bar", 12000, 200, 0, 5, false),    // matches all
-            row("3", "Foo", "Bar", 12000, 200, 3, 5, false),    // fails auto
-            row("4", "Foo", "Bar", 12000, 200, 0, 5, true),     // fails auto (locked)
-            row("5", "Baz", "Bar", 12000, 200, 0, 5, false),    // fails fuzzy
-            row("6", "Foo", "Bar", 12000, 200, 0, 5, false),    // matches; will fail text
+            row("2", "Foo", "Bar", 12000, 200, 0, 5, false), // matches all
+            row("3", "Foo", "Bar", 12000, 200, 3, 5, false), // fails auto
+            row("4", "Foo", "Bar", 12000, 200, 0, 5, true),  // fails auto (locked)
+            row("5", "Baz", "Bar", 12000, 200, 0, 5, false), // fails fuzzy
+            row("6", "Foo", "Bar", 12000, 200, 0, 5, false), // matches; will fail text
         ];
         // Text filter: just "Foo".
         let vis = dst_visible(&rows, "foo", true, Some(&src), true, 1);

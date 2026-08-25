@@ -67,13 +67,10 @@ impl TrackHeader {
     /// A streaming row holds a service URI here instead (`soundcloud:tracks:…`),
     /// which is not a path, so this returns `None` for those.
     pub fn local_path(&self) -> Option<&str> {
-        [
-            self.folder_path.as_deref(),
-            self.org_folder_path.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        .find(|p| p.starts_with('/') || p.contains(":\\") || p.contains(":/"))
+        [self.folder_path.as_deref(), self.org_folder_path.as_deref()]
+            .into_iter()
+            .flatten()
+            .find(|p| p.starts_with('/') || p.contains(":\\") || p.contains(":/"))
     }
 
     /// The service URI of a streaming row, e.g. `soundcloud:tracks:123`.

@@ -116,9 +116,7 @@ impl Term {
                 // A row with no value simply does not match, so `-bpm:>120`
                 // keeps the unanalysed tracks. Excluding a property nobody can
                 // see should not also exclude the rows that lack it.
-                value.is_some_and(|v| {
-                    lo.is_none_or(|lo| v >= lo) && hi.is_none_or(|hi| v <= hi)
-                })
+                value.is_some_and(|v| lo.is_none_or(|lo| v >= lo) && hi.is_none_or(|hi| v <= hi))
             }
         };
         hit != self.negated
@@ -676,7 +674,9 @@ mod tests {
     #[test]
     fn an_unparseable_range_drops_the_term_rather_than_the_list() {
         // Mid-keystroke states, and outright typos.
-        for q in ["bpm:", "bpm:>", "bpm:12x", "bpm:120-", "len:3m30", "len:1:2"] {
+        for q in [
+            "bpm:", "bpm:>", "bpm:12x", "bpm:120-", "len:3m30", "len:1:2",
+        ] {
             assert!(Query::parse(q).is_empty(), "{q:?} should constrain nothing");
         }
         // Three decimal places is more precision than master.db stores.
@@ -714,7 +714,10 @@ mod tests {
         // into a single phrase and silently drop the operators.
         assert_eq!(argv(&["burial OR zomby"]), "burial OR zomby");
         assert_eq!(argv(&["is:cloud is:lossless"]), "is:cloud is:lossless");
-        assert_eq!(argv(&["p:\"jack night\" -remix"]), "p:\"jack night\" -remix");
+        assert_eq!(
+            argv(&["p:\"jack night\" -remix"]),
+            "p:\"jack night\" -remix"
+        );
     }
 
     #[test]
