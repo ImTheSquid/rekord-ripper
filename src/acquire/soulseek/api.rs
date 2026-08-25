@@ -106,12 +106,20 @@ pub struct Search {
 pub struct SearchRequest<'a> {
     pub id: String,
     pub search_text: &'a str,
-    /// Seconds of quiet before slskd calls the search done. Minimum 5.
+    /// Quiet time before slskd calls the search done, in **milliseconds**.
+    ///
+    /// slskd's own API docs say seconds. They are wrong: the value goes straight
+    /// into Soulseek.NET's `SearchOptions.SearchTimeout`, which is milliseconds,
+    /// and its `[Range(5, …)]` validation happily accepts a value that is
+    /// nonsense as seconds. Sending `8` asks for an eight *millisecond* search,
+    /// which completes instantly as `TimedOut` with zero responses — the same
+    /// symptom as a broken connection, which is what makes it worth a comment
+    /// this long.
     pub search_timeout: u64,
-    /// Stop after this many peers have answered. This, not the timeout, is what
-    /// keeps a popular query from running long.
+    /// Stop after this many peers have answered. The only limit worth setting:
+    /// a `fileLimit` cuts the search off mid-flight, biasing the results towards
+    /// whoever answered first rather than whoever has the best copy.
     pub response_limit: usize,
-    pub file_limit: usize,
     /// Let slskd drop responses that fail its own filters before we see them.
     pub filter_responses: bool,
 }
