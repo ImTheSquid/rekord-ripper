@@ -612,13 +612,8 @@ impl App {
                     self.on_probed(entry_id, generation, result);
                 }
                 super::worker::Update::Fingerprinted(r) => {
-                    let (entry_id, _generation, result) = *r;
-                    match result {
-                        Ok(outcome) => self
-                            .status
-                            .ok(format!("#{entry_id}: {}", outcome.verdict.summary())),
-                        Err(why) => self.status.err(format!("#{entry_id}: {why}")),
-                    }
+                    let (entry_id, generation, result) = *r;
+                    self.on_fingerprinted(entry_id, generation, result);
                 }
                 super::worker::Update::Failed(why) => {
                     self.status.err(format!("worker failed: {why}"));
@@ -1189,6 +1184,296 @@ impl App {
                 self.status
                     .err(format!("imported {done}/{total}. Failed → {first}"));
             }
+        }
+    }
+
+    /// Fingerprint the queued downloads that now have a row, one at a time.
+    ///
+    /// One at a time on purpose. A gate against a streaming source rips it
+    /// before decoding, so ten entries could hold the single worker thread for
+    /// the better part of an hour — and `Worker` has no way to drop queued
+    /// jobs, so there would be no cancel short of killing the TUI.
+    pub fn start_apply(&mut self) {
+        if self.queue.any_in_flight() {
+            self.status.info("already working — give it a moment.");
+            return;
+        }
+        self.queue.next_generation();
+        if !self.submit_next_gate() {
+            self.status
+                .info("nothing to check — import the downloads first with 'i'.");
+        }
+    }
+
+    /// Submit the next entry needing a verdict. False when there are none left.
+    fn submit_next_gate(&mut self) -> bool {
+        let generation = self.queue.current_generation();
+        let candidates: Vec<crate::pending::Entry> = self
+            .queue
+            .entries
+            .iter()
+            .filter(|e| e.state == crate::pending::State::AwaitingImport)
+            .filter(|e| {
+                !matches!(
+                    self.queue.work_for(e.id),
+                    Some(
+                        super::queue::EntryWork::Ready { .. } | super::queue::EntryWork::Failed(_)
+                    )
+                )
+            })
+            .cloned()
+            .collect();
+
+        for entry in candidates {
+            // Resolved now, and the plan is built against this id rather than a
+            // fresh lookup when the verdict lands.
+            let Some(dst_content_id) =
+                crate::pending::find_imported_row(&self.db, &entry.acquired_path)
+                    .ok()
+                    .flatten()
+            else {
+                continue;
+            };
+            let Ok(src) = crate::analysis::load_track(&self.db, &entry.src_content_id) else {
+                self.queue.set_work(
+                    entry.id,
+                    super::queue::EntryWork::Failed("the source track is gone".into()),
+                );
+                continue;
+            };
+            if src.uuid != entry.src_uuid {
+                self.queue.set_work(
+                    entry.id,
+                    super::queue::EntryWork::Failed("the source track was replaced".into()),
+                );
+                continue;
+            }
+            // A row this tool just inserted has a NULL BPM, so only duration
+            // evidence is available; one rekordbox imported has both.
+            let dst = crate::analysis::load_track(&self.db, &dst_content_id).ok();
+            let (dst_length, dst_bpm) = match &dst {
+                Some(d) => (d.length, d.bpm),
+                None => (None, None),
+            };
+
+            let job = super::worker::Job::Fingerprint {
+                entry_id: entry.id,
+                generation,
+                src: Box::new(src),
+                dst_path: entry.acquired_path.clone(),
+                dst_length,
+                dst_bpm,
+            };
+            if self.worker.as_mut().is_some_and(|w| w.submit(job)) {
+                self.queue.set_work(
+                    entry.id,
+                    super::queue::EntryWork::Fingerprinting {
+                        since: Instant::now(),
+                        generation,
+                        dst_content_id,
+                    },
+                );
+                self.status.info(format!(
+                    "fingerprinting {}…",
+                    entry.src_title.as_deref().unwrap_or("the download")
+                ));
+                return true;
+            }
+        }
+        false
+    }
+
+    /// A verdict arrived. Build the plan against the row it was computed for.
+    pub fn on_fingerprinted(
+        &mut self,
+        entry_id: i64,
+        generation: u64,
+        result: Result<crate::transfer::GateOutcome, String>,
+    ) {
+        if !self.queue.accepts(entry_id, generation) {
+            return;
+        }
+        let Some(super::queue::EntryWork::Fingerprinting { dst_content_id, .. }) =
+            self.queue.work_for(entry_id)
+        else {
+            return;
+        };
+        let dst_content_id = dst_content_id.clone();
+        let Some(entry) = self
+            .queue
+            .entries
+            .iter()
+            .find(|e| e.id == entry_id)
+            .cloned()
+        else {
+            return;
+        };
+
+        match result {
+            Err(why) => self
+                .queue
+                .set_work(entry_id, super::queue::EntryWork::Failed(why)),
+            Ok(outcome) if !outcome.verdict.is_accept() => {
+                let why = outcome.verdict.summary();
+                if let Some(store) = self.store.as_ref() {
+                    let _ = store.set_rejected(entry_id, &why);
+                }
+                self.queue
+                    .set_work(entry_id, super::queue::EntryWork::Failed(why));
+            }
+            Ok(outcome) => {
+                // The row the verdict was computed against may have been
+                // replaced while the gate ran. Applying to a different one
+                // would bypass the only real check there is.
+                let still = crate::pending::find_imported_row(&self.db, &entry.acquired_path)
+                    .ok()
+                    .flatten();
+                if still.as_deref() != Some(dst_content_id.as_str()) {
+                    self.queue.set_work(
+                        entry_id,
+                        super::queue::EntryWork::Failed(
+                            "the rekordbox row changed while checking — press 'a' again".into(),
+                        ),
+                    );
+                } else {
+                    let opts = CopyOpts {
+                        replace: entry.replace,
+                        lock: entry.lock,
+                    };
+                    match crate::analysis::build_plan(
+                        &self.db,
+                        &entry.src_content_id,
+                        &dst_content_id,
+                        &opts,
+                    ) {
+                        Ok(plan) => self.queue.set_work(
+                            entry_id,
+                            super::queue::EntryWork::Ready {
+                                plan: Box::new(plan),
+                                verdict: outcome.verdict,
+                            },
+                        ),
+                        Err(e) => self
+                            .queue
+                            .set_work(entry_id, super::queue::EntryWork::Failed(e.to_string())),
+                    }
+                }
+            }
+        }
+
+        // Next in line, or write what is ready.
+        if !self.submit_next_gate() {
+            self.apply_ready();
+        }
+    }
+
+    /// Write every plan the gate accepted.
+    ///
+    /// `apply_plan` takes its own backup per plan, and the store is only moved
+    /// to `Applied` once the write succeeds — a verdict held in memory and lost
+    /// to a quit costs a re-check, where a persisted `Matched` would strand the
+    /// entry somewhere nothing moves it out of.
+    fn apply_ready(&mut self) {
+        let ready: Vec<i64> = self
+            .queue
+            .entries
+            .iter()
+            .map(|e| e.id)
+            .filter(|id| {
+                matches!(
+                    self.queue.work_for(*id),
+                    Some(super::queue::EntryWork::Ready { .. })
+                )
+            })
+            .collect();
+        if ready.is_empty() {
+            self.status.warn("nothing passed the fingerprint check.");
+            return;
+        }
+        if let Err(e) = crate::db::safety_preflight(self.safety) {
+            self.status.err(format!("{e}"));
+            return;
+        }
+
+        let (mut done, mut failed) = (0usize, Vec::new());
+        for id in &ready {
+            // Taken, not borrowed: `Plan` is not `Clone`, and applying it needs
+            // ownership. On failure a `Failed` goes back in its place.
+            let Some(super::queue::EntryWork::Ready { plan, verdict }) = self.queue.take_work(*id)
+            else {
+                continue;
+            };
+            let entry = self.queue.entries.iter().find(|e| e.id == *id).cloned();
+            match crate::analysis::apply_plan(&mut self.db, &plan) {
+                Ok(_backup) => {
+                    // Only now: a verdict written before the transfer landed
+                    // would leave the entry claiming work that never happened.
+                    if let (Some(store), Some(entry)) = (self.store.as_ref(), entry.as_ref()) {
+                        let _ = store.set_matched(*id, &plan.dst.id, &verdict.summary());
+                        let _ = crate::transfer::mark_applied(store, entry);
+                    }
+                    done += 1;
+                }
+                Err(e) => {
+                    failed.push(e.to_string());
+                    self.queue
+                        .set_work(*id, super::queue::EntryWork::Failed(e.to_string()));
+                }
+            }
+        }
+
+        self.reload_queue();
+        match failed.first() {
+            None => self.status.ok(format!("applied {done} transfer(s).")),
+            Some(first) => {
+                self.unresolved_errors = true;
+                self.status
+                    .err(format!("applied {done}/{}. Failed → {first}", ready.len()));
+            }
+        }
+    }
+
+    /// Put a rejected entry back in the running.
+    ///
+    /// `State::is_terminal` is deliberately false for `Rejected`, so a rejection
+    /// is meant to be retryable — after re-encoding a file, or loosening
+    /// `score_max`. The CLI has no way to ask for that; this is it.
+    pub fn retry_selected(&mut self) {
+        let Some(entry) = self.queue.selected().cloned() else {
+            return;
+        };
+        self.queue.clear_work(entry.id);
+        if entry.state != crate::pending::State::AwaitingImport {
+            let Some(store) = self.store.as_ref() else {
+                return;
+            };
+            if let Err(e) = store.set_state(entry.id, crate::pending::State::AwaitingImport) {
+                self.status
+                    .err(format!("could not reset #{}: {e}", entry.id));
+                return;
+            }
+        }
+        self.reload_queue();
+        self.status
+            .info(format!("#{} is back in the queue.", entry.id));
+    }
+
+    /// Drop one entry. Deliberately one at a time: `remove` is a hard delete
+    /// with no undo, so a bulk clear would be a foot-gun.
+    pub fn forget_selected(&mut self) {
+        let Some(entry) = self.queue.selected().cloned() else {
+            return;
+        };
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        match store.remove(entry.id) {
+            Ok(()) => {
+                self.queue.clear_work(entry.id);
+                self.reload_queue();
+                self.status.info(format!("forgot #{}.", entry.id));
+            }
+            Err(e) => self.status.err(format!("could not forget it: {e}")),
         }
     }
 
