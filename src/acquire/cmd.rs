@@ -191,24 +191,49 @@ pub fn fetch(
     }
 
     println!();
-    println!(
-        "{} drag {} into rekordbox to import, then run {}",
-        "next:".bold(),
-        dest.display(),
-        "rekord-ripper pending apply".bold()
-    );
-    println!(
-        "      {}",
-        "(rekordbox has no watch-folder feature, so this step is manual)".dimmed()
-    );
+    if args.src_track_id.is_some() {
+        // The queue knows the source track, so one command finishes the job.
+        println!(
+            "{} {}",
+            "next:".bold(),
+            "rekord-ripper pending apply --import".bold()
+        );
+        println!(
+            "      {}",
+            "(creates the rekordbox row for you; needs insert_content_rows = true)".dimmed()
+        );
+        println!(
+            "      {}",
+            format!(
+                "or drag {} into rekordbox, then `rekord-ripper pending apply`",
+                dest.display()
+            )
+            .dimmed()
+        );
+    } else {
+        println!(
+            "{} {} to add it to your collection, or drag it into rekordbox",
+            "next:".bold(),
+            format!("rekord-ripper import \"{}\" --apply", dest.display()).bold()
+        );
+    }
     Ok(())
 }
 
 /// List, inspect, and act on queued pairings.
 pub enum PendingAction {
     List,
-    Apply { dry_run: bool },
-    Clear { id: i64 },
+    Apply {
+        dry_run: bool,
+        /// Create the `djmdContent` rows for downloads rekordbox has not
+        /// imported, instead of waiting for them to be dragged in.
+        import: bool,
+        /// Skip the confirmation in front of those inserts.
+        yes: bool,
+    },
+    Clear {
+        id: i64,
+    },
 }
 
 pub fn pending(
@@ -266,7 +291,11 @@ pub fn pending(
             }
             Ok(())
         }
-        PendingAction::Apply { dry_run } => apply_pending(db, &store, cfg, safety, dry_run),
+        PendingAction::Apply {
+            dry_run,
+            import,
+            yes,
+        } => apply_pending(db, &store, cfg, safety, dry_run, import, yes),
     }
 }
 
@@ -276,8 +305,17 @@ fn apply_pending(
     cfg: &Config,
     safety: SafetyOpts,
     dry_run: bool,
+    import_missing_rows: bool,
+    yes: bool,
 ) -> Result<()> {
     let waiting = store.in_state(State::AwaitingImport)?;
+
+    // Before anything is fingerprinted: give the files rekordbox has not
+    // imported a row, so they stop reading as "still waiting".
+    if import_missing_rows && !waiting.is_empty() {
+        import_missing(db, cfg, safety, &waiting, dry_run, yes)?;
+    }
+
     if waiting.is_empty() {
         println!("{}", "nothing awaiting import.".dimmed());
     }
@@ -286,15 +324,21 @@ fn apply_pending(
     for entry in waiting {
         match transfer::process(db, store, &entry, cfg)? {
             transfer::Processed::NotImported => {
-                println!(
-                    "{} {} — not in rekordbox yet",
-                    "waiting:".dimmed(),
-                    entry
-                        .acquired_path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default()
-                );
+                let name = entry
+                    .acquired_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                // In a dry run the row above was only planned, so saying "not in
+                // rekordbox yet" would read as a contradiction of it.
+                if import_missing_rows && dry_run {
+                    println!(
+                        "{} {name} — would be imported first, then fingerprint-checked",
+                        "waiting:".dimmed()
+                    );
+                } else {
+                    println!("{} {name} — not in rekordbox yet", "waiting:".dimmed());
+                }
             }
             transfer::Processed::Rejected(why) => {
                 eprintln!("{} #{}: {why}", "fp REJECT".red(), entry.id);
@@ -323,6 +367,105 @@ fn apply_pending(
         }
         transfer::mark_applied(store, entry)?;
         eprintln!("applied: {} → {}", plan.src.id, plan.dst.id);
+    }
+    Ok(())
+}
+
+/// Give queued downloads a `djmdContent` row, so the transfer can run without a
+/// manual drag into rekordbox.
+///
+/// The queue already recorded which source track each file belongs to, so
+/// nothing has to be named again — this fills in the one step that was manual.
+/// It keeps every gate `import` puts in front of row creation: the config
+/// opt-in, an explicit confirmation having seen the rows, and the same
+/// running-rekordbox refusal and backup as `cp`.
+///
+/// A file it cannot plan (an unreadable codec, a row that already exists) is
+/// reported and skipped rather than failing the whole run: one bad download
+/// should not strand the others.
+fn import_missing(
+    db: &mut MasterDb,
+    cfg: &Config,
+    safety: SafetyOpts,
+    waiting: &[crate::pending::Entry],
+    dry_run: bool,
+    yes: bool,
+) -> Result<()> {
+    use crate::{audio, import, pending};
+
+    let mut planned = Vec::new();
+    for entry in waiting {
+        if pending::find_imported_row(db, &entry.acquired_path)?.is_some() {
+            continue;
+        }
+        let name = entry.acquired_path.display();
+        if !entry.acquired_path.exists() {
+            eprintln!("{} #{}: {name} is gone", "skip".yellow(), entry.id);
+            continue;
+        }
+        let planning = audio::probe(&entry.acquired_path)
+            .and_then(|info| import::plan_insert(db, &entry.acquired_path, &info, None, None));
+        match planning {
+            Ok(new) => planned.push(new),
+            Err(e) => eprintln!("{} #{}: {e}", "skip".yellow(), entry.id),
+        }
+    }
+
+    if planned.is_empty() {
+        return Ok(());
+    }
+
+    if dry_run {
+        for new in &planned {
+            println!("{}", import::render(new));
+            println!();
+        }
+        eprintln!(
+            "{} would create {} row(s). Dry-run; pass --apply to write.",
+            "ok:".green(),
+            planned.len()
+        );
+        return Ok(());
+    }
+
+    // Gate 1: the config opt-in.
+    if !cfg.import.insert_content_rows {
+        bail!(
+            "creating rekordbox rows is off. Set `insert_content_rows = true` under \
+             [import] in your config first — see `rekord-ripper config`. \
+             Without it, import the {} file(s) into rekordbox by hand and re-run \
+             without --import.",
+            planned.len()
+        );
+    }
+    // Gate 2: an explicit yes, having seen what would be written.
+    for new in &planned {
+        println!("{}", import::render(new));
+        println!();
+    }
+    if !yes && !confirm(&format!("insert {} row(s) into master.db?", planned.len()))? {
+        bail!("cancelled.");
+    }
+    // Gate 3: the same refusal and backup discipline as cp and auto.
+    db::safety_preflight(safety)?;
+    let backup = db.backup()?;
+    eprintln!("backed up to: {}", backup.display());
+
+    for new in &planned {
+        let mut note = import::insert(db, new)?;
+        note.backup = Some(backup.to_string_lossy().into_owned());
+        let note_path = note.write_beside(&backup)?;
+        eprintln!(
+            "{} {} → row {}",
+            "imported:".green(),
+            new.title,
+            new.id.bold()
+        );
+        eprintln!(
+            "  undo with: {}",
+            format!("rekord-ripper import --undo {} --apply", new.id).bold()
+        );
+        eprintln!("  {}", format!("note: {}", note_path.display()).dimmed());
     }
     Ok(())
 }
