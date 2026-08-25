@@ -5,7 +5,7 @@
 //! holds a trait object.
 //!
 //! An `Offer` is deliberately *not* a track. The crate already has three track
-//! structs (`analysis::TrackHeader`, `dump::Track`, `tui::data::TrackRow`) and
+//! structs (`analysis::TrackHeader`, `dump::Track`, `library::TrackRow`) and
 //! all three are projections of a `djmdContent` row, keyed on an ID a remote
 //! listing does not have. An offer has price, currency, formats and ownership,
 //! and has no UUID, cue count, or `Analysed` bits. Unifying them would produce a
