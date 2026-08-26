@@ -403,8 +403,23 @@ fn import_missing(
             eprintln!("{} #{}: {name} is gone", "skip".yellow(), entry.id);
             continue;
         }
-        let planning = audio::probe(&entry.acquired_path)
-            .and_then(|info| import::plan_insert(db, &entry.acquired_path, &info, None, None));
+        // The download's own tags win; the source track fills the gaps. A rip
+        // usually has neither, and `plan_insert` would otherwise fall back to
+        // the filename stem — a title like "OW：3N - ALL THE LOCALS ARE
+        // LOCALING" with no artist, full-width colon and all, because a real
+        // one cannot go in a filename.
+        let planning = audio::probe(&entry.acquired_path).and_then(|info| {
+            let title = info
+                .tags
+                .title
+                .is_none()
+                .then_some(entry.src_title.as_deref())
+                .flatten();
+            let artist = (info.tags.artist.is_none() && info.tags.album_artist.is_none())
+                .then_some(entry.src_artist.as_deref())
+                .flatten();
+            import::plan_insert(db, &entry.acquired_path, &info, title, artist)
+        });
         match planning {
             Ok(new) => planned.push(new),
             Err(e) => eprintln!("{} #{}: {e}", "skip".yellow(), entry.id),
