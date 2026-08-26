@@ -30,10 +30,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 }
 
 fn draw_transfer(f: &mut Frame, app: &App) {
+    let status = status_bar(app, f.area());
     let outer = Layout::vertical([
-        Constraint::Length(1),                            // top bar
-        Constraint::Min(0),                               // body (columns + preview)
-        Constraint::Length(status_height(app, f.area())), // status bar
+        Constraint::Length(1),                   // top bar
+        Constraint::Min(0),                      // body (columns + preview)
+        Constraint::Length(status.len() as u16), // status bar
     ])
     .split(f.area());
 
@@ -51,7 +52,7 @@ fn draw_transfer(f: &mut Frame, app: &App) {
     draw_column(f, cols[1], app, Focus::Dst);
 
     draw_preview(f, body[1], app);
-    draw_status(f, outer[2], app);
+    f.render_widget(Paragraph::new(status), outer[2]);
 }
 
 fn draw_top_bar(f: &mut Frame, area: Rect, app: &App) {
@@ -254,14 +255,19 @@ fn key_hints(screen: Screen) -> &'static str {
     }
 }
 
-/// Floor on the width the status bar wraps to. `wrap` cannot make progress at
-/// width 0, and nothing readable happens below this anyway.
-const MIN_STATUS_WIDTH: usize = 16;
-
-/// Rows the status bar may take: enough for a wrapped message, never so many
-/// that the body above it disappears.
-fn status_budget(frame: Rect) -> u16 {
-    (frame.height / 3).max(2)
+/// The status bar for this frame: its rows are its height, so the caller lays
+/// itself out around what the bar actually needs.
+fn status_bar(app: &App, frame: Rect) -> Vec<Line<'static>> {
+    // Rows enough for a wrapped message, never so many that the body above it
+    // disappears.
+    let budget = (frame.height / 3).max(2);
+    status_lines(
+        key_hints(app.screen),
+        &app.status.text,
+        app.status.level,
+        frame.width,
+        budget,
+    )
 }
 
 /// The status bar's lines — key hints, then the message, both wrapped.
@@ -276,7 +282,7 @@ fn status_lines(
     width: u16,
     budget: u16,
 ) -> Vec<Line<'static>> {
-    let width = (width as usize).max(MIN_STATUS_WIDTH);
+    let width = width as usize;
     let budget = (budget as usize).max(1);
 
     // Always at least one row, so the bar does not resize under the body the
@@ -304,34 +310,11 @@ fn status_lines(
     };
     let mut out: Vec<Line> = wrap(hints, width)
         .into_iter()
-        .take(budget - msg_rows.len())
+        .take(budget.saturating_sub(msg_rows.len()))
         .map(|s| Line::styled(s, Style::new().fg(Color::DarkGray)))
         .collect();
     out.extend(msg_rows.into_iter().map(|s| Line::styled(s, msg_style)));
     out
-}
-
-/// How tall the status bar wants to be, for the caller's layout.
-fn status_height(app: &App, frame: Rect) -> u16 {
-    status_lines(
-        key_hints(app.screen),
-        &app.status.text,
-        app.status.level,
-        frame.width,
-        status_budget(frame),
-    )
-    .len() as u16
-}
-
-fn draw_status(f: &mut Frame, area: Rect, app: &App) {
-    let lines = status_lines(
-        key_hints(app.screen),
-        &app.status.text,
-        app.status.level,
-        area.width,
-        area.height,
-    );
-    f.render_widget(Paragraph::new(lines), area);
 }
 
 /// Gate 2: every row that will be written, before anything is.
@@ -419,7 +402,7 @@ fn draw_confirm(f: &mut Frame, app: &mut App) {
     let inner = block.inner(area);
     let parts = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
 
-    let plans = batch.plans.len();
+    let plan_count = batch.plans.len();
     let lines = confirm_lines(batch, inner.width as usize);
 
     let viewport = parts[0].height as usize;
@@ -443,7 +426,7 @@ fn draw_confirm(f: &mut Frame, app: &mut App) {
     f.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), parts[0]);
     f.render_widget(
         Paragraph::new(Line::styled(
-            confirm_keys(plans, scrolls, inner.width as usize),
+            confirm_keys(plan_count, scrolls, inner.width as usize),
             Style::new().fg(Color::Cyan).bold(),
         )),
         parts[1],
@@ -452,14 +435,16 @@ fn draw_confirm(f: &mut Frame, app: &mut App) {
 
 /// The modal's key line, shortened before it can be clipped — the keys are the
 /// only way out of a modal, so they are the last thing that may go missing.
-fn confirm_keys(plans: usize, scrolls: bool, width: usize) -> String {
-    let scroll_key = if scrolls { "   ↑↓ scroll" } else { "" };
-    let long = format!("[y/enter] apply {plans}   [n/esc] cancel{scroll_key}");
+fn confirm_keys(plan_count: usize, scrolls: bool, width: usize) -> String {
+    let long = format!(
+        "[y/enter] apply {plan_count}   [n/esc] cancel{}",
+        if scrolls { "   ↑↓ scroll" } else { "" }
+    );
     if long.chars().count() <= width {
         return long;
     }
     let short = format!(
-        "y apply {plans}  n cancel{}",
+        "y apply {plan_count}  n cancel{}",
         if scrolls { "  ↑↓" } else { "" }
     );
     clip_cell(&short, width)
@@ -570,10 +555,11 @@ fn prefixed_rows(prefix: &str, text: &str, style: Style, width: usize) -> Vec<Li
 /// stepping across to DESTINATIONS was reachable and meant nothing at all. Each
 /// screen now owns its own list and its own selection.
 fn draw_shop_screen(f: &mut Frame, app: &App) {
+    let status = status_bar(app, f.area());
     let outer = Layout::vertical([
-        Constraint::Length(1),                            // top bar
-        Constraint::Min(0),                               // tracks + offers
-        Constraint::Length(status_height(app, f.area())), // status bar
+        Constraint::Length(1),                   // top bar
+        Constraint::Min(0),                      // tracks + offers
+        Constraint::Length(status.len() as u16), // status bar
     ])
     .split(f.area());
 
@@ -581,15 +567,16 @@ fn draw_shop_screen(f: &mut Frame, app: &App) {
     let cols = Layout::horizontal([Constraint::Percentage(34), Constraint::Min(0)]).split(outer[1]);
     draw_shop_tracks(f, cols[0], app);
     draw_shop_offers(f, cols[1], app);
-    draw_status(f, outer[2], app);
+    f.render_widget(Paragraph::new(status), outer[2]);
 }
 
 /// The queue of downloads that have not become transfers yet.
 fn draw_pending_screen(f: &mut Frame, app: &App) {
+    let status = status_bar(app, f.area());
     let outer = Layout::vertical([
-        Constraint::Length(1),                            // top bar
-        Constraint::Min(0),                               // the queue
-        Constraint::Length(status_height(app, f.area())), // status bar
+        Constraint::Length(1),                   // top bar
+        Constraint::Min(0),                      // the queue
+        Constraint::Length(status.len() as u16), // status bar
     ])
     .split(f.area());
 
@@ -601,7 +588,7 @@ fn draw_pending_screen(f: &mut Frame, app: &App) {
     f.render_widget(Paragraph::new(Line::from(spans)), outer[0]);
 
     draw_pending_list(f, outer[1], app);
-    draw_status(f, outer[2], app);
+    f.render_widget(Paragraph::new(status), outer[2]);
 }
 
 fn draw_pending_list(f: &mut Frame, area: Rect, app: &App) {
@@ -1806,25 +1793,18 @@ mod tests {
         let msg = "no offers found for “Jane Remover - Music Baby (Hurricane Edit)” \
                    on bandcamp, soundcloud or soulseek — try a shorter search.";
         for width in [20u16, 40, 61, 80, 120, 200] {
-            for height in [6u16, 10, 24, 50] {
-                let frame = Rect {
-                    x: 0,
-                    y: 0,
-                    width,
-                    height,
-                };
-                let budget = status_budget(frame);
+            for budget in [2u16, 3, 8, 16] {
                 for screen in [Screen::Transfer, Screen::Shop, Screen::Pending] {
                     let lines =
                         status_lines(key_hints(screen), msg, StatusLevel::Warn, width, budget);
                     assert!(
                         lines.len() <= budget as usize,
-                        "{} lines at {width}x{height}, budget {budget}",
+                        "{} lines at width {width}, budget {budget}",
                         lines.len()
                     );
                     for l in &lines {
                         assert!(
-                            l.width() <= width.max(MIN_STATUS_WIDTH as u16) as usize,
+                            l.width() <= width as usize,
                             "line {:?} overruns width {width}",
                             l.to_string()
                         );
