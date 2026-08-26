@@ -74,6 +74,14 @@ pub struct QueueState {
     /// which is what tells "press `a`, Esc, press `a`" apart from a retry.
     generation: u64,
     work: HashMap<i64, EntryWork>,
+    /// Entries rekordbox now has a row for.
+    ///
+    /// The store's own `State` stays `AwaitingImport` until the transfer lands,
+    /// so it cannot answer "does this file exist in the collection yet?" — and
+    /// a row that had just been imported went on reading "awaiting import",
+    /// which looked exactly like the import having done nothing. Resolved once
+    /// per reload rather than per frame.
+    has_row: std::collections::HashSet<i64>,
 }
 
 impl QueueState {
@@ -119,6 +127,15 @@ impl QueueState {
 
     pub fn work_for(&self, id: i64) -> Option<&EntryWork> {
         self.work.get(&id)
+    }
+
+    /// Record which entries rekordbox has a row for.
+    pub fn set_rows_present(&mut self, ids: std::collections::HashSet<i64>) {
+        self.has_row = ids;
+    }
+
+    pub fn has_row(&self, id: i64) -> bool {
+        self.has_row.contains(&id)
     }
 
     /// True when the worker already owes an answer for this entry, so a second

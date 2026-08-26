@@ -989,7 +989,24 @@ impl App {
             Err(e) => self.status.warn(format!("sweep failed: {e}")),
         }
         match listed {
-            Some(Ok(entries)) => self.queue.reload(entries),
+            Some(Ok(entries)) => {
+                // Which files rekordbox already has a row for. The store's own
+                // state cannot answer that — it stays `AwaitingImport` until the
+                // transfer lands — so an entry whose row had just been created
+                // still read "awaiting import".
+                let present: std::collections::HashSet<i64> = entries
+                    .iter()
+                    .filter(|e| {
+                        crate::pending::find_imported_row(&self.db, &e.acquired_path)
+                            .ok()
+                            .flatten()
+                            .is_some()
+                    })
+                    .map(|e| e.id)
+                    .collect();
+                self.queue.reload(entries);
+                self.queue.set_rows_present(present);
+            }
             Some(Err(e)) => self.status.err(format!("could not read the queue: {e}")),
             None => {}
         }
@@ -1174,16 +1191,22 @@ impl App {
 
         self.reload_queue();
         let total = batch.rows.len();
-        match failed.first() {
-            None => self.status.ok(format!(
-                "imported {done} row(s). Backup: {}",
-                backup.display()
-            )),
-            Some(first) => {
-                self.unresolved_errors = true;
-                self.status
-                    .err(format!("imported {done}/{total}. Failed → {first}"));
-            }
+        if let Some(first) = failed.first() {
+            self.unresolved_errors = true;
+            self.status
+                .err(format!("imported {done}/{total}. Failed → {first}"));
+            return;
+        }
+        self.status.ok(format!(
+            "imported {done} row(s) — checking fingerprints now. Backup: {}",
+            backup.display()
+        ));
+        // The rows exist only so the transfer can happen, so go straight on to
+        // it rather than leaving the user on a screen that looks unchanged with
+        // no word about what to press. The fingerprint is still the gate, and
+        // it still fails closed.
+        if done > 0 {
+            self.start_apply();
         }
     }
 
