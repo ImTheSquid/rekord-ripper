@@ -343,6 +343,8 @@ impl StatusLine {
 pub struct PendingBatch {
     pub plans: Vec<Plan>,
     pub failures: Vec<(String, String)>, // dst_id, error
+    /// Rows scrolled past in the confirm modal, clamped at draw time.
+    pub scroll: u16,
 }
 
 pub struct App {
@@ -1521,6 +1523,9 @@ impl App {
     /// Scroll whichever modal is open.
     pub fn scroll_confirm(&mut self, delta: i32) {
         if let Some(batch) = self.import_batch.as_mut() {
+            batch.scroll = (batch.scroll as i32 + delta).max(0) as u16;
+        }
+        if let Some(batch) = self.pending.as_mut() {
             batch.scroll = (batch.scroll as i32 + delta).max(0) as u16;
         }
     }

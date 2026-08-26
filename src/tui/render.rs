@@ -7,7 +7,8 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use crate::format::{file_type_name, format_bpm, format_length};
 
 use super::app::{
-    App, ConfirmKind, Focus, InputMode, Screen, ShopFocus, ShopTrackState, StatusLevel,
+    App, ConfirmKind, Focus, InputMode, PendingBatch, Screen, ShopFocus, ShopTrackState,
+    StatusLevel,
 };
 use super::diff::render_pair;
 use crate::library::TrackRow;
@@ -30,9 +31,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
 fn draw_transfer(f: &mut Frame, app: &App) {
     let outer = Layout::vertical([
-        Constraint::Length(1), // top bar
-        Constraint::Min(0),    // body (columns + preview)
-        Constraint::Length(2), // status bar
+        Constraint::Length(1),                            // top bar
+        Constraint::Min(0),                               // body (columns + preview)
+        Constraint::Length(status_height(app, f.area())), // status bar
     ])
     .split(f.area());
 
@@ -239,10 +240,8 @@ fn draw_preview(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn draw_status(f: &mut Frame, area: Rect, app: &App) {
-    let parts = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(area);
-
-    let hints = match app.screen {
+fn key_hints(screen: Screen) -> &'static str {
+    match screen {
         Screen::Transfer => {
             "tab focus  / search  s shop  space pick dest  a auto  f fuzzy  r replace  l lock  enter apply  ? help  q quit"
         }
@@ -252,22 +251,87 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         Screen::Pending => {
             "↑↓ move  i import  a apply  r retry  c forget  R refresh  ? help  esc back"
         }
-    };
-    f.render_widget(
-        Paragraph::new(hints).style(Style::new().fg(Color::DarkGray)),
-        parts[0],
-    );
+    }
+}
 
-    let style = match app.status.level {
+/// Floor on the width the status bar wraps to. `wrap` cannot make progress at
+/// width 0, and nothing readable happens below this anyway.
+const MIN_STATUS_WIDTH: usize = 16;
+
+/// Rows the status bar may take: enough for a wrapped message, never so many
+/// that the body above it disappears.
+fn status_budget(frame: Rect) -> u16 {
+    (frame.height / 3).max(2)
+}
+
+/// The status bar's lines — key hints, then the message, both wrapped.
+///
+/// One unwrapped line each is how "set insert_content_rows = true under
+/// [import]" stopped at the right edge mid-sentence: the advice a message exists
+/// to give is usually in the half that got clipped.
+fn status_lines(
+    hints: &str,
+    msg: &str,
+    level: StatusLevel,
+    width: u16,
+    budget: u16,
+) -> Vec<Line<'static>> {
+    let width = (width as usize).max(MIN_STATUS_WIDTH);
+    let budget = (budget as usize).max(1);
+
+    // Always at least one row, so the bar does not resize under the body the
+    // first time something is said.
+    let mut msg_rows = if msg.is_empty() {
+        vec![String::new()]
+    } else {
+        wrap(msg, width)
+    };
+    // The message outranks the hints, which are all on the help page anyway.
+    if msg_rows.len() > budget {
+        msg_rows.truncate(budget);
+        if let Some(last) = msg_rows.last_mut() {
+            let mut cut: String = last.chars().take(width.saturating_sub(1)).collect();
+            cut.push('…');
+            *last = cut;
+        }
+    }
+
+    let msg_style = match level {
         StatusLevel::Info => Style::new().fg(Color::Gray),
         StatusLevel::Ok => Style::new().fg(Color::Green),
         StatusLevel::Warn => Style::new().fg(Color::Yellow),
         StatusLevel::Err => Style::new().fg(Color::Red).bold(),
     };
-    f.render_widget(
-        Paragraph::new(app.status.text.as_str()).style(style),
-        parts[1],
+    let mut out: Vec<Line> = wrap(hints, width)
+        .into_iter()
+        .take(budget - msg_rows.len())
+        .map(|s| Line::styled(s, Style::new().fg(Color::DarkGray)))
+        .collect();
+    out.extend(msg_rows.into_iter().map(|s| Line::styled(s, msg_style)));
+    out
+}
+
+/// How tall the status bar wants to be, for the caller's layout.
+fn status_height(app: &App, frame: Rect) -> u16 {
+    status_lines(
+        key_hints(app.screen),
+        &app.status.text,
+        app.status.level,
+        frame.width,
+        status_budget(frame),
+    )
+    .len() as u16
+}
+
+fn draw_status(f: &mut Frame, area: Rect, app: &App) {
+    let lines = status_lines(
+        key_hints(app.screen),
+        &app.status.text,
+        app.status.level,
+        area.width,
+        area.height,
     );
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 /// Gate 2: every row that will be written, before anything is.
@@ -337,7 +401,12 @@ fn draw_import_confirm(f: &mut Frame, app: &mut App) {
     );
 }
 
-fn draw_confirm(f: &mut Frame, app: &App) {
+/// Gate 2 for a transfer: every destination that will be written, before any is.
+///
+/// Scrolls, and pins the keys under the rows. Two lines a destination outgrows
+/// the popup at about a dozen of them, and a modal that clips is asking for a
+/// yes to what it is hiding.
+fn draw_confirm(f: &mut Frame, app: &mut App) {
     let Some(batch) = app.pending.as_ref() else {
         return;
     };
@@ -346,21 +415,80 @@ fn draw_confirm(f: &mut Frame, app: &App) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::new().fg(Color::Yellow))
-        .title(" CONFIRM APPLY ");
+        .border_style(Style::new().fg(Color::Yellow));
+    let inner = block.inner(area);
+    let parts = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
 
+    let plans = batch.plans.len();
+    let lines = confirm_lines(batch, inner.width as usize);
+
+    let viewport = parts[0].height as usize;
+    let scroll = clamp_help_scroll(batch.scroll as usize, viewport, lines.len());
+    if let Some(b) = app.pending.as_mut() {
+        b.scroll = scroll as u16;
+    }
+
+    let scrolls = lines.len() > viewport;
+    let title = if scrolls {
+        format!(
+            " CONFIRM APPLY {}–{} of {} ",
+            scroll + 1,
+            (scroll + viewport).min(lines.len()),
+            lines.len()
+        )
+    } else {
+        " CONFIRM APPLY ".to_string()
+    };
+    f.render_widget(block.title(title), area);
+    f.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), parts[0]);
+    f.render_widget(
+        Paragraph::new(Line::styled(
+            confirm_keys(plans, scrolls, inner.width as usize),
+            Style::new().fg(Color::Cyan).bold(),
+        )),
+        parts[1],
+    );
+}
+
+/// The modal's key line, shortened before it can be clipped — the keys are the
+/// only way out of a modal, so they are the last thing that may go missing.
+fn confirm_keys(plans: usize, scrolls: bool, width: usize) -> String {
+    let scroll_key = if scrolls { "   ↑↓ scroll" } else { "" };
+    let long = format!("[y/enter] apply {plans}   [n/esc] cancel{scroll_key}");
+    if long.chars().count() <= width {
+        return long;
+    }
+    let short = format!(
+        "y apply {plans}  n cancel{}",
+        if scrolls { "  ↑↓" } else { "" }
+    );
+    clip_cell(&short, width)
+}
+
+/// The scrolling body of the confirm modal, wrapped to `width`.
+fn confirm_lines(batch: &PendingBatch, width: usize) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
+
     if let Some(p) = batch.plans.first() {
-        let src_title = p.src.title.as_deref().unwrap_or("?");
-        let src_artist = p.src.artist.as_deref().unwrap_or("?");
-        lines.push(Line::from(format!(
-            "src: \"{src_title}\" — {src_artist}   ({})",
-            p.src.id
-        )));
+        let title = p.src.title.as_deref().unwrap_or("?");
+        let artist = p.src.artist.as_deref().unwrap_or("?");
+        let text = format!("\"{title}\" — {artist}   ({})", p.src.id);
+        lines.extend(prefixed_rows("src: ", &text, Style::new(), width));
         lines.push(Line::from(""));
     }
+
     for p in &batch.plans {
         let dst_title = p.dst.title.as_deref().unwrap_or("?");
+        let dst_artist = p.dst.artist.as_deref().unwrap_or("?");
+        let mut rows = prefixed_rows(
+            "  → ",
+            &format!("\"{dst_title}\" — {dst_artist}"),
+            Style::new().bold(),
+            width,
+        );
+        append_id(&mut rows, &p.dst.id, width);
+        lines.extend(rows);
+
         let bpm_pair = match (p.set_bpm, p.dst.bpm) {
             (Some(s), Some(d)) if s != d => {
                 format!("BPM {:.2} → {:.2}", d as f64 / 100.0, s as f64 / 100.0)
@@ -373,22 +501,14 @@ fn draw_confirm(f: &mut Frame, app: &App) {
         } else {
             "len skipped"
         };
-        let dst_artist = p.dst.artist.as_deref().unwrap_or("?");
-        lines.push(Line::from(vec![
-            Span::raw("  → "),
-            Span::styled(
-                format!("\"{dst_title}\" — {dst_artist}"),
-                Style::new().bold(),
-            ),
-            Span::styled(
-                format!("  ({})", p.dst.id),
-                Style::new().fg(Color::DarkGray),
-            ),
-        ]));
-        lines.push(Line::from(format!(
-            "       {bpm_pair}   {cue_delta}   {len}"
-        )));
+        lines.extend(prefixed_rows(
+            "       ",
+            &format!("{bpm_pair}   {cue_delta}   {len}"),
+            Style::new(),
+            width,
+        ));
     }
+
     if !batch.failures.is_empty() {
         lines.push(Line::from(""));
         lines.push(Line::styled(
@@ -396,19 +516,51 @@ fn draw_confirm(f: &mut Frame, app: &App) {
             Style::new().fg(Color::Yellow).bold(),
         ));
         for (dst_id, err) in &batch.failures {
-            lines.push(Line::from(format!("  {dst_id}: {err}")));
+            lines.extend(prefixed_rows(
+                "  ",
+                &format!("{dst_id}: {err}"),
+                Style::new(),
+                width,
+            ));
         }
     }
-    lines.push(Line::from(""));
-    lines.push(Line::styled(
-        format!("[y/enter] apply {}     [n/esc] cancel", batch.plans.len()),
-        Style::new().fg(Color::Cyan).bold(),
-    ));
+    lines
+}
 
-    let para = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .block(block);
-    f.render_widget(para, area);
+/// Put `id` after the last of `rows`, or on a row of its own if it will not fit.
+///
+/// The id is what tells two destinations with the same title apart, so it may
+/// not be the thing that runs off the right edge.
+fn append_id(rows: &mut Vec<Line<'static>>, id: &str, width: usize) {
+    let gray = Style::new().fg(Color::DarkGray);
+    let tail = format!("  ({id})");
+    match rows.last_mut() {
+        Some(last) if last.width() + tail.chars().count() <= width => {
+            last.push_span(Span::styled(tail, gray));
+        }
+        _ => rows.push(Line::from(vec![
+            Span::raw("      "),
+            Span::styled(format!("({id})"), gray),
+        ])),
+    }
+}
+
+/// `text` wrapped to `width` under `prefix`, continuation rows aligned to it.
+fn prefixed_rows(prefix: &str, text: &str, style: Style, width: usize) -> Vec<Line<'static>> {
+    let indent = prefix.chars().count();
+    let pad = " ".repeat(indent);
+    wrap(text, width.saturating_sub(indent))
+        .into_iter()
+        .enumerate()
+        .map(|(i, chunk)| {
+            let lead = if i == 0 {
+                prefix.to_string()
+            } else {
+                pad.clone()
+            };
+            Line::from(vec![Span::raw(lead), Span::styled(chunk, style)])
+        })
+        .collect()
 }
 
 /// The shop screen: a track list on the left, offers on the right.
@@ -419,9 +571,9 @@ fn draw_confirm(f: &mut Frame, app: &App) {
 /// screen now owns its own list and its own selection.
 fn draw_shop_screen(f: &mut Frame, app: &App) {
     let outer = Layout::vertical([
-        Constraint::Length(1), // top bar
-        Constraint::Min(0),    // tracks + offers
-        Constraint::Length(2), // status bar
+        Constraint::Length(1),                            // top bar
+        Constraint::Min(0),                               // tracks + offers
+        Constraint::Length(status_height(app, f.area())), // status bar
     ])
     .split(f.area());
 
@@ -435,9 +587,9 @@ fn draw_shop_screen(f: &mut Frame, app: &App) {
 /// The queue of downloads that have not become transfers yet.
 fn draw_pending_screen(f: &mut Frame, app: &App) {
     let outer = Layout::vertical([
-        Constraint::Length(1), // top bar
-        Constraint::Min(0),    // the queue
-        Constraint::Length(2), // status bar
+        Constraint::Length(1),                            // top bar
+        Constraint::Min(0),                               // the queue
+        Constraint::Length(status_height(app, f.area())), // status bar
     ])
     .split(f.area());
 
@@ -466,7 +618,12 @@ fn draw_pending_list(f: &mut Frame, area: Rect, app: &App) {
         } else {
             "nothing queued. Download something on the shop screen and it lands here."
         };
-        f.render_widget(Paragraph::new(empty).style(Style::new().dim()), inner);
+        f.render_widget(
+            Paragraph::new(empty)
+                .style(Style::new().dim())
+                .wrap(Wrap { trim: true }),
+            inner,
+        );
         return;
     }
 
@@ -1209,6 +1366,8 @@ fn detail_width(content_width: u16) -> usize {
 /// Break `s` into chunks of at most `width` characters, on whitespace where
 /// possible so words stay intact.
 fn wrap(s: &str, width: usize) -> Vec<String> {
+    // Zero would spin the hard-split loop below forever.
+    let width = width.max(1);
     if s.chars().count() <= width {
         return vec![s.to_string()];
     }
@@ -1349,6 +1508,7 @@ TRANSFER SCREEN — copy analysis from one track onto others
   Enter            Build plans and open the confirm modal
   y / Enter        (Confirm) Apply the batch
   n / Esc / q      (Confirm) Cancel
+  ↑ ↓ / PgUp/PgDn  (Confirm) Scroll a batch too tall for the modal
 
 SHOP SCREEN — find and download better copies
   Tab              Switch focus between TRACKS and OFFERS
@@ -1623,6 +1783,138 @@ mod tests {
     fn short_text_is_not_wrapped() {
         assert_eq!(wrap("short", 20), vec!["short".to_string()]);
         assert_eq!(wrap("", 20), vec![String::new()]);
+    }
+
+    /// The regression: the advice was in the clipped half.
+    #[test]
+    fn a_long_message_keeps_its_second_half() {
+        let msg = "creating rekordbox rows is off — set insert_content_rows = true under \
+                   [import] in your config, or import the files into rekordbox by hand.";
+        let lines = status_lines("? help  q quit", msg, StatusLevel::Err, 80, 8);
+        let shown = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        for word in msg.split_whitespace() {
+            assert!(shown.contains(word), "lost {word:?} from {shown:?}");
+        }
+    }
+
+    #[test]
+    fn the_status_bar_fits_the_width_and_the_budget_it_is_given() {
+        let msg = "no offers found for “Jane Remover - Music Baby (Hurricane Edit)” \
+                   on bandcamp, soundcloud or soulseek — try a shorter search.";
+        for width in [20u16, 40, 61, 80, 120, 200] {
+            for height in [6u16, 10, 24, 50] {
+                let frame = Rect {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                };
+                let budget = status_budget(frame);
+                for screen in [Screen::Transfer, Screen::Shop, Screen::Pending] {
+                    let lines =
+                        status_lines(key_hints(screen), msg, StatusLevel::Warn, width, budget);
+                    assert!(
+                        lines.len() <= budget as usize,
+                        "{} lines at {width}x{height}, budget {budget}",
+                        lines.len()
+                    );
+                    for l in &lines {
+                        assert!(
+                            l.width() <= width.max(MIN_STATUS_WIDTH as u16) as usize,
+                            "line {:?} overruns width {width}",
+                            l.to_string()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_message_that_will_not_fit_says_so() {
+        // Nothing may stop mid-word without a mark: a silent cut is the bug.
+        let msg = "a ".repeat(200);
+        let lines = status_lines("hints", &msg, StatusLevel::Err, 20, 3);
+        assert_eq!(lines.len(), 3);
+        assert!(
+            lines.last().unwrap().to_string().ends_with('…'),
+            "expected an ellipsis, got {:?}",
+            lines.last().unwrap().to_string()
+        );
+    }
+
+    #[test]
+    fn a_confirm_row_wraps_under_its_prefix() {
+        let rows = prefixed_rows(
+            "  → ",
+            "\"Jane Remover - Music Baby (Hurricane Edit)\" — Jane Remover",
+            Style::new().bold(),
+            40,
+        );
+        assert!(rows.len() > 1, "should have wrapped");
+        for r in &rows {
+            assert!(r.width() <= 40, "row {:?} overruns 40", r.to_string());
+        }
+        // Continuations line up under the first row's text, not under the arrow.
+        for r in &rows[1..] {
+            assert!(r.to_string().starts_with("    "), "{:?}", r.to_string());
+        }
+    }
+
+    #[test]
+    fn the_destination_id_is_never_the_thing_that_gets_clipped() {
+        for width in [20usize, 30, 48, 64, 120] {
+            let mut rows = prefixed_rows(
+                "  → ",
+                "\"A Title Long Enough To Fill Most Of A Narrow Popup\" — Some Artist",
+                Style::new().bold(),
+                width,
+            );
+            append_id(&mut rows, "4f3c9a21", width);
+            let shown = rows
+                .iter()
+                .map(|r| r.to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(shown.contains("4f3c9a21"), "id lost at {width}: {shown}");
+            for r in &rows {
+                assert!(
+                    r.width() <= width,
+                    "row {:?} overruns {width}",
+                    r.to_string()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_way_out_of_the_modal_fits_the_popup_it_is_drawn_in() {
+        // The popup is 80% of the frame, so a 40-column terminal gives 30 inner
+        // columns — and losing "[n/esc] cancel" there would trap the user.
+        for width in [30usize, 40, 46, 64, 100] {
+            for scrolls in [false, true] {
+                let keys = confirm_keys(999, scrolls, width);
+                assert!(keys.chars().count() <= width, "{keys:?} overruns {width}");
+                assert!(keys.contains("cancel"), "no way out at {width}: {keys:?}");
+                assert_eq!(
+                    keys.contains("↑↓"),
+                    scrolls,
+                    "scroll hint at {width}: {keys:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_message_still_holds_its_row() {
+        // Otherwise the body resizes under the cursor the first time anything is
+        // said.
+        let lines = status_lines(key_hints(Screen::Pending), "", StatusLevel::Info, 120, 8);
+        assert_eq!(lines.len(), 2);
     }
 
     #[test]

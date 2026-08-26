@@ -331,7 +331,11 @@ fn build_pending(app: &mut App) {
         }
     }
 
-    app.pending = Some(PendingBatch { plans, failures });
+    app.pending = Some(PendingBatch {
+        plans,
+        failures,
+        scroll: 0,
+    });
     app.mode = InputMode::Confirm(ConfirmKind::Transfer);
 }
 
