@@ -1095,18 +1095,36 @@ impl App {
         if !self.queue.accepts(entry_id, generation) {
             return;
         }
-        let Some(path) = self
+        let Some(entry) = self
             .queue
             .entries
             .iter()
             .find(|e| e.id == entry_id)
-            .map(|e| e.acquired_path.clone())
+            .cloned()
         else {
             return;
         };
+        let path = entry.acquired_path.clone();
 
         let planned = result.and_then(|info| {
-            crate::import::plan_insert(&self.db, &path, &info, None, None)
+            // The download's own tags win; the source track fills the gaps.
+            //
+            // A rip usually carries no tags at all, and `plan_insert`'s last
+            // resort is the filename stem — which produced a track titled
+            // "OW：3N - ALL THE LOCALS ARE LOCALING" with no artist, and a
+            // full-width colon at that, because a real one cannot go in a
+            // filename. The queue knows what this file is a copy of, so it can
+            // do better than the stem.
+            let title = info
+                .tags
+                .title
+                .is_none()
+                .then_some(entry.src_title.as_deref())
+                .flatten();
+            let artist = (info.tags.artist.is_none() && info.tags.album_artist.is_none())
+                .then_some(entry.src_artist.as_deref())
+                .flatten();
+            crate::import::plan_insert(&self.db, &path, &info, title, artist)
                 .map_err(|e| e.to_string())
         });
         match planned {
