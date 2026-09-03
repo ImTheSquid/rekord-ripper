@@ -344,15 +344,26 @@ impl Client {
         // `state: InProgress` and an empty response list, so reading results
         // straight away reliably returns nothing. Peers answer over the next few
         // seconds and `isComplete` is what says they have stopped.
+        let started = Instant::now();
+        let mut complete = false;
         while Instant::now() < deadline {
             std::thread::sleep(SEARCH_POLL);
             let s: Search = self.get_json(&format!("searches/{}", req.id), "search state")?;
             if s.is_complete {
+                complete = true;
                 break;
             }
         }
-        // Falling out of that loop on the deadline is fine — whatever arrived is
-        // still worth returning.
+        // An unfinished search hands over nothing — `responses` is empty until
+        // slskd files them away — so running out of time is a timeout to report,
+        // not an empty result to show as "no matches".
+        if !complete {
+            return Err(BackendError::Timeout {
+                backend: ID,
+                op: "search",
+                elapsed: started.elapsed(),
+            });
+        }
 
         let url = self.url(&format!("searches/{}/responses", req.id));
         // A wide search answers with a lot of JSON, so this one is not held to
