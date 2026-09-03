@@ -28,9 +28,11 @@ pub fn run(db: MasterDb, safety: SafetyOpts) -> Result<()> {
     // this, so the leftovers accumulated forever.
     let _ = crate::fingerprint::ScratchDir::sweep_stale(Duration::from_secs(24 * 3600));
 
-    // From here on stderr is the alternate screen, and a backend's progress
-    // line would be painted straight onto whatever view is up.
-    crate::acquire::silence_progress();
+    // From here on stderr is the alternate screen, and a backend's progress line
+    // would be painted straight onto whatever view is up. The worker replaces
+    // this with a sink that renders them; a worker that never starts leaves it,
+    // so nothing can reach the screen behind ratatui's back.
+    crate::acquire::route_progress(Box::new(|_| {}));
 
     let mut app = App::new(db, safety)?;
     let mut terminal = setup_terminal()?;

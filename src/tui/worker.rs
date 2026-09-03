@@ -125,6 +125,9 @@ pub enum Update {
         total: usize,
         label: String,
     },
+    /// A line of backend chatter — a queue position, a transfer percentage.
+    /// Advisory: it names no job, so the UI attaches it to whatever is running.
+    Note(String),
     /// Boxed because the outcomes are large and this moves through a channel.
     Finished(Box<Vec<GroupOutcome>>),
     /// A fetch finished. `Ok` carries where the files landed.
@@ -161,7 +164,7 @@ impl Update {
             Self::Probed(_) => Some(JobKind::Probe),
             Self::Fingerprinted(_) => Some(JobKind::Fingerprint),
             // A dead thread ends whatever was in flight; `drain` handles it.
-            Self::Failed(_) | Self::Started | Self::Progress { .. } => None,
+            Self::Failed(_) | Self::Started | Self::Progress { .. } | Self::Note(_) => None,
         }
     }
 }
@@ -191,6 +194,13 @@ impl Worker {
         std::thread::Builder::new()
             .name("rr-shop".into())
             .spawn(move || {
+                // Backend chatter belongs on screen, not on the stderr the TUI
+                // is drawing over. Best-effort: a closed channel just drops it.
+                let notes = up_tx.clone();
+                crate::acquire::route_progress(Box::new(move |line| {
+                    let _ = notes.send(Update::Note(line.to_string()));
+                }));
+
                 let reg = Registry::from_config(&cfg, &creds);
                 // Ends when the UI drops its sender.
                 while let Ok(job) = job_rx.recv() {

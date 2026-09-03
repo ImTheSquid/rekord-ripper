@@ -20,34 +20,39 @@ pub use backend::AcquisitionBackend;
 pub use error::{BackendError, Result};
 pub use types::*;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 use crate::config::{Config, Credentials};
 
-static QUIET: AtomicBool = AtomicBool::new(false);
+/// Where a backend's progress lines go. Unset means stderr.
+type Sink = Box<dyn Fn(&str) + Send + Sync>;
 
-/// Stop backends writing progress to stderr, for whoever owns the screen.
+static SINK: Mutex<Option<Sink>> = Mutex::new(None);
+
+/// Send backend progress somewhere other than stderr.
 ///
-/// Under the TUI, stderr *is* the alternate screen: an `eprintln!` lands
-/// wherever the cursor happens to sit, mid-frame, and stays there until
-/// something else repaints those cells — so a download's progress ends up
-/// spliced through whatever view is up. Not undone; the caller owns the terminal
-/// for the rest of the run.
-pub fn silence_progress() {
-    QUIET.store(true, Ordering::Relaxed);
+/// A queue position that moves twice an hour is the whole story of a Soulseek
+/// download, so it has to reach the user somehow — but under the TUI stderr *is*
+/// the alternate screen, where an `eprintln!` lands wherever the cursor happens
+/// to sit, mid-frame, and stays until something repaints that cell. Whoever owns
+/// the screen takes the lines instead and renders them where they belong.
+pub fn route_progress(sink: Sink) {
+    *SINK.lock().unwrap_or_else(|e| e.into_inner()) = Some(sink);
 }
 
-pub fn progress_is_silenced() -> bool {
-    QUIET.load(Ordering::Relaxed)
+/// One line of backend progress. Prefer the `note!` macro.
+pub fn note_line(line: &str) {
+    match SINK.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        Some(sink) => sink(line),
+        None => eprintln!("{line}"),
+    }
 }
 
 /// `eprintln!` for backend progress and warnings — the chatter a CLI run wants
-/// in its scrollback and a full-screen UI cannot have.
+/// in its scrollback and a full-screen UI needs somewhere of its own.
 macro_rules! note {
     ($($arg:tt)*) => {
-        if !$crate::acquire::progress_is_silenced() {
-            eprintln!($($arg)*);
-        }
+        $crate::acquire::note_line(&format!($($arg)*))
     };
 }
 pub(crate) use note;
@@ -148,6 +153,21 @@ pub fn format_preference(cfg: &Config) -> anyhow::Result<Vec<AudioFormat>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_routed_note_goes_to_the_sink_instead_of_stderr() {
+        // The only test that installs a sink, so it stays installed for the rest
+        // of the run — harmless, since nothing else asserts on stderr.
+        static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        route_progress(Box::new(|line| SEEN.lock().unwrap().push(line.to_string())));
+
+        note!("soulseek: {} at position {}", "queued", 12);
+        assert!(
+            SEEN.lock()
+                .unwrap()
+                .contains(&"soulseek: queued at position 12".to_string())
+        );
+    }
 
     #[test]
     fn default_config_registers_the_enabled_backends() {
