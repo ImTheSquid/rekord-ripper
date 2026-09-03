@@ -745,7 +745,7 @@ impl super::AcquisitionBackend for Soulseek {
         let client = self.client()?;
         let id = uuid::Uuid::new_v4().to_string();
 
-        let responses = client.search(
+        let result = client.search(
             &api::SearchRequest {
                 id: id.clone(),
                 search_text: &text,
@@ -759,16 +759,21 @@ impl super::AcquisitionBackend for Soulseek {
                 response_limit: self.search_limit,
                 filter_responses: true,
             },
-            // Room for the idle window to expire plus a little slack, but never
-            // past the fan-out's own budget — a scoped thread cannot be
-            // abandoned, so overrunning here would hang the whole shop.
-            Instant::now() + (self.search_window + POLL_EVERY).min(self.budget),
-        )?;
+            // The whole budget, because the idle window is not the wall time:
+            // slskd restarts it on every response, so a search that finds
+            // anything finishes at *last answer plus the window*, and it hands
+            // over nothing at all until it has finished. Waiting one window and
+            // a little slack is a race that mostly loses — the symptom being a
+            // query that plainly matches returning no offers. A scoped thread
+            // cannot be abandoned, so the budget is still the hard ceiling.
+            Instant::now() + self.budget,
+        );
 
         // slskd keeps searches in its history for the web UI; ours are noise.
+        // Before the `?`, so an abandoned search is tidied up too.
         client.forget_search(&id);
 
-        Ok(rank_and_truncate(hits_from(&responses), query.limit))
+        Ok(rank_and_truncate(hits_from(&result?), query.limit))
     }
 
     fn purchase(&self, _item: &ItemRef) -> Result<PurchaseFlow> {
@@ -1474,6 +1479,14 @@ mod server_tests {
         }
 
         fn backend(&self, tweak: impl FnOnce(&mut config::Soulseek)) -> Soulseek {
+            self.backend_with_budget(Duration::from_secs(20), tweak)
+        }
+
+        fn backend_with_budget(
+            &self,
+            budget: Duration,
+            tweak: impl FnOnce(&mut config::Soulseek),
+        ) -> Soulseek {
             let mut cfg = config::Soulseek {
                 url: self.base.clone(),
                 files_url: format!("{}/files", self.base),
@@ -1489,7 +1502,7 @@ mod server_tests {
                 },
                 ..Default::default()
             };
-            Soulseek::new(&cfg, &creds, Duration::from_secs(20))
+            Soulseek::new(&cfg, &creds, budget)
         }
 
         fn asked(&self) -> Vec<String> {
@@ -1667,6 +1680,41 @@ mod server_tests {
         assert!(
             state_polls >= 3,
             "should have polled until complete, got {state_polls}"
+        );
+    }
+
+    #[test]
+    fn a_search_that_never_settles_is_a_timeout_not_an_empty_result() {
+        // slskd files its responses away only when the search completes, so
+        // giving up early and reading them yields nothing — which must not be
+        // shown as "the network has no copy of this".
+        let d = Fake::start(|method, path| {
+            if method == "POST" {
+                return json_reply(200, json!({"isComplete": false}));
+            }
+            if path.ends_with("/responses") {
+                return json_reply(200, responses());
+            }
+            json_reply(200, json!({"isComplete": false, "state": "InProgress"}))
+        });
+
+        let err = d
+            .backend_with_budget(Duration::from_secs(1), |_| {})
+            .search(&SearchQuery::from_text("burial untrue", 10))
+            .unwrap_err();
+        assert!(
+            matches!(err, BackendError::Timeout { op: "search", .. }),
+            "got {err:?}"
+        );
+
+        let asked = d.asked();
+        assert!(
+            !asked.iter().any(|a| a.ends_with("/responses")),
+            "an unfinished search has nothing to read: {asked:?}"
+        );
+        assert!(
+            asked.iter().any(|a| a.starts_with("DELETE ")),
+            "the abandoned search is still tidied up: {asked:?}"
         );
     }
 
