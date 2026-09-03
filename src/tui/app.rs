@@ -123,6 +123,9 @@ pub enum FetchState {
     Running {
         since: Instant,
         what: String,
+        /// The backend's last word on it — a queue position, a percentage. None
+        /// until it says something.
+        note: Option<String>,
     },
     Done {
         paths: Vec<std::path::PathBuf>,
@@ -522,6 +525,13 @@ impl App {
                         if t > 1 && !label.is_empty() {
                             *what = format!("{label}  ({}/{t})", d + 1);
                         }
+                    }
+                }
+                super::worker::Update::Note(line) => {
+                    // Only a download has anywhere to put it; a warning raised
+                    // during a search has no row of its own and is dropped.
+                    if let FetchState::Running { note, .. } = &mut self.fetch {
+                        *note = Some(line);
                     }
                 }
                 super::worker::Update::Finished(new_groups) => {
@@ -1636,6 +1646,7 @@ impl App {
         self.fetch = FetchState::Running {
             since: Instant::now(),
             what,
+            note: None,
         };
         true
     }

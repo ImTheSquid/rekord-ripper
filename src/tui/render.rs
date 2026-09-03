@@ -1153,7 +1153,7 @@ fn detail_lines(app: &App, width: u16) -> Vec<Line<'static>> {
     // on and it must never be the part that gets clipped.
     match &app.fetch {
         FetchState::Idle => {}
-        FetchState::Running { since, what } => {
+        FetchState::Running { since, what, note } => {
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("{} downloading ", spinner(Some(*since))),
@@ -1165,6 +1165,14 @@ fn detail_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                     Style::new().fg(Color::DarkGray),
                 ),
             ]));
+            // Its own line: a queue position is the only news for hours, and
+            // appending it would push the title out of a narrow terminal.
+            if let Some(note) = note {
+                lines.push(Line::from(Span::styled(
+                    format!("  {note}"),
+                    Style::new().fg(Color::DarkGray),
+                )));
+            }
         }
         FetchState::Done { paths, queued } => {
             for p in paths {
