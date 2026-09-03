@@ -20,7 +20,37 @@ pub use backend::AcquisitionBackend;
 pub use error::{BackendError, Result};
 pub use types::*;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::config::{Config, Credentials};
+
+static QUIET: AtomicBool = AtomicBool::new(false);
+
+/// Stop backends writing progress to stderr, for whoever owns the screen.
+///
+/// Under the TUI, stderr *is* the alternate screen: an `eprintln!` lands
+/// wherever the cursor happens to sit, mid-frame, and stays there until
+/// something else repaints those cells — so a download's progress ends up
+/// spliced through whatever view is up. Not undone; the caller owns the terminal
+/// for the rest of the run.
+pub fn silence_progress() {
+    QUIET.store(true, Ordering::Relaxed);
+}
+
+pub fn progress_is_silenced() -> bool {
+    QUIET.load(Ordering::Relaxed)
+}
+
+/// `eprintln!` for backend progress and warnings — the chatter a CLI run wants
+/// in its scrollback and a full-screen UI cannot have.
+macro_rules! note {
+    ($($arg:tt)*) => {
+        if !$crate::acquire::progress_is_silenced() {
+            eprintln!($($arg)*);
+        }
+    };
+}
+pub(crate) use note;
 
 /// The enabled backends, in config order.
 ///
@@ -100,10 +130,10 @@ pub fn format_preference(cfg: &Config) -> anyhow::Result<Vec<AudioFormat>> {
     for raw in &cfg.general.format_preference {
         match raw.parse::<AudioFormat>() {
             Ok(f) if f.usable_in_rekordbox() => out.push(f),
-            Ok(f) => eprintln!(
+            Ok(f) => note!(
                 "warning: format_preference lists {f}, which rekordbox cannot read — ignoring"
             ),
-            Err(e) => eprintln!("warning: {e} in format_preference — ignoring"),
+            Err(e) => note!("warning: {e} in format_preference — ignoring"),
         }
     }
     if out.is_empty() {

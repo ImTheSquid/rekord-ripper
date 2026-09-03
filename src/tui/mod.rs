@@ -28,6 +28,10 @@ pub fn run(db: MasterDb, safety: SafetyOpts) -> Result<()> {
     // this, so the leftovers accumulated forever.
     let _ = crate::fingerprint::ScratchDir::sweep_stale(Duration::from_secs(24 * 3600));
 
+    // From here on stderr is the alternate screen, and a backend's progress
+    // line would be painted straight onto whatever view is up.
+    crate::acquire::silence_progress();
+
     let mut app = App::new(db, safety)?;
     let mut terminal = setup_terminal()?;
     install_panic_hook();

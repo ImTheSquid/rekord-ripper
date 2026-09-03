@@ -24,6 +24,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use super::error::{BackendError, Result};
+use super::note;
 use super::types::*;
 use crate::config::{self, CredentialSource, Credentials, Secret};
 
@@ -510,11 +511,11 @@ impl Soulseek {
                 }
                 Err(e) if api::is_conflict(&e) => {
                     if self.is_reusable(client, &id, &staging)? {
-                        eprintln!("soulseek: attaching to a transfer slskd already has");
+                        note!("soulseek: attaching to a transfer slskd already has");
                         return Ok(id);
                     }
                     // Spent: finished, with nothing left behind. Queue it again.
-                    eprintln!("soulseek: the earlier copy is gone; downloading it again");
+                    note!("soulseek: the earlier copy is gone; downloading it again");
                 }
                 Err(e) => return Err(e),
             }
@@ -573,7 +574,7 @@ impl Soulseek {
 
             let line = progress_line(t);
             if line != last {
-                eprintln!("soulseek: {line}");
+                note!("soulseek: {line}");
                 last = line;
             }
 
@@ -597,7 +598,7 @@ impl Soulseek {
                 // Deliberately left running. It is queued on a peer that may be
                 // hours away, and cancelling would throw away a wait already
                 // paid for; the next fetch attaches to it instead.
-                eprintln!(
+                note!(
                     "soulseek: giving up waiting — the transfer is still queued in slskd, \
                      and fetching this offer again will attach to it"
                 );
