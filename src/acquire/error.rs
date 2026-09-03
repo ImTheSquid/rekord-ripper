@@ -47,6 +47,18 @@ pub enum BackendError {
         how_to_fix: String,
     },
 
+    /// Credentials *are* configured and cannot be used: a cookie jar that will
+    /// not decrypt, or a browser we cannot read. Separate from `NoCredentials`
+    /// because it must never be mistaken for "running anonymously is fine" —
+    /// the user believes they are signed in, and silently falling back would
+    /// hand them a transcode while reporting an authenticated session.
+    #[error("{backend}: configured credentials are unusable — {detail} ({how_to_fix})")]
+    CredentialsUnusable {
+        backend: BackendId,
+        detail: String,
+        how_to_fix: String,
+    },
+
     #[error("{backend}: rate limited{}", match retry_after {
         Some(d) => format!(" — retry in {}s", d.as_secs()),
         None => String::new(),
@@ -125,6 +137,7 @@ impl BackendError {
             | Self::NotOwned { backend, .. }
             | Self::AuthExpired { backend, .. }
             | Self::NoCredentials { backend, .. }
+            | Self::CredentialsUnusable { backend, .. }
             | Self::RateLimited { backend, .. }
             | Self::Timeout { backend, .. }
             | Self::Http { backend, .. }
@@ -151,6 +164,7 @@ impl BackendError {
             Self::NotOwned { .. }
                 | Self::AuthExpired { .. }
                 | Self::NoCredentials { .. }
+                | Self::CredentialsUnusable { .. }
                 | Self::ToolMissing { .. }
                 | Self::NoAcceptableFormat { .. }
         )

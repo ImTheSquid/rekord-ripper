@@ -45,6 +45,10 @@ impl Registry {
         if cfg.soundcloud.enabled {
             backends.push(Box::new(soundcloud::SoundCloud::new(
                 &cfg.soundcloud.yt_dlp_path,
+                soundcloud::Cookies::from_config(
+                    &cfg.soundcloud.cookies_from_browser,
+                    &cfg.soundcloud.cookies_file,
+                ),
                 cfg.soundcloud.extra_args.clone(),
                 budget,
             )));

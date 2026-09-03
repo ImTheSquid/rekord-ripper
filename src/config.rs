@@ -133,8 +133,20 @@ pub struct Bandcamp {
 pub struct SoundCloud {
     pub enabled: bool,
     pub yt_dlp_path: String,
-    /// Appended verbatim to every yt-dlp invocation. Output-template and
-    /// progress flags are controlled by rekord-ripper and will be overridden.
+    /// Browser profile to read SoundCloud cookies from, e.g. `firefox` or
+    /// `chrome:Profile 1`. Empty means anonymous.
+    ///
+    /// Anonymous access caps at MP3-128 and cannot fetch an artist-enabled
+    /// original at all; a signed-in session can, and a Go+ session also sees a
+    /// 256 kbps AAC stream. Set this and the format probe stops under-reporting.
+    pub cookies_from_browser: String,
+    /// Netscape-format cookie jar, for when the browser profile is not on this
+    /// machine. `~/` is expanded; nothing else is. Mutually exclusive with
+    /// `cookies_from_browser` — setting both is refused rather than silently
+    /// resolved.
+    pub cookies_file: String,
+    /// Appended verbatim to every yt-dlp invocation. Output-template, progress
+    /// and cookie flags are controlled by rekord-ripper and will be overridden.
     pub extra_args: Vec<String>,
 }
 
@@ -241,6 +253,8 @@ impl Default for SoundCloud {
         Self {
             enabled: true,
             yt_dlp_path: "yt-dlp".into(),
+            cookies_from_browser: String::new(),
+            cookies_file: String::new(),
             extra_args: Vec::new(),
         }
     }

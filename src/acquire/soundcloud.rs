@@ -4,46 +4,255 @@
 //! assembly, and throttling are moving targets that yt-dlp already tracks, and
 //! duplicating that here would mean breaking every time SoundCloud changes.
 //!
-//! Two honest limitations, both surfaced rather than hidden:
+//! Two limitations, both surfaced rather than hidden:
 //!
-//! * A free track caps at MP3-128 unless the artist enabled the original file.
-//!   That is frequently *worse* than what the user already has, so quality is
-//!   reported rather than assumed to be an upgrade.
+//! * A transcode is all most tracks have — `hls_aac_160k` at best. That is
+//!   frequently *worse* than what the user already has, so quality is reported
+//!   rather than assumed to be an upgrade.
 //! * Go+ tracks fail with `This video is DRM protected`. That is a clean
 //!   `Unsupported`, not a bug to work around.
+//!
+//! What login changes, measured rather than assumed. The ordinary ladder
+//! (`hls_mp3`, `hls_aac_96k`, `hls_aac_160k`) is identical signed in or not.
+//! Auth adds two things: the *original*, whose endpoint answers 401 with "only
+//! available for registered users", and `hls_aac_256k` — 256 kbps, flagged
+//! `Premium` — on tracks SoundCloud marks `quality: hq`, which needs Go+ and is
+//! absent from an anonymous manifest. Go+ *subscription* tracks are a separate
+//! case: anonymously a 30-second preview, signed in a DRM failure.
+//!
+//! So [`Cookies`] widens what is reachable, and every invocation carries the
+//! same setting: a probe and the download it informs must not disagree.
 //!
 //! Quality is resolved lazily. `--flat-playlist` carries no format list, so
 //! knowing whether a track is MP3-128 or an artist-enabled original costs a
 //! separate extraction per track — done for the offers the user is actually
 //! weighing, never for the whole table.
 
+use std::ffi::OsStr;
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use super::error::{BackendError, Result};
 use super::types::*;
 use crate::proc;
 
-/// SoundCloud's streaming ceiling for a track with no artist-enabled download.
+/// A conservative floor, used only when the format list cannot be read.
+///
+/// Not the anonymous ceiling — anonymous requests also see `hls_aac_160k`. This
+/// deliberately under-claims, so an unreadable probe can never make a rip look
+/// like an upgrade.
 const STREAM_FORMAT: AudioFormat = AudioFormat::Mp3(Some(128));
+
+/// Where yt-dlp gets its SoundCloud cookies, if anywhere.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Cookies {
+    /// Anonymous. No artist-enabled originals and no Go+ 256k AAC.
+    #[default]
+    None,
+    /// A local browser profile, e.g. `firefox` or `chrome:Profile 1`.
+    Browser(String),
+    /// A Netscape-format cookie jar. Validated at construction — see
+    /// [`SoundCloud::check_jar`].
+    File(String),
+    /// Both were configured. yt-dlp would quietly take one, so every call fails
+    /// with the fix instead.
+    Conflict,
+}
+
+impl Cookies {
+    pub fn from_config(browser: &str, file: &str) -> Self {
+        match (browser.trim(), file.trim()) {
+            ("", "") => Self::None,
+            (b, "") => Self::Browser(b.to_string()),
+            // `~/` like every other path in the config. An unexpandable one is
+            // kept verbatim so `check_jar` names the path the user wrote.
+            ("", f) => Self::File(
+                crate::paths::expand_tilde(f)
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| f.to_string()),
+            ),
+            _ => Self::Conflict,
+        }
+    }
+
+    fn args(&self) -> Vec<&str> {
+        match self {
+            Self::Browser(b) => vec!["--cookies-from-browser", b],
+            Self::File(f) => vec!["--cookies", f],
+            Self::None | Self::Conflict => Vec::new(),
+        }
+    }
+
+    fn is_configured(&self) -> bool {
+        matches!(self, Self::Browser(_) | Self::File(_))
+    }
+}
+
+/// True for a `document.cookie` dump: `a=b; c=d` on one line.
+///
+/// Detected in order to *reject* it, not to convert it. It is the obvious thing
+/// to reach for — devtools' cookie panel and `console.log(document.cookie)` both
+/// produce it — and it cannot see `HttpOnly` cookies, so the export is silently
+/// incomplete whenever the session cookie is one. Converting it would work often
+/// enough to be trusted and fail invisibly the rest of the time.
+///
+/// A real Netscape jar is tab-separated, so the absence of tabs is the tell.
+fn looks_like_header_string(raw: &str) -> bool {
+    let raw = raw.trim();
+    !raw.is_empty()
+        && !raw.contains('\t')
+        && !raw.starts_with('#')
+        && raw.lines().count() == 1
+        && raw.contains('=')
+}
 
 pub struct SoundCloud {
     yt_dlp: String,
+    cookies: Cookies,
+    /// A `cookies_file` that cannot be used. Held rather than returned because
+    /// construction is infallible; every call then reports it instead of
+    /// quietly running anonymously.
+    file_error: Option<String>,
     extra_args: Vec<String>,
     budget: Duration,
 }
 
 impl SoundCloud {
-    pub fn new(yt_dlp: impl Into<String>, extra_args: Vec<String>, budget: Duration) -> Self {
+    pub fn new(
+        yt_dlp: impl Into<String>,
+        cookies: Cookies,
+        extra_args: Vec<String>,
+        budget: Duration,
+    ) -> Self {
+        let file_error = match &cookies {
+            Cookies::File(path) => Self::check_jar(path),
+            _ => None,
+        };
         Self {
             yt_dlp: yt_dlp.into(),
+            cookies,
+            file_error,
             extra_args,
             budget,
         }
     }
 
-    fn run_json(&self, args: &[&str]) -> Result<String> {
+    /// Why `cookies_file` cannot be used, if it cannot.
+    ///
+    /// Checked once at construction: an unusable jar is a configuration mistake,
+    /// and finding out per-track would report it once per offer.
+    fn check_jar(path: &str) -> Option<String> {
+        match std::fs::read_to_string(path) {
+            Err(e) => Some(format!("cannot read {path}: {e}")),
+            Ok(raw) if raw.trim().is_empty() => Some(format!("{path} is empty")),
+            Ok(raw) if looks_like_header_string(&raw) => Some(format!(
+                "{path} is a `document.cookie` string, not a Netscape cookie jar"
+            )),
+            Ok(_) => None,
+        }
+    }
+
+    /// A yt-dlp command carrying the configured auth.
+    ///
+    /// The single place invocations are built, so a format probe and the fetch
+    /// that acts on it always run as the same user.
+    ///
+    /// Warnings are deliberately *not* suppressed: a cookie failure is only ever
+    /// a warning, stderr is captured rather than printed, and [`Self::audit_cookies`]
+    /// is what decides which of it the user sees.
+    fn ytdlp<I, S>(&self, args: I) -> Result<Command>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        if self.cookies == Cookies::Conflict {
+            return Err(BackendError::NoCredentials {
+                backend: BackendId::SoundCloud,
+                how_to_fix: "cookies_from_browser and cookies_file are both set; \
+                             clear one of them"
+                    .into(),
+            });
+        }
+        if let Some(detail) = &self.file_error {
+            return Err(BackendError::CredentialsUnusable {
+                backend: BackendId::SoundCloud,
+                detail: detail.clone(),
+                how_to_fix: "export a Netscape cookie jar with a cookies.txt \
+                             browser extension — a `document.cookie` dump cannot \
+                             include HttpOnly cookies and may be missing the \
+                             session entirely"
+                    .into(),
+            });
+        }
         let mut cmd = proc::capture(&self.yt_dlp);
-        cmd.args(args).args(&self.extra_args);
+        // extra_args last, so a hand-written flag still wins.
+        cmd.args(args)
+            .args(self.cookies.args())
+            .args(&self.extra_args);
+        Ok(cmd)
+    }
+
+    /// Fail loudly on a cookie problem yt-dlp only *warns* about.
+    ///
+    /// A keyring mismatch (the usual outcome of borrowing the `chromium` reader
+    /// for a fork) leaves the run successful with an empty or half-decrypted
+    /// jar. Left alone that is the worst possible outcome: `backends` reports an
+    /// authenticated session, `--lossless-only` includes us, and every fetch
+    /// quietly returns a transcode. So it is an error, not a note.
+    fn audit_cookies(&self, stderr: &[u8]) -> Result<()> {
+        if !self.cookies.is_configured() {
+            return Ok(());
+        }
+        let text = String::from_utf8_lossy(stderr);
+        let unusable = |detail: &str, how_to_fix: &str| BackendError::CredentialsUnusable {
+            backend: BackendId::SoundCloud,
+            detail: detail.trim().to_string(),
+            how_to_fix: how_to_fix.to_string(),
+        };
+        for line in text.lines() {
+            let lower = line.to_ascii_lowercase();
+            if lower.contains("extracted 0 cookies") {
+                return Err(unusable(
+                    line,
+                    "nothing decrypted — check the profile path, and that the \
+                     browser has been signed in at least once",
+                ));
+            }
+            // The decisive test, and the only one that is actually about
+            // SoundCloud: yt-dlp asked for the original and was told to
+            // register, while we believe we are signed in. Whatever the jar
+            // contains, this session is anonymous to SoundCloud.
+            if missed_original(line) {
+                return Err(unusable(
+                    line,
+                    "cookies loaded but SoundCloud does not treat this session \
+                     as signed in — the session cookies are probably among the \
+                     ones that failed to decrypt; export a cookie jar and use \
+                     cookies_file instead",
+                ));
+            }
+            // A decrypt failure loses the *value* and keeps the name, so a jar
+            // can look populated while every session cookie is an empty string
+            // — which is silently anonymous. Nothing here can tell which half
+            // the session landed in, so a partial failure is fatal too.
+            if lower.contains("could not be decrypted") || lower.contains("failed to decrypt") {
+                return Err(unusable(
+                    line,
+                    "the cookie encryption key does not match this browser — a \
+                     Chromium fork read via `chromium:<path>` keeps its key under \
+                     its own keychain name, and the names survive while the values \
+                     do not; export a cookie jar and use cookies_file instead",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Runs yt-dlp and returns `(stdout, stderr)`. Callers need the stderr
+    /// because yt-dlp reports a *missing* format as a warning beside a
+    /// successful extraction — see [`missed_original`].
+    fn run_json(&self, args: &[&str]) -> Result<(String, String)> {
+        let cmd = self.ytdlp(args)?;
         let out = proc::run_with_deadline(cmd, Instant::now() + self.budget).map_err(|e| {
             let msg = e.to_string();
             if msg.contains("not found") {
@@ -67,8 +276,21 @@ impl SoundCloud {
         if !out.status.success() {
             return Err(classify_ytdlp_failure(&self.yt_dlp, &out.stderr));
         }
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        self.audit_cookies(&out.stderr)?;
+        Ok((
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        ))
     }
+}
+
+/// True when yt-dlp found an artist-enabled original and was refused it.
+///
+/// The extraction still succeeds, so the format list looks complete while
+/// silently omitting the only lossless option the track has. Worth saying out
+/// loud: it is the one case where configuring cookies pays for itself.
+fn missed_original(stderr: &str) -> bool {
+    stderr.contains("only available for registered users")
 }
 
 /// Turn a yt-dlp failure into the right variant, so the caller can tell "you
@@ -76,6 +298,17 @@ impl SoundCloud {
 fn classify_ytdlp_failure(tool: &str, stderr: &[u8]) -> BackendError {
     let tail = proc::stderr_tail(stderr);
     let lower = tail.to_ascii_lowercase();
+    if lower.contains("unsupported browser") {
+        // yt-dlp only knows a fixed list of browsers. A fork is still reachable
+        // by borrowing a supported reader and giving it an absolute profile path.
+        return BackendError::CredentialsUnusable {
+            backend: BackendId::SoundCloud,
+            detail: tail,
+            how_to_fix: "cookies_from_browser must name a browser yt-dlp knows; \
+                         for a Chromium fork use `chromium:/absolute/path/to/profile`"
+                .into(),
+        };
+    }
     if lower.contains("drm") {
         // Go+ subscription audio. Nothing to work around.
         return BackendError::Unsupported {
@@ -220,14 +453,27 @@ impl super::AcquisitionBackend for SoundCloud {
             ownership_check: false,
             requires_purchase: false,
             fetch: true,
-            // A transcode is never lossless, so --lossless-only can skip this
-            // backend without a single request.
-            lossless_capable: false,
+            // Only an artist-enabled original is lossless, and that endpoint
+            // refuses anonymous requests — so without cookies --lossless-only
+            // can skip this backend without a single request.
+            lossless_capable: self.cookies.is_configured(),
         }
     }
 
     fn credentials(&self) -> CredentialState {
-        CredentialState::NotRequired
+        match &self.cookies {
+            // Anonymous works; it just caps at MP3-128.
+            Cookies::None => CredentialState::NotRequired,
+            Cookies::Browser(b) => CredentialState::Present {
+                hint: format!("cookies from {b}"),
+            },
+            Cookies::File(f) => CredentialState::Present {
+                hint: format!("cookie jar {f}"),
+            },
+            Cookies::Conflict => CredentialState::Malformed {
+                detail: "cookies_from_browser and cookies_file are both set".into(),
+            },
+        }
     }
 
     fn claim_url(&self, url: &str) -> Option<ItemRef> {
@@ -247,12 +493,7 @@ impl super::AcquisitionBackend for SoundCloud {
         }
         // Ask for exactly as many as we will keep.
         let target = format!("scsearch{}:{text}", query.limit);
-        let json = self.run_json(&[
-            "--no-warnings",
-            "--flat-playlist",
-            "--dump-single-json",
-            &target,
-        ])?;
+        let (json, _) = self.run_json(&["--flat-playlist", "--dump-single-json", &target])?;
         parse_search(&json, query.limit)
     }
 
@@ -262,9 +503,22 @@ impl super::AcquisitionBackend for SoundCloud {
                 offer.formats = Some(vec![STREAM_FORMAT]);
                 continue;
             };
-            match self.run_json(&["--no-warnings", "--dump-single-json", &api_url(&id)]) {
-                Ok(json) => match parse_formats(&json) {
-                    Ok(formats) => offer.formats = Some(formats),
+            match self.run_json(&["--dump-single-json", &api_url(&id)]) {
+                Ok((json, stderr)) => match parse_formats(&json) {
+                    Ok(formats) => {
+                        offer.formats = Some(formats);
+                        if missed_original(&stderr) {
+                            // The row is not wrong, but it is short a format we
+                            // could have had — say so rather than let the user
+                            // conclude MP3 is all there is.
+                            offer.enrich_error = Some(
+                                "this track has an artist-enabled original, which \
+                                 needs a signed-in session — set \
+                                 soundcloud.cookies_from_browser"
+                                    .into(),
+                            );
+                        }
+                    }
                     Err(e) => offer.enrich_error = Some(e.to_string()),
                 },
                 // Per-offer failure never fails the batch — a DRM track must not
@@ -298,7 +552,6 @@ impl super::AcquisitionBackend for SoundCloud {
         let mut args: Vec<String> = vec![
             "--no-playlist".into(),
             "--no-progress".into(),
-            "--no-warnings".into(),
             // Prefer an artist-enabled original over any transcode; that is the
             // only case where a soundcloud rip beats what you already have.
             "-f".into(),
@@ -317,8 +570,7 @@ impl super::AcquisitionBackend for SoundCloud {
             .saturating_duration_since(Instant::now())
             .max(Duration::from_secs(1));
 
-        let mut cmd = proc::capture(&self.yt_dlp);
-        cmd.args(args.drain(..)).args(&self.extra_args);
+        let cmd = self.ytdlp(args.drain(..))?;
         let out = proc::run_with_deadline(cmd, Instant::now() + remaining).map_err(|e| {
             BackendError::ToolFailed {
                 tool: self.yt_dlp.clone(),
@@ -328,6 +580,7 @@ impl super::AcquisitionBackend for SoundCloud {
         if !out.status.success() {
             return Err(classify_ytdlp_failure(&self.yt_dlp, &out.stderr));
         }
+        self.audit_cookies(&out.stderr)?;
 
         let produced = newest_audio_file(&staging.0)?;
         let format = produced
@@ -448,7 +701,16 @@ mod tests {
     ]}"#;
 
     fn sc() -> SoundCloud {
-        SoundCloud::new("yt-dlp", vec![], Duration::from_secs(5))
+        SoundCloud::new("yt-dlp", Cookies::None, vec![], Duration::from_secs(5))
+    }
+
+    fn missing_tool(cookies: Cookies) -> SoundCloud {
+        SoundCloud::new(
+            "definitely-not-yt-dlp-xyzzy",
+            cookies,
+            vec![],
+            Duration::from_secs(5),
+        )
     }
 
     #[test]
@@ -636,12 +898,291 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_advertise_that_a_rip_is_never_lossless() {
+    fn capabilities_advertise_that_an_anonymous_rip_is_never_lossless() {
         let c = sc().capabilities();
         assert!(c.search && c.fetch);
         assert!(!c.lossless_capable);
         assert!(!c.requires_purchase);
         assert!(!c.price_quotes, "everything is free, so there is no price");
+    }
+
+    #[test]
+    fn cookies_make_the_backend_worth_searching_for_lossless() {
+        // An artist-enabled original is only reachable signed in, so
+        // --lossless-only should stop skipping us once cookies are configured.
+        assert!(
+            missing_tool(Cookies::Browser("firefox".into()))
+                .capabilities()
+                .lossless_capable
+        );
+        assert!(
+            missing_tool(Cookies::File("/tmp/cookies.txt".into()))
+                .capabilities()
+                .lossless_capable
+        );
+    }
+
+    #[test]
+    fn cookie_config_maps_to_the_right_yt_dlp_flags() {
+        assert_eq!(Cookies::from_config("", ""), Cookies::None);
+        assert_eq!(Cookies::from_config("  ", ""), Cookies::None);
+        assert_eq!(
+            Cookies::from_config("firefox", "").args(),
+            ["--cookies-from-browser", "firefox"]
+        );
+        assert_eq!(
+            Cookies::from_config("", " /tmp/c.txt ").args(),
+            ["--cookies", "/tmp/c.txt"]
+        );
+        assert!(Cookies::None.args().is_empty());
+    }
+
+    #[test]
+    fn a_cookie_jar_path_expands_a_leading_tilde() {
+        // Every other path in the config does, and yt-dlp is not a shell.
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(
+            Cookies::from_config("", "~/sc_cookies.txt"),
+            Cookies::File(format!("{home}/sc_cookies.txt"))
+        );
+    }
+
+    #[test]
+    fn setting_both_cookie_sources_is_refused_not_silently_resolved() {
+        // yt-dlp would take one of them; which one is not something to guess at.
+        let both = Cookies::from_config("firefox", "/tmp/c.txt");
+        assert_eq!(both, Cookies::Conflict);
+
+        // The tool name is deliberately bogus: a conflict must fail before we
+        // ever spawn anything.
+        let sc = missing_tool(both);
+        let err = sc
+            .search(&SearchQuery::from_text("anything", 1))
+            .unwrap_err();
+        assert!(
+            matches!(err, BackendError::NoCredentials { .. }),
+            "got {err:?}"
+        );
+        assert!(err.needs_user_action());
+        assert!(matches!(
+            sc.credentials(),
+            CredentialState::Malformed { .. }
+        ));
+        assert!(!sc.credentials().is_usable());
+    }
+
+    #[test]
+    fn every_invocation_carries_the_same_auth() {
+        // The probe reports what the fetch will get only if both run signed in.
+        let sc = SoundCloud::new(
+            "yt-dlp",
+            Cookies::Browser("firefox".into()),
+            vec!["--sleep-requests".into(), "1".into()],
+            Duration::from_secs(5),
+        );
+        let args = |c: Command| {
+            c.get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        let probe = args(sc.ytdlp(["--dump-single-json", "url"]).unwrap());
+        assert_eq!(
+            probe,
+            [
+                "--dump-single-json",
+                "url",
+                "--cookies-from-browser",
+                "firefox",
+                "--sleep-requests",
+                "1"
+            ]
+        );
+        assert_eq!(
+            &args(sc.ytdlp(["-f", "download"]).unwrap())[2..],
+            &probe[2..]
+        );
+    }
+
+    #[test]
+    fn a_partly_decrypted_jar_is_fatal_because_the_names_outlive_the_values() {
+        // Observed borrowing the `chromium` reader for Helium: the jar looks
+        // populated, every soundcloud.com value is the empty string, and
+        // yt-dlp never even attempts a login. Tolerating this is what "silently
+        // anonymous" looks like.
+        let sc = missing_tool(Cookies::Browser("chromium:/tmp/helium".into()));
+        let err = sc
+            .audit_cookies(
+                b"WARNING: failed to decrypt cookie (AES-CBC) because UTF-8 decoding failed\n\
+                  Extracted 2192 cookies from chromium (1537 could not be decrypted)",
+            )
+            .unwrap_err();
+        match &err {
+            BackendError::CredentialsUnusable { how_to_fix, .. } => {
+                assert!(how_to_fix.contains("cookies_file"), "got {how_to_fix}")
+            }
+            other => panic!("got {other:?}"),
+        }
+        assert!(err.needs_user_action());
+        assert!(!err.is_retryable(), "a wrong key is wrong on the retry too");
+        assert!(!err.is_silently_skippable(), "this must not be swallowed");
+    }
+
+    #[test]
+    fn a_session_soundcloud_does_not_accept_is_an_error_not_a_quiet_downgrade() {
+        // The decisive signal: we believe we are signed in and SoundCloud is
+        // still refusing the original. Every fetch would silently be anonymous.
+        let sc = missing_tool(Cookies::Browser("chromium:/tmp/helium".into()));
+        let err = sc
+            .audit_cookies(
+                b"WARNING: Original download format is only available for registered users.",
+            )
+            .unwrap_err();
+        match &err {
+            BackendError::CredentialsUnusable { how_to_fix, .. } => {
+                assert!(how_to_fix.contains("cookies_file"), "got {how_to_fix}")
+            }
+            other => panic!("got {other:?}"),
+        }
+        assert!(err.needs_user_action());
+        assert!(!err.is_retryable(), "a wrong key is wrong on the retry too");
+        assert!(!err.is_silently_skippable(), "this must not be swallowed");
+        assert_eq!(err.backend(), Some(BackendId::SoundCloud));
+    }
+
+    #[test]
+    fn a_document_cookie_dump_is_rejected_with_the_real_instructions() {
+        // The obvious thing to reach for, and it cannot see HttpOnly cookies —
+        // so accepting it would work by luck and fail invisibly.
+        let dir = std::env::temp_dir().join(format!("rr-sc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("header.txt");
+        std::fs::write(
+            &path,
+            "sc_theme=dark; oauth_token=2-314159; sc_session=abc\n",
+        )
+        .unwrap();
+
+        let sc = SoundCloud::new(
+            "yt-dlp",
+            Cookies::File(path.to_string_lossy().into_owned()),
+            vec![],
+            Duration::from_secs(5),
+        );
+        let err = sc.ytdlp(["--version"]).unwrap_err();
+        match &err {
+            BackendError::CredentialsUnusable {
+                detail, how_to_fix, ..
+            } => {
+                assert!(detail.contains("document.cookie"), "got {detail}");
+                assert!(how_to_fix.contains("HttpOnly"), "got {how_to_fix}");
+            }
+            other => panic!("got {other:?}"),
+        }
+        assert!(err.needs_user_action());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_real_netscape_jar_is_accepted_and_an_unreadable_one_is_not() {
+        let dir = std::env::temp_dir().join(format!("rr-sc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("jar.txt");
+        std::fs::write(
+            &path,
+            "# Netscape HTTP Cookie File\n\
+             .soundcloud.com\tTRUE\t/\tTRUE\t2000000000\toauth_token\t2-314159\n",
+        )
+        .unwrap();
+        let jar = |p: String| SoundCloud::new("yt-dlp", Cookies::File(p), vec![], Duration::ZERO);
+        assert!(
+            jar(path.to_string_lossy().into_owned())
+                .ytdlp(["--version"])
+                .is_ok()
+        );
+        // Tabs are the tell, so a jar is never mistaken for a header string.
+        assert!(!looks_like_header_string(
+            ".soundcloud.com\tTRUE\t/\tTRUE\t1\ta\tb"
+        ));
+        assert!(looks_like_header_string("a=b; c=d"));
+        assert!(!looks_like_header_string("   "));
+
+        let missing = dir.join("nope.txt").to_string_lossy().into_owned();
+        assert!(matches!(
+            jar(missing).ytdlp(["--version"]),
+            Err(BackendError::CredentialsUnusable { .. })
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_empty_jar_is_caught() {
+        let sc = missing_tool(Cookies::File("/tmp/c.txt".into()));
+        assert!(
+            sc.audit_cookies(b"Extracted 0 cookies from chromium")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn anonymous_runs_are_never_audited_for_cookie_problems() {
+        // Nothing was configured, so neither a stray warning nor a refused
+        // original is a credentials failure — the latter is an offer note.
+        let sc = sc();
+        assert!(
+            sc.audit_cookies(b"Extracted 0 cookies from chromium")
+                .is_ok()
+        );
+        assert!(
+            sc.audit_cookies(b"Original download format is only available for registered users")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_clean_signed_in_run_passes_the_audit() {
+        let sc = missing_tool(Cookies::Browser("firefox".into()));
+        assert!(
+            sc.audit_cookies(b"Extracted 2192 cookies from firefox")
+                .is_ok()
+        );
+        assert!(sc.audit_cookies(b"").is_ok());
+    }
+
+    #[test]
+    fn an_unsupported_browser_names_the_fix_rather_than_leaking_stderr() {
+        let err = classify_ytdlp_failure(
+            "yt-dlp",
+            b"yt-dlp: error: unsupported browser specified for cookies: \"helium\". \
+              Supported browsers are: brave, chrome, chromium, edge, firefox, opera, \
+              safari, vivaldi, whale",
+        );
+        match &err {
+            BackendError::CredentialsUnusable { how_to_fix, .. } => {
+                assert!(how_to_fix.contains("chromium:"), "got {how_to_fix}")
+            }
+            other => panic!("got {other:?}"),
+        }
+        assert!(err.needs_user_action());
+    }
+
+    #[test]
+    fn a_refused_original_is_reported_on_the_offer() {
+        // yt-dlp warns and carries on, so the format list looks complete while
+        // missing the only lossless option the track has.
+        assert!(missed_original(
+            "WARNING: Original download format is only available for registered users. \
+             Use --cookies-from-browser"
+        ));
+        assert!(!missed_original("Extracted 12 cookies from firefox"));
+    }
+
+    #[test]
+    fn configured_cookies_are_reported_as_present() {
+        assert!(matches!(sc().credentials(), CredentialState::NotRequired));
+        match missing_tool(Cookies::Browser("firefox".into())).credentials() {
+            CredentialState::Present { hint } => assert!(hint.contains("firefox"), "got {hint}"),
+            other => panic!("got {other:?}"),
+        }
     }
 
     #[test]
@@ -656,11 +1197,7 @@ mod tests {
 
     #[test]
     fn a_missing_yt_dlp_is_reported_by_name() {
-        let sc = SoundCloud::new(
-            "definitely-not-yt-dlp-xyzzy",
-            vec![],
-            Duration::from_secs(5),
-        );
+        let sc = missing_tool(Cookies::None);
         let err = sc
             .search(&SearchQuery::from_text("anything", 1))
             .unwrap_err();
@@ -674,11 +1211,7 @@ mod tests {
     #[test]
     fn an_empty_query_makes_no_subprocess_call() {
         // Guards against spawning yt-dlp with a meaningless search term.
-        let sc = SoundCloud::new(
-            "definitely-not-yt-dlp-xyzzy",
-            vec![],
-            Duration::from_secs(5),
-        );
+        let sc = missing_tool(Cookies::None);
         assert!(
             sc.search(&SearchQuery::from_text("   ", 5))
                 .unwrap()
