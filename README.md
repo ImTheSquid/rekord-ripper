@@ -144,7 +144,7 @@ An all-digit query is still an exact track ID, not a search.
 
 ## Acquisition backends
 
-Most of a library ends up on SoundCloud, where the audio is a 128kbps transcode.
+Most of a library ends up on SoundCloud, where the audio is a lossy transcode.
 The same tracks are usually buyable in lossless on Bandcamp, and the ones that
 were never for sale anywhere are usually on Soulseek. These commands find them,
 help you buy them, fetch the file, and move your cue points and beat grid onto
@@ -201,6 +201,89 @@ requests per backend and invite a rate limit.
 Backends implement the `AcquisitionBackend` trait, so adding another is a matter
 of implementing search, enrich, purchase and fetch. Bandcamp, SoundCloud and
 Soulseek ship with it.
+
+### SoundCloud
+
+SoundCloud rips go through `yt-dlp`. Cookies are optional and do not improve an
+ordinary track — `hls_mp3` 128k, `hls_aac_96k`, `hls_aac_160k` are the same
+signed in or not. What signing in adds:
+
+- **`hls_aac_256k`**, 256kbps AAC flagged `Premium`, on tracks marked
+  `quality: hq`. Needs Go+, absent from an anonymous manifest. One test track
+  fetched 10.7MB anonymous, 17.1MB signed in — the main reason to bother.
+- **The artist-enabled original**, the only lossless thing here. Rare, and its
+  endpoint refuses anonymous requests.
+- **Access**: private links, tracks that otherwise return a 30-second snippet,
+  and much softer rate limits.
+
+Go+ subscription-only tracks stay out of reach either way — a 30-second preview
+anonymously, `This video is DRM protected` signed in.
+
+```toml
+[soundcloud]
+cookies_from_browser = "firefox"     # or "chrome:Profile 1", "brave", "safari", …
+```
+
+`yt-dlp` knows only `brave`, `chrome`, `chromium`, `edge`, `firefox`, `opera`,
+`safari`, `vivaldi` and `whale`. First use prompts for keychain access on macOS
+— click **Always Allow** or the run hangs on the dialog.
+
+**A Chromium fork outside that list needs `cookies_file`, not a path override.**
+Pointing the `chromium` reader at the fork's profile reads the right cookie
+database with the wrong decryption key: `yt-dlp` derives the keychain item from
+the browser name, so `chromium:` looks up `Chromium Safe Storage` while Helium
+keeps `Helium Storage Key` and Arc keeps `Arc Safe Storage`. Cookie names are
+unencrypted and survive, so the jar looks populated while every value is blank —
+silently anonymous. rekord-ripper treats that as fatal rather than carrying on.
+
+#### Exporting a cookie jar
+
+Also what you want when the logged-in browser is on another machine.
+
+```toml
+[soundcloud]
+cookies_file = "~/soundcloud-cookies.txt"
+```
+
+It must be **Netscape format** — tab-separated, one cookie per line, starting
+`# Netscape HTTP Cookie File`. Use a cookies.txt browser extension that exports
+locally (avoid anything that uploads), from a signed-in SoundCloud tab.
+
+**`document.cookie` is rejected.** Devtools' cookie panel and
+`console.log(document.cookie)` give you `a=b; c=d`, which is both the wrong
+format and unable to see `HttpOnly` cookies — so it can silently omit the
+session. Auto-converting it was tried and dropped for that reason: it would work
+often enough to be trusted, then fail invisibly.
+
+The jar holds a live session token. Keep it `chmod 600` and out of the repo, and
+re-export when the session rotates. To confirm one authenticated:
+
+```bash
+yt-dlp --cookies ~/soundcloud-cookies.txt -F <track-url> 2>&1 | grep -i "verif\|logging"
+#   [soundcloud] Verifying login token...
+#   [soundcloud] Logging in
+```
+
+No `Logging in` means `oauth_token` did not survive the export.
+
+#### When auth is broken
+
+`yt-dlp` reports cookie problems as *warnings* on an otherwise successful run, so
+the default outcome would be `backends` claiming an authenticated session while
+every fetch quietly returns a transcode. Instead, all of these are hard errors:
+both cookie keys set, an unknown browser name, a `cookies_file` that is
+unreadable, empty or a `document.cookie` dump, any cookie that fails to decrypt,
+and a signed-in session SoundCloud still refuses the original to. Running
+*without* cookies on a track that has an original is noted on the offer, so you
+can see where cookies would pay off.
+
+Two consequences: **`--lossless-only` skips SoundCloud entirely until cookies are
+configured**, since the original is the only lossless option and is otherwise
+unreachable; and changing the cookie setting invalidates what a previous `shop`
+told you, so search again rather than fetching against an old offer table.
+
+`extra_args` is appended after the cookie flags, so a hand-written
+`--cookies-from-browser` there wins.
 
 ### Soulseek
 
@@ -274,8 +357,8 @@ Two behaviours worth knowing:
 - **Compare prices across currencies.** Prices come in each seller's own
   currency and there is no exchange-rate source here, so prices are always shown
   with their ISO code and any "cheapest" line is per-currency.
-- **Pretend a SoundCloud rip is an upgrade.** Free tracks cap at MP3-128 unless
-  the artist enabled the original file, and Go+ tracks are DRM'd and simply fail.
+- **Pretend a SoundCloud rip is an upgrade.** Everything there is a transcode
+  unless the artist enabled the original, which needs a signed-in session.
   `fetch` reports the format it actually got and says when it is a downgrade.
 - **Vouch for a Soulseek file's quality.** All a search result carries is a peer's
   filename and their claimed bitrate, and a `.flac` upscaled from a 128kbps MP3

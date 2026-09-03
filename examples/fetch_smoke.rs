@@ -5,11 +5,26 @@
 // specific track staying up.
 use std::time::{Duration, Instant};
 
-use rekord_ripper::acquire::{AcquisitionBackend, soundcloud::SoundCloud, *};
+use rekord_ripper::acquire::{
+    AcquisitionBackend,
+    soundcloud::{Cookies, SoundCloud},
+    *,
+};
 use rekord_ripper::fingerprint as fp;
 
 fn main() -> anyhow::Result<()> {
-    let sc = SoundCloud::new("yt-dlp", vec![], Duration::from_secs(120));
+    // RR_SC_COOKIES_FROM_BROWSER=firefox or RR_SC_COOKIES_FILE=/path/to/jar
+    // exercises the signed-in path, where the artist-enabled original and the
+    // Go+ 256k AAC tier are reachable.
+    let env = |k| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
+    let cookies = match (env("RR_SC_COOKIES_FROM_BROWSER"), env("RR_SC_COOKIES_FILE")) {
+        (Some(b), None) => Cookies::Browser(b),
+        (None, Some(f)) => Cookies::File(f),
+        (Some(_), Some(_)) => Cookies::Conflict,
+        (None, None) => Cookies::None,
+    };
+    println!("cookies: {cookies:?}");
+    let sc = SoundCloud::new("yt-dlp", cookies, vec![], Duration::from_secs(120));
     let query = SearchQuery::from_text("four tet baby", 3);
 
     let offers = sc.search(&query)?;
