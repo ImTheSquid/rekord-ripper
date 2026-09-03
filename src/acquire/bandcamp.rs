@@ -24,6 +24,7 @@ use serde::Deserialize;
 use super::blob;
 use super::error::{BackendError, Result};
 use super::http;
+use super::note;
 use super::types::*;
 use crate::config::{CredentialSource, Credentials, Secret};
 
@@ -320,13 +321,13 @@ fn download_when_ready(
             .read_to_string()
             .map_err(|e| http::map_err(BackendId::Bandcamp, &url, e))?;
         if attempt == 1 {
-            eprintln!(
+            note!(
                 "  bandcamp is preparing this download — a file nobody has fetched before can \
                  take several minutes. Waiting up to {}s.",
                 READY_TIMEOUT.as_secs()
             );
         } else {
-            eprintln!(
+            note!(
                 "  still preparing ({}s elapsed, attempt {attempt})",
                 started.elapsed().as_secs()
             );
@@ -343,7 +344,7 @@ fn download_when_ready(
                     ));
                 }
             },
-            Err(e) => eprintln!("  (could not re-read the download page: {e})"),
+            Err(e) => note!("  (could not re-read the download page: {e})"),
         }
         std::thread::sleep(delay);
         delay = (delay * 2).min(READY_MAX_BACKOFF);
@@ -436,7 +437,7 @@ impl Bandcamp {
                     // Ownership stays Unknown rather than No: telling the user
                     // they don't own something we failed to check could have
                     // them buy it twice.
-                    eprintln!("warning: could not read your bandcamp collection: {e}");
+                    note!("warning: could not read your bandcamp collection: {e}");
                     OwnedSet::default()
                 }
             }
