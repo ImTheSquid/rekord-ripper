@@ -431,7 +431,7 @@ fn rank(offers: Vec<Offer>, query: &SearchQuery, opts: &SearchOpts) -> Vec<Ranke
 /// The cheapest offer in each currency.
 ///
 /// Plural by construction: naming a single winner across differing currencies
-/// would require an exchange rate we do not have.
+/// would require a conversion we do not do.
 pub fn cheapest_per_currency(offers: &[RankedOffer]) -> Vec<(Price, BackendId)> {
     use std::collections::BTreeMap;
     let mut best: BTreeMap<String, (Price, BackendId)> = BTreeMap::new();
@@ -457,12 +457,6 @@ pub fn cheapest_per_currency(offers: &[RankedOffer]) -> Vec<(Price, BackendId)> 
         }
     }
     best.into_values().collect()
-}
-
-/// True when the table holds prices in more than one currency, meaning any
-/// "cheapest" claim has to be qualified.
-pub fn has_mixed_currencies(offers: &[RankedOffer]) -> bool {
-    cheapest_per_currency(offers).len() > 1
 }
 
 #[cfg(test)]
@@ -580,7 +574,6 @@ mod tests {
         let r = ranked(vec![gbp, usd], SortMode::Quality);
         let cheap = cheapest_per_currency(&r);
         assert_eq!(cheap.len(), 2, "one entry per currency, not one overall");
-        assert!(has_mixed_currencies(&r));
         let codes: Vec<&str> = cheap.iter().map(|(p, _)| p.currency.as_str()).collect();
         assert_eq!(codes, vec!["GBP", "USD"]);
     }
@@ -592,18 +585,18 @@ mod tests {
         let unprobed = offer(BackendId::Bandcamp, "u", "x");
         let r = ranked(vec![free, unprobed], SortMode::Quality);
         assert!(cheapest_per_currency(&r).is_empty());
-        assert!(!has_mixed_currencies(&r));
     }
 
     #[test]
-    fn a_single_currency_table_is_not_flagged_as_mixed() {
+    fn one_currency_yields_one_entry_at_the_lowest_price() {
         let mut a = offer(BackendId::Bandcamp, "a", "x");
         a.pricing = Pricing::Flat(Price::new(400, "GBP"));
         let mut b = offer(BackendId::Bandcamp, "b", "x");
         b.pricing = Pricing::Flat(Price::new(700, "GBP"));
         let r = ranked(vec![a, b], SortMode::Quality);
-        assert!(!has_mixed_currencies(&r));
-        assert_eq!(cheapest_per_currency(&r)[0].0.to_string(), "4.00 GBP");
+        let cheap = cheapest_per_currency(&r);
+        assert_eq!(cheap.len(), 1);
+        assert_eq!(cheap[0].0.to_string(), "4.00 GBP");
     }
 
     #[test]

@@ -182,10 +182,14 @@ The **shop screen** is a track list beside an offer table. `s` searches the
 highlighted track. Tapping it on several tracks searches them one after
 another, with results accumulating into one grouped table; nothing is discarded
 and nothing is searched twice. `Space` fills a basket and `S` searches all of
-it. Each track carries a tag showing what its search found: a count, `·` for
+it, up to `search.bulk_max` (25) tracks a press — press it again for the next
+batch. Each track carries a tag showing what its search found: a count, `·` for
 nothing, `…` for still queued. `Enter` on an offer downloads it and queues an
 analysis transfer against that offer's own source track, which after a batch of
-searches is not necessarily the track under the list cursor. `Esc` goes back.
+searches is not necessarily the track under the list cursor. `Enter` on further
+offers stacks them behind the running download rather than refusing: they run
+one at a time, for the same reason searches do, and each finished file is paired
+with the source track its own offer came from. `Esc` goes back.
 
 Searches run on a background thread, so leaving the screen loses nothing and `s`
 returns to it. They run sequentially rather than in parallel: each track is
