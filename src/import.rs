@@ -40,6 +40,12 @@ use crate::analysis::{derive_anlz_path, random_numeric_id};
 use crate::audio::AudioInfo;
 use crate::db::{MasterDb, now_db_string};
 
+/// `djmdContent.FileType` that rekordbox renders as "Unknown Format". It writes
+/// this on nothing itself, and a row carrying it will not play.
+pub const UNPLAYABLE_FILE_TYPE: i64 = 0;
+
+pub use crate::format::file_type_name;
+
 /// Everything needed to write one track row.
 #[derive(Debug, Clone)]
 pub struct NewContent {
@@ -174,6 +180,30 @@ pub fn existing_row_for_path(db: &MasterDb, path: &Path) -> Result<Option<String
         .optional()?)
 }
 
+/// True when a row already holds these exact bytes under some other name.
+///
+/// `existing_row_for_path` alone is not enough: a re-download lands beside the
+/// first as `name (2).mp3`, which is a different path and sails straight past
+/// it. Size plus duration separates that from a genuine second format of the
+/// same track, whose size differs by orders of magnitude.
+pub fn existing_row_for_content(
+    db: &MasterDb,
+    file_size: u64,
+    length_secs: i64,
+) -> Result<Option<String>> {
+    Ok(db
+        .conn
+        .query_row(
+            "SELECT ID FROM djmdContent
+             WHERE (rb_local_deleted = 0 OR rb_local_deleted IS NULL)
+               AND FileSize = ?1 AND Length = ?2
+             LIMIT 1",
+            params![file_size as i64, length_secs],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
 /// Build the row for `path` without writing anything.
 ///
 /// Fails rather than inventing values for anything rekordbox needs: a file whose
@@ -194,6 +224,12 @@ pub fn plan_insert(
             abs.display()
         );
     }
+    if let Some(existing) = existing_row_for_content(db, info.file_size, info.length_secs())? {
+        bail!(
+            "{} has the same bytes as track {existing}, already in rekordbox",
+            abs.display()
+        );
+    }
 
     let file_type = info.rekordbox_file_type(&abs).ok_or_else(|| {
         anyhow!(
@@ -202,6 +238,16 @@ pub fn plan_insert(
             info.codec
         )
     })?;
+    // Refusing beats writing a row rekordbox imports, displays, and then will
+    // not play: 0 is the "Unknown Format" code, and nothing may map to it.
+    if file_type == UNPLAYABLE_FILE_TYPE {
+        bail!(
+            "refusing to import {} with FileType 0 — rekordbox reads that as \
+             Unknown Format and the track would be unplayable (codec {:?})",
+            abs.display(),
+            info.codec
+        );
+    }
 
     let file_name = abs
         .file_name()
@@ -474,6 +520,14 @@ fn insert_lookup(
         &LOOKUP_INSERT.replace("{}", lookup.table),
         params![lookup.id, lookup.name, lookup.uuid, usn, now],
     )?;
+    // `Compilation` is djmdAlbum's alone, and rekordbox writes 0 where this
+    // left NULL. Set after the insert so the shared statement stays shared.
+    if lookup.table == "djmdAlbum" {
+        tx.execute(
+            "UPDATE djmdAlbum SET Compilation = 0 WHERE ID = ?1",
+            params![lookup.id],
+        )?;
+    }
     Ok(())
 }
 
@@ -672,6 +726,85 @@ pub fn anlz_path_for(new: &NewContent) -> String {
     derive_anlz_path(&new.uuid)
 }
 
+/// One row whose `FileType` disagrees with the file it points at.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileTypeFix {
+    pub content_id: String,
+    pub path: String,
+    pub current: Option<i64>,
+    pub correct: i64,
+    /// True where the current value is the one rekordbox will not play.
+    pub unplayable: bool,
+}
+
+/// Find local rows whose `FileType` does not match what the file actually is.
+///
+/// Reads every candidate off disk rather than trusting the extension, and skips
+/// anything unreadable — a file that has moved is a different problem, and
+/// guessing at its format to "fix" the row would be worse than leaving it.
+pub fn scan_file_types(db: &MasterDb) -> Result<Vec<FileTypeFix>> {
+    let mut stmt = db.conn.prepare(
+        "SELECT ID, FolderPath, FileType FROM djmdContent
+         WHERE (rb_local_deleted = 0 OR rb_local_deleted IS NULL)
+           AND FolderPath LIKE '/%'",
+    )?;
+    let rows: Vec<(String, String, Option<i64>)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<std::result::Result<_, _>>()?;
+
+    let mut fixes = Vec::new();
+    for (content_id, path, current) in rows {
+        let p = Path::new(&path);
+        if !p.exists() {
+            continue;
+        }
+        let Ok(info) = crate::audio::probe(p) else {
+            continue;
+        };
+        let Some(correct) = info.rekordbox_file_type(p) else {
+            continue;
+        };
+        if current != Some(correct) {
+            fixes.push(FileTypeFix {
+                content_id,
+                path,
+                current,
+                correct,
+                unplayable: current == Some(UNPLAYABLE_FILE_TYPE),
+            });
+        }
+    }
+    Ok(fixes)
+}
+
+/// Write the corrected `FileType`s, one USN per row so Cloud Library Sync sees
+/// each as its own edit. The caller owns the backup and the running-rekordbox
+/// refuse, the same as every other write here.
+pub fn apply_file_type_fixes(db: &mut MasterDb, fixes: &[FileTypeFix]) -> Result<usize> {
+    if fixes.is_empty() {
+        return Ok(0);
+    }
+    let base_usn = db.read_local_usn()?;
+    let now = now_db_string();
+    let tx = db.conn.unchecked_transaction()?;
+    for (i, fix) in fixes.iter().enumerate() {
+        let usn = base_usn + 1 + i as i64;
+        let n = tx.execute(
+            "UPDATE djmdContent
+             SET FileType = ?2, rb_local_synced = 0, rb_local_usn = ?3, updated_at = ?4
+             WHERE ID = ?1",
+            params![fix.content_id, fix.correct, usn, now],
+        )?;
+        if n != 1 {
+            bail!("expected to update track {}, updated {n} rows", fix.content_id);
+        }
+    }
+    let next_usn = base_usn + fixes.len() as i64;
+    db.write_local_usn(next_usn)?;
+    tx.commit()?;
+    Ok(fixes.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -716,11 +849,16 @@ mod tests {
             ("djmdGenre", named_columns(LOOKUP_INSERT)),
         ];
         for (table, columns) in tables {
-            let cols: Vec<String> = columns
+            let mut cols: Vec<String> = columns
                 .iter()
                 .filter(|c| !drop_from.contains(&(table, c)))
                 .map(|c| format!("{c} TEXT"))
                 .collect();
+            // Only djmdAlbum has it, which is the whole reason it is set apart
+            // from the shared lookup insert.
+            if table == "djmdAlbum" {
+                cols.push("Compilation INTEGER".into());
+            }
             conn.execute_batch(&format!("CREATE TABLE {table} ({})", cols.join(", ")))
                 .unwrap();
         }
@@ -781,7 +919,7 @@ mod tests {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         for (table, search_str) in [
             ("djmdArtist", ", SearchStr TEXT"),
-            ("djmdAlbum", ", SearchStr TEXT"),
+            ("djmdAlbum", ", SearchStr TEXT, Compilation INTEGER"),
             ("djmdGenre", ""),
         ] {
             conn.execute_batch(&format!(
@@ -813,6 +951,11 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{table}: {e}"));
             assert_eq!(name, "ducter", "{table}");
         }
+        // rekordbox writes 0 here; the shared insert left it NULL.
+        let compilation: Option<i64> = conn
+            .query_row("SELECT Compilation FROM djmdAlbum", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(compilation, Some(0));
     }
 
     fn info() -> AudioInfo {

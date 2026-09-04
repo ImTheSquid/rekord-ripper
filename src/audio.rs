@@ -66,8 +66,8 @@ impl AudioInfo {
                 // decides, so fall through to the extension for these.
                 None
             }
-            Some("mp3") => Some(0),
-            Some("aac" | "alac") => Some(1),
+            Some("mp3") => Some(1),
+            Some("aac" | "alac") => Some(4),
             _ => None,
         };
         if from_codec.is_some() {
@@ -280,8 +280,18 @@ bit_rate=128000
     fn pcm_falls_back_to_the_extension_because_the_container_decides() {
         // AIFF and WAV are both PCM; only the container distinguishes them.
         let pcm = parse_probe("codec_name=pcm_s16be\nduration=10\n", 1).unwrap();
-        assert_eq!(pcm.rekordbox_file_type(Path::new("/x/a.aiff")), Some(11));
-        assert_eq!(pcm.rekordbox_file_type(Path::new("/x/a.wav")), Some(4));
+        assert_eq!(pcm.rekordbox_file_type(Path::new("/x/a.aiff")), Some(12));
+        assert_eq!(pcm.rekordbox_file_type(Path::new("/x/a.wav")), Some(11));
+    }
+
+    #[test]
+    fn mp3_is_file_type_one_because_zero_is_unplayable() {
+        // The mapping was off by a row: mp3 was written as 0, which rekordbox
+        // shows as "Unknown Format" and refuses to play.
+        let mp3 = parse_probe("codec_name=mp3\nduration=10\n", 1).unwrap();
+        assert_eq!(mp3.rekordbox_file_type(Path::new("/x/a.mp3")), Some(1));
+        let aac = parse_probe("codec_name=aac\nduration=10\n", 1).unwrap();
+        assert_eq!(aac.rekordbox_file_type(Path::new("/x/a.m4a")), Some(4));
     }
 
     #[test]

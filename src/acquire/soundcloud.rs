@@ -298,6 +298,16 @@ fn missed_original(stderr: &str) -> bool {
 fn classify_ytdlp_failure(tool: &str, stderr: &[u8]) -> BackendError {
     let tail = proc::stderr_tail(stderr);
     let lower = tail.to_ascii_lowercase();
+    // A fragment 429 is a WARNING line partway up the output, and the last line
+    // is whatever yt-dlp gave up with — so the tail alone reports a rate limit
+    // as a generic tool failure. Scan the whole of it before classifying.
+    let whole = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    if whole.contains("429") || whole.contains("too many requests") {
+        return BackendError::RateLimited {
+            backend: BackendId::SoundCloud,
+            retry_after: retry_after_secs(&whole),
+        };
+    }
     if lower.contains("unsupported browser") {
         // yt-dlp only knows a fixed list of browsers. A fork is still reachable
         // by borrowing a supported reader and giving it an absolute profile path.
@@ -322,16 +332,24 @@ fn classify_ytdlp_failure(tool: &str, stderr: &[u8]) -> BackendError {
             item: tail,
         };
     }
-    if lower.contains("429") || lower.contains("too many requests") {
-        return BackendError::RateLimited {
-            backend: BackendId::SoundCloud,
-            retry_after: None,
-        };
-    }
     BackendError::ToolFailed {
         tool: tool.to_string(),
         detail: tail,
     }
+}
+
+/// Seconds from a `Retry-After:` yt-dlp echoed, so a backoff has a real number
+/// instead of a guess. Only the integer-seconds form; an HTTP-date is left to
+/// the caller's default.
+fn retry_after_secs(lower_stderr: &str) -> Option<Duration> {
+    let at = lower_stderr.find("retry-after")?;
+    let rest = &lower_stderr[at + "retry-after".len()..];
+    let digits: String = rest
+        .trim_start_matches([':', ' ', '\t'])
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok().map(Duration::from_secs)
 }
 
 /// Parse `yt-dlp --flat-playlist --dump-single-json scsearchN:...` output.
@@ -552,6 +570,17 @@ impl super::AcquisitionBackend for SoundCloud {
         let mut args: Vec<String> = vec![
             "--no-playlist".into(),
             "--no-progress".into(),
+            // Most tracks have only an HLS transcode, so one download is
+            // hundreds of fragment requests. yt-dlp's default is to skip a
+            // fragment it cannot get and still exit 0, which lands a track with
+            // holes in it in rekordbox and calls it a success.
+            "--abort-on-unavailable-fragments".into(),
+            // And its default retry has no delay, so the first 429 becomes ten
+            // more requests as fast as the socket allows.
+            "--retry-sleep".into(),
+            "fragment:exp=1:20".into(),
+            "--retry-sleep".into(),
+            "http:exp=1:60".into(),
             // Prefer an artist-enabled original over any transcode; that is the
             // only case where a soundcloud rip beats what you already have.
             "-f".into(),
@@ -597,7 +626,10 @@ impl super::AcquisitionBackend for SoundCloud {
             });
         }
 
-        let (artist, title) = parse_download_metadata(&String::from_utf8_lossy(&out.stdout));
+        let meta = parse_download_metadata(&String::from_utf8_lossy(&out.stdout));
+        short_download(&produced, meta.duration_secs)?;
+
+        let (artist, title) = (meta.artist, meta.title);
         let final_path = super::fs::place(&produced, &opts.dest_dir, opts.overwrite)?;
         Ok(vec![AcquiredFile {
             path: final_path,
@@ -623,31 +655,69 @@ impl Drop for StagingDir {
     }
 }
 
-/// Artist and title from the info JSON yt-dlp prints after a download.
-///
+/// What the info JSON yt-dlp prints after a download is worth reading for.
+#[derive(Debug, Default, PartialEq)]
+struct DownloadMetadata {
+    artist: Option<String>,
+    title: Option<String>,
+    /// What soundcloud says the track runs to, for checking what we got.
+    duration_secs: Option<f64>,
+}
+
 /// Best-effort: missing metadata leaves the acquired file untagged rather than
 /// failing a download that otherwise succeeded.
-fn parse_download_metadata(stdout: &str) -> (Option<String>, Option<String>) {
+fn parse_download_metadata(stdout: &str) -> DownloadMetadata {
     for line in stdout.lines().rev() {
         let line = line.trim();
         if !line.starts_with('{') {
             continue;
         }
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-            let artist = ["artist", "uploader", "creator"]
-                .iter()
-                .find_map(|k| v[*k].as_str())
-                .map(str::to_string);
-            // `track` is the bare title where soundcloud has it; `title` often
-            // carries an "Artist - Title" prefix instead.
-            let title = ["track", "title"]
-                .iter()
-                .find_map(|k| v[*k].as_str())
-                .map(str::to_string);
-            return (artist, title);
+            return DownloadMetadata {
+                artist: ["artist", "uploader", "creator"]
+                    .iter()
+                    .find_map(|k| v[*k].as_str())
+                    .map(str::to_string),
+                // `track` is the bare title where soundcloud has it; `title`
+                // often carries an "Artist - Title" prefix instead.
+                title: ["track", "title"]
+                    .iter()
+                    .find_map(|k| v[*k].as_str())
+                    .map(str::to_string),
+                duration_secs: v["duration"].as_f64(),
+            };
         }
     }
-    (None, None)
+    DownloadMetadata::default()
+}
+
+/// How far short of the advertised duration a file may land before it counts as
+/// truncated. Container padding and rounding move the last second either way.
+const DURATION_SLACK_SECS: f64 = 2.0;
+
+/// Reject a download that is materially shorter than the track it claims to be.
+///
+/// `--abort-on-unavailable-fragments` catches the fragment yt-dlp knows it
+/// missed; this catches a stream that ended early and was reported as complete.
+/// An unreadable duration on either side is not evidence of anything, so it
+/// passes.
+fn short_download(path: &std::path::Path, expected_secs: Option<f64>) -> Result<()> {
+    let Some(expected) = expected_secs.filter(|d| *d > 0.0) else {
+        return Ok(());
+    };
+    let Ok(actual) = crate::fingerprint::probe_duration_secs(path) else {
+        return Ok(());
+    };
+    if actual + DURATION_SLACK_SECS < expected {
+        return Err(BackendError::ToolFailed {
+            tool: "yt-dlp".into(),
+            detail: format!(
+                "truncated download: {actual:.0}s of an advertised {expected:.0}s \
+                 (soundcloud rate limiting drops fragments)"
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// What to hand yt-dlp for an item ref.
@@ -826,6 +896,65 @@ mod tests {
             rl.is_retryable(),
             "a rate limit should back off, not give up"
         );
+    }
+
+    #[test]
+    fn a_rate_limit_above_the_last_line_is_still_a_rate_limit() {
+        // How a fragment 429 actually arrives: a warning partway up, and some
+        // other message last. Reading only the tail called this a tool failure
+        // and lost the one classification that knows to back off.
+        let stderr = b"WARNING: fragment 12 not available; HTTP Error 429: Too Many Requests\n\
+                       Retry-After: 90\n\
+                       ERROR: unable to download video data\n";
+        match classify_ytdlp_failure("yt-dlp", stderr) {
+            BackendError::RateLimited { retry_after, .. } => {
+                assert_eq!(retry_after, Some(Duration::from_secs(90)));
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_rate_limit_without_a_retry_after_still_classifies() {
+        match classify_ytdlp_failure("yt-dlp", b"ERROR: HTTP Error 429\n") {
+            BackendError::RateLimited { retry_after, .. } => assert_eq!(retry_after, None),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_download_shorter_than_the_track_is_rejected() {
+        // Rate limiting drops fragments, and until this check the result was a
+        // track with holes in it that reported success.
+        let dir = std::env::temp_dir().join(format!("rr-short-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wav = dir.join("t.wav");
+        let made = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+            .arg("sine=frequency=440:duration=3")
+            .arg(&wav)
+            .status()
+            .is_ok_and(|s| s.success());
+        if !made {
+            return; // no ffmpeg here; the check is exercised where there is one
+        }
+
+        assert!(short_download(&wav, Some(3.0)).is_ok(), "full length passes");
+        assert!(short_download(&wav, None).is_ok(), "unknown length passes");
+        let err = short_download(&wav, Some(200.0)).unwrap_err();
+        assert!(format!("{err}").contains("truncated"), "got {err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_info_json_yields_the_duration_the_completeness_check_needs() {
+        let meta = parse_download_metadata(
+            r#"{"artist":"nanode","track":"AMB","title":"nanode - AMB","duration":203.6}"#,
+        );
+        assert_eq!(meta.artist.as_deref(), Some("nanode"));
+        assert_eq!(meta.title.as_deref(), Some("AMB"));
+        assert_eq!(meta.duration_secs, Some(203.6));
+        assert_eq!(parse_download_metadata("not json"), DownloadMetadata::default());
     }
 
     #[test]
