@@ -1,14 +1,18 @@
 //! Small pure formatting helpers shared between `dump`, `analysis` rendering,
 //! and the TUI row formatter. Keep this module dependency-free.
 
-pub(crate) fn file_type_name(ft: Option<i64>) -> &'static str {
-    // Mapping observed in master.db dumps; see also pyrekordbox tables.py.
+pub fn file_type_name(ft: Option<i64>) -> &'static str {
+    // Counted over the rows rekordbox itself wrote in a real master.db: 1 is
+    // mp3 (522), 4 m4a (70), 5 flac (725), 11 wav (355). 12 is aiff, read back
+    // off a probe file imported for the purpose. 0 appears on nothing rekordbox
+    // created, and a row carrying it reads as "Unknown Format" and will not play.
     match ft {
-        Some(0) => "MP3",
-        Some(1) => "M4A",
-        Some(4) => "WAV",
+        Some(0) => "unplayable (FileType 0)",
+        Some(1) => "MP3",
+        Some(4 | 6) => "M4A",
         Some(5) => "FLAC",
-        Some(11) => "AIFF",
+        Some(11) => "WAV",
+        Some(12) => "AIFF",
         Some(19) => "SoundCloud",
         Some(21) => "Beatport",
         Some(25) => "Spotify",

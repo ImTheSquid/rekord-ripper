@@ -283,6 +283,26 @@ enum Cmd {
         undo: Option<String>,
     },
 
+    /// Re-derive `djmdContent.FileType` from the audio itself and correct rows
+    /// that disagree.
+    ///
+    /// A wrong value is not cosmetic: rekordbox reads FileType 0 as "Unknown
+    /// Format" and refuses to play the track, however good the file is. Every
+    /// local row is probed; anything unreadable or moved is skipped rather than
+    /// guessed at. Default = dry-run.
+    Repair {
+        /// Actually write to master.db. Without this, prints what it would do.
+        #[arg(long)]
+        apply: bool,
+        /// Skip the confirmation prompt.
+        #[arg(short = 'y', long)]
+        yes: bool,
+        /// Only correct rows rekordbox cannot play, leaving mislabelled but
+        /// working rows alone.
+        #[arg(long)]
+        unplayable_only: bool,
+    },
+
     /// Compare two audio files by fingerprint and print the raw numbers.
     ///
     /// This is the calibration tool. The accept thresholds shipped in config are
@@ -339,6 +359,17 @@ fn main() -> Result<()> {
             acquire::report::run(&cfg, &creds, &config_path)?
         }
         Cmd::Config { init, force } => run_config(&config_path, init, force)?,
+        Cmd::Repair {
+            apply,
+            yes,
+            unplayable_only,
+        } => run_repair(
+            db.as_mut().expect("repair needs the db"),
+            safety,
+            apply,
+            yes,
+            unplayable_only,
+        )?,
         Cmd::Import {
             files,
             title,
@@ -632,6 +663,67 @@ fn run_import(db: &mut MasterDb, cfg: &Config, safety: SafetyOpts, args: ImportA
     Ok(())
 }
 
+fn run_repair(
+    db: &mut MasterDb,
+    safety: SafetyOpts,
+    apply: bool,
+    yes: bool,
+    unplayable_only: bool,
+) -> Result<()> {
+    use owo_colors::OwoColorize;
+    use rekord_ripper::import::{self, file_type_name};
+
+    eprintln!("probing every local track …");
+    let mut fixes = import::scan_file_types(db)?;
+    if unplayable_only {
+        fixes.retain(|f| f.unplayable);
+    }
+    if fixes.is_empty() {
+        eprintln!("{} every FileType matches its file.", "ok:".green());
+        return Ok(());
+    }
+
+    let broken = fixes.iter().filter(|f| f.unplayable).count();
+    for fix in &fixes {
+        let arrow = format!(
+            "{} -> {}",
+            file_type_name(fix.current),
+            file_type_name(Some(fix.correct))
+        );
+        let name = std::path::Path::new(&fix.path)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| fix.path.clone());
+        if fix.unplayable {
+            println!("  {} {:<28} {}", "unplayable".red(), arrow, name);
+        } else {
+            println!("  {} {:<28} {}", "mislabelled".yellow(), arrow, name);
+        }
+    }
+    println!();
+    eprintln!(
+        "{} row(s) to correct, {broken} of them unplayable today.",
+        fixes.len()
+    );
+
+    if !apply {
+        eprintln!("Dry-run; pass --apply to write.");
+        return Ok(());
+    }
+    if !yes && !confirm_stdin(&format!("correct {} row(s) in master.db?", fixes.len()))? {
+        println!("cancelled.");
+        return Ok(());
+    }
+
+    db::safety_preflight(safety)?;
+    let backup = db.backup()?;
+    eprintln!("backed up to: {}", backup.display());
+    let n = import::apply_file_type_fixes(db, &fixes)?;
+    eprintln!("{} corrected {n} row(s).", "ok:".green());
+    eprintln!("rekordbox must be restarted to re-read them.");
+    Ok(())
+}
+
 /// Fingerprint-gate and apply an analysis transfer onto a freshly imported row.
 fn transfer_onto_import(
     db: &mut MasterDb,
@@ -808,7 +900,8 @@ fn needs_database(cmd: &Cmd) -> bool {
         | Cmd::Cp { .. }
         | Cmd::Auto { .. }
         | Cmd::Pending { .. }
-        | Cmd::Import { .. } => true,
+        | Cmd::Import { .. }
+        | Cmd::Repair { .. } => true,
     }
 }
 
