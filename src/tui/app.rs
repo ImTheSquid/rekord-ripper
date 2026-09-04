@@ -134,8 +134,19 @@ pub enum FetchState {
     Failed(String),
 }
 
+/// What an offer's download is doing, for the marker in its row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OfferFetch {
+    /// Never asked for, or asked for and failed — either way, `Enter` will try.
+    None,
+    Queued,
+    Running,
+    Done,
+}
+
 /// A download handed to the worker: in flight if it is at the front, else
 /// waiting its turn.
+#[derive(Debug, PartialEq, Eq)]
 struct QueuedFetch {
     /// `artist — title`, for the status line.
     what: String,
@@ -170,16 +181,24 @@ impl FetchQueue {
         self.0.iter().position(|q| &q.item == item)
     }
 
-    /// Retire the finished front and hand back the source track it was for.
+    /// Retire the finished front and hand it back.
     ///
     /// Front, not a search by id: the worker answers in submission order, and
     /// `Fetched` carries no way to tell which download it belongs to.
-    fn finish_front(&mut self) -> Option<String> {
-        self.0.pop_front().and_then(|q| q.src)
+    fn finish_front(&mut self) -> Option<QueuedFetch> {
+        self.0.pop_front()
     }
 
     fn label(&self) -> Option<&str> {
         self.0.front().map(|q| q.what.as_str())
+    }
+
+    /// Every download, oldest first, paired with whether it is the running one.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, bool)> {
+        self.0
+            .iter()
+            .enumerate()
+            .map(|(i, q)| (q.what.as_str(), i == 0))
     }
 
     pub fn len(&self) -> usize {
@@ -425,6 +444,9 @@ pub struct App {
     pub dst: ColumnState,
     pub focus: Focus,
     pub screen: Screen,
+    /// The screen `p` was pressed on, so Esc goes back there rather than always
+    /// to the transfer screen.
+    queue_return: Screen,
     pub shop_focus: ShopFocus,
     /// The shop screen's own track list: its own filter, and a selection that
     /// only ever means "search for these".
@@ -442,6 +464,9 @@ pub struct App {
     /// `Enter` on further offers stacks up behind the running download the way
     /// `s` stacks searches.
     pub fetch_queue: FetchQueue,
+    /// Offers whose file has landed, so a row keeps saying so after the queue
+    /// drains. Failures are absent on purpose — see [`App::offer_fetch`].
+    fetched: HashSet<crate::acquire::ItemRef>,
     /// Source track ids submitted to the worker but not yet answered, so `s` on
     /// the same track twice does not search it twice.
     shop_queued: Vec<String>,
@@ -487,6 +512,7 @@ impl App {
             dst: ColumnState::default(),
             focus: Focus::Src,
             screen: Screen::Transfer,
+            queue_return: Screen::Transfer,
             shop_focus: ShopFocus::Tracks,
             shop_list: ColumnState::default(),
             mode: InputMode::Normal,
@@ -497,6 +523,7 @@ impl App {
             shop: ShopState::Idle,
             fetch: FetchState::Idle,
             fetch_queue: FetchQueue::default(),
+            fetched: HashSet::new(),
             shop_queued: Vec::new(),
             cfg,
             pending: None,
@@ -661,8 +688,11 @@ impl App {
                         let lossy = files.iter().any(|f| !f.format.is_lossless());
                         // Queueing needs the database, so it happens here on the
                         // main thread rather than in the worker.
-                        let src = self.finish_front_fetch();
-                        let queued = self.queue_transfer_for(src, &paths);
+                        let done = self.finish_front_fetch();
+                        if let Some(q) = &done {
+                            self.fetched.insert(q.item.clone());
+                        }
+                        let queued = self.queue_transfer_for(done.and_then(|q| q.src), &paths);
                         match (queued, lossy) {
                             (Some(id), _) => self.status.ok(format!(
                                 "downloaded and queued transfer #{id} — import, then `pending --apply`"
@@ -1054,8 +1084,16 @@ impl App {
     /// Searches submitted but not yet answered.
     /// Open the queue screen, retiring anything that can no longer progress.
     pub fn open_queue(&mut self) {
+        if self.screen != Screen::Pending {
+            self.queue_return = self.screen;
+        }
         self.screen = Screen::Pending;
         self.reload_queue();
+    }
+
+    /// Leave the queue for whichever screen opened it.
+    pub fn close_queue(&mut self) {
+        self.screen = self.queue_return;
     }
 
     /// Re-read the store, sweeping first.
@@ -1752,8 +1790,8 @@ impl App {
     ///
     /// Returns the source track the finished one was for. Popping the front is
     /// what keeps the pairing right: the worker answers in submission order.
-    fn finish_front_fetch(&mut self) -> Option<String> {
-        let src = self.fetch_queue.finish_front();
+    fn finish_front_fetch(&mut self) -> Option<QueuedFetch> {
+        let done = self.fetch_queue.finish_front();
         if let Some(what) = self.fetch_queue.label().map(str::to_string) {
             self.fetch = FetchState::Running {
                 since: Instant::now(),
@@ -1761,7 +1799,19 @@ impl App {
                 note: None,
             };
         }
-        src
+        done
+    }
+
+    /// What an offer's download is doing, for the marker in its row.
+    pub fn offer_fetch(&self, item: &crate::acquire::ItemRef) -> OfferFetch {
+        match self.fetch_queue.ahead_of(item) {
+            Some(0) => OfferFetch::Running,
+            Some(_) => OfferFetch::Queued,
+            // A failed download is deliberately left unmarked: the row has to
+            // look retryable, because `Enter` on it is.
+            None if self.fetched.contains(item) => OfferFetch::Done,
+            None => OfferFetch::None,
+        }
     }
 
     /// Append the outstanding download count to whatever the status line just
@@ -2037,11 +2087,19 @@ mod tests {
         q.push(queued("b", Some("src-b")));
         q.push(queued("c", None));
 
+        fn src_of(q: Option<QueuedFetch>) -> Option<String> {
+            q.and_then(|q| q.src)
+        }
+
         assert_eq!(q.label(), Some("a"), "the front one is the running one");
-        assert_eq!(q.finish_front().as_deref(), Some("src-a"));
+        assert_eq!(src_of(q.finish_front()).as_deref(), Some("src-a"));
         assert_eq!(q.label(), Some("b"));
-        assert_eq!(q.finish_front().as_deref(), Some("src-b"));
-        assert_eq!(q.finish_front(), None, "'just download it' stays unpaired");
+        assert_eq!(src_of(q.finish_front()).as_deref(), Some("src-b"));
+        assert_eq!(
+            src_of(q.finish_front()),
+            None,
+            "'just download it' stays unpaired"
+        );
         assert!(q.is_empty());
         assert_eq!(q.label(), None);
     }
