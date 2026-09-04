@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::time::Instant;
 
 use crate::analysis::{CopyOpts, Plan};
@@ -134,6 +134,63 @@ pub enum FetchState {
     Failed(String),
 }
 
+/// A download handed to the worker: in flight if it is at the front, else
+/// waiting its turn.
+struct QueuedFetch {
+    /// `artist — title`, for the status line.
+    what: String,
+    /// The source track to pair the finished file with, if any.
+    src: Option<String>,
+    /// So the same offer twice is refused rather than downloaded twice.
+    item: crate::acquire::ItemRef,
+}
+
+/// The downloads handed to the worker, oldest first. The front one is running.
+///
+/// A queue rather than a slot because the worker already runs jobs one at a time
+/// in submission order — `Enter` on several offers needs somewhere to keep each
+/// one's label and source track, not a scheduler. Per-download `src` is the part
+/// that has to be a queue: a single shared slot pairs every finished file with
+/// the *last* download started rather than its own.
+#[derive(Default)]
+pub struct FetchQueue(VecDeque<QueuedFetch>);
+
+impl FetchQueue {
+    fn push(&mut self, q: QueuedFetch) {
+        self.0.push_back(q);
+    }
+
+    /// A dead worker answers none of them, not just the one in flight.
+    fn abandon_all(&mut self) {
+        self.0.clear();
+    }
+
+    /// Downloads ahead of `item`, or `None` when it is not queued at all.
+    fn ahead_of(&self, item: &crate::acquire::ItemRef) -> Option<usize> {
+        self.0.iter().position(|q| &q.item == item)
+    }
+
+    /// Retire the finished front and hand back the source track it was for.
+    ///
+    /// Front, not a search by id: the worker answers in submission order, and
+    /// `Fetched` carries no way to tell which download it belongs to.
+    fn finish_front(&mut self) -> Option<String> {
+        self.0.pop_front().and_then(|q| q.src)
+    }
+
+    fn label(&self) -> Option<&str> {
+        self.0.front().map(|q| q.what.as_str())
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 impl ShopState {
     /// Total offers across every group.
     pub fn len(&self) -> usize {
@@ -220,19 +277,25 @@ fn hidden_selected(rows: &[TrackRow], col: &ColumnState) -> usize {
     col.selected.len().saturating_sub(shown)
 }
 
-/// Basket rows in library order, capped, with the uncapped total.
+/// Basket rows still worth searching, in library order, capped, with the
+/// uncapped total.
 ///
 /// Walks every row rather than the visible ones: filtering the list after filling
 /// the basket used to drop the hidden items from the search without a word, which
 /// looked exactly like the basket being forgotten.
+///
+/// `pending` is applied *before* the cap, so a basket bigger than the cap works
+/// through itself one `S` at a time. Capping first meant every press offered the
+/// same already-queued batch and the rest were unreachable.
 fn basket_rows(
     rows: &[TrackRow],
     selected: &HashSet<String>,
     cap: usize,
+    pending: impl Fn(&TrackRow) -> bool,
 ) -> (Vec<TrackRow>, usize) {
     let all: Vec<TrackRow> = rows
         .iter()
-        .filter(|r| selected.contains(&r.id))
+        .filter(|r| selected.contains(&r.id) && pending(r))
         .cloned()
         .collect();
     let total = all.len();
@@ -376,9 +439,9 @@ pub struct App {
     pub worker: Option<super::worker::Worker>,
     pub shop: ShopState,
     pub fetch: FetchState,
-    /// The source track a fetch was started for, so the transfer can be queued
-    /// once the file lands.
-    fetch_src: Option<String>,
+    /// `Enter` on further offers stacks up behind the running download the way
+    /// `s` stacks searches.
+    pub fetch_queue: FetchQueue,
     /// Source track ids submitted to the worker but not yet answered, so `s` on
     /// the same track twice does not search it twice.
     shop_queued: Vec<String>,
@@ -433,7 +496,7 @@ impl App {
             worker,
             shop: ShopState::Idle,
             fetch: FetchState::Idle,
-            fetch_src: None,
+            fetch_queue: FetchQueue::default(),
             shop_queued: Vec::new(),
             cfg,
             pending: None,
@@ -598,7 +661,8 @@ impl App {
                         let lossy = files.iter().any(|f| !f.format.is_lossless());
                         // Queueing needs the database, so it happens here on the
                         // main thread rather than in the worker.
-                        let queued = self.queue_transfer_for(&paths);
+                        let src = self.finish_front_fetch();
+                        let queued = self.queue_transfer_for(src, &paths);
                         match (queued, lossy) {
                             (Some(id), _) => self.status.ok(format!(
                                 "downloaded and queued transfer #{id} — import, then `pending --apply`"
@@ -610,11 +674,22 @@ impl App {
                                 self.status.ok(format!("downloaded {} file(s)", paths.len()))
                             }
                         }
-                        self.fetch = FetchState::Done { paths, queued };
+                        // The next download owns the panel while it runs; this
+                        // one's outcome stays in the status line.
+                        if self.fetch_queue.is_empty() {
+                            self.fetch = FetchState::Done { paths, queued };
+                        } else {
+                            self.note_downloads_left();
+                        }
                     }
                     Err(why) => {
+                        self.finish_front_fetch();
                         self.status.err(format!("download failed: {why}"));
-                        self.fetch = FetchState::Failed(why);
+                        if self.fetch_queue.is_empty() {
+                            self.fetch = FetchState::Failed(why);
+                        } else {
+                            self.note_downloads_left();
+                        }
                     }
                 },
                 // The queue screen consumes these; until it exists they only
@@ -634,6 +709,7 @@ impl App {
                     // refused as already-in-flight.
                     self.queue.abandon_in_flight(&why);
                     if matches!(self.fetch, FetchState::Running { .. }) {
+                        self.fetch_queue.abandon_all();
                         self.fetch = FetchState::Failed(why);
                     } else {
                         self.shop = ShopState::Failed(why);
@@ -800,10 +876,7 @@ impl App {
     pub fn enqueue_shop(&mut self, rows: &[TrackRow]) -> bool {
         let specs: Vec<_> = rows
             .iter()
-            // Skip anything already answered or already queued.
-            .filter(|r| {
-                self.first_offer_index_for(&r.id).is_none() && !self.shop_queued.contains(&r.id)
-            })
+            .filter(|r| self.is_pending(&r.id))
             .filter_map(|r| self.spec_for(r))
             .collect();
 
@@ -813,6 +886,12 @@ impl App {
             return false;
         }
         self.submit_shop_queued(specs)
+    }
+
+    /// Worth searching: neither answered already nor waiting in the queue.
+    fn is_pending(&self, src_id: &str) -> bool {
+        self.first_offer_index_for(src_id).is_none()
+            && !self.shop_queued.iter().any(|q| q == src_id)
     }
 
     /// Index into the flattened offer list of the first offer found for `src_id`.
@@ -870,13 +949,16 @@ impl App {
     ///
     /// A basket rather than "everything visible": a filter can match hundreds of
     /// rows, and each track is a full fan-out across every backend.
-    pub fn shop_selected(&mut self, cap: usize) -> bool {
+    pub fn shop_selected(&mut self) -> bool {
         if self.shop_list.selected.is_empty() {
             self.status
                 .warn("the basket is empty — press space on the tracks you want, then 'S'.");
             return false;
         }
-        let (rows, total) = basket_rows(&self.rows, &self.shop_list.selected, cap);
+        let cap = self.cfg.search.bulk_max.max(1);
+        let (rows, total) = basket_rows(&self.rows, &self.shop_list.selected, cap, |r| {
+            self.is_pending(&r.id)
+        });
         let queued = rows.len();
         let ok = self.enqueue_shop(&rows);
         // Said *after* the submit, which sets its own status — a warning written
@@ -884,7 +966,8 @@ impl App {
         if ok && total > queued {
             let text = self.status.text.clone();
             self.status.warn(format!(
-                "{text} {total} in the basket, only the first {queued} queued — press 'S' again for the rest."
+                "{text} {} left in the basket — press 'S' again for the next {cap}.",
+                total - queued
             ));
         }
         ok
@@ -1618,17 +1701,18 @@ impl App {
             }
         };
 
+        if let Some(n) = self.fetch_queue.ahead_of(&offer.item_ref) {
+            self.status.info(match n {
+                0 => "that one is downloading now.".to_string(),
+                _ => format!("that one is already queued, {n} download(s) ahead of it."),
+            });
+            return false;
+        }
+
         let Some(worker) = self.worker.as_mut() else {
             self.status.err("the worker thread is not running.");
             return false;
         };
-        // Only a download conflicts with a download. A fingerprint can take
-        // minutes, and blocking on the shared counter made `f` a dead key with
-        // nothing on screen to explain why.
-        if worker.outstanding_of(super::worker::JobKind::Fetch) > 0 {
-            self.status.warn("a download is already running.");
-            return false;
-        }
         if !worker.submit(super::worker::Job::Fetch {
             item: offer.item_ref.clone(),
             dest,
@@ -1641,22 +1725,63 @@ impl App {
 
         let what = format!("{} — {}", offer.artist, offer.title);
         // Remember the source so the transfer can be queued on completion.
-        self.fetch_src = group_src.or_else(|| self.current_shop_track().map(|r| r.id.clone()));
-        self.status.info(format!("downloading {what} …"));
-        self.fetch = FetchState::Running {
-            since: Instant::now(),
-            what,
-            note: None,
-        };
+        let src = group_src.or_else(|| self.current_shop_track().map(|r| r.id.clone()));
+        let running = !self.fetch_queue.is_empty();
+        self.fetch_queue.push(QueuedFetch {
+            what: what.clone(),
+            src,
+            item: offer.item_ref.clone(),
+        });
+        if running {
+            self.status.info(format!(
+                "queued {what} — {} download(s) ahead of it.",
+                self.fetch_queue.len() - 1
+            ));
+        } else {
+            self.status.info(format!("downloading {what} …"));
+            self.fetch = FetchState::Running {
+                since: Instant::now(),
+                what,
+                note: None,
+            };
+        }
         true
+    }
+
+    /// Retire the finished download and start showing the next one.
+    ///
+    /// Returns the source track the finished one was for. Popping the front is
+    /// what keeps the pairing right: the worker answers in submission order.
+    fn finish_front_fetch(&mut self) -> Option<String> {
+        let src = self.fetch_queue.finish_front();
+        if let Some(what) = self.fetch_queue.label().map(str::to_string) {
+            self.fetch = FetchState::Running {
+                since: Instant::now(),
+                what,
+                note: None,
+            };
+        }
+        src
+    }
+
+    /// Append the outstanding download count to whatever the status line just
+    /// said, so a finished download does not read as the whole queue finishing.
+    fn note_downloads_left(&mut self) {
+        let text = self.status.text.clone();
+        self.status
+            .info(format!("{text} {} still queued.", self.fetch_queue.len()));
     }
 
     /// Record a pending old→new pairing for a downloaded file.
     ///
     /// Returns the queued entry id. `None` when there was no source track
     /// selected, which is a legitimate "just download it" case.
-    fn queue_transfer_for(&mut self, paths: &[std::path::PathBuf]) -> Option<i64> {
-        let src_id = self.fetch_src.take()?;
+    fn queue_transfer_for(
+        &mut self,
+        src_id: Option<String>,
+        paths: &[std::path::PathBuf],
+    ) -> Option<i64> {
+        let src_id = src_id?;
         let src = crate::analysis::load_track(&self.db, &src_id).ok()?;
         let store = crate::pending::PendingStore::open().ok()?;
         let first = paths.first()?;
@@ -1845,7 +1970,7 @@ mod tests {
         // filter after filling the basket silently dropped whatever it hid. The
         // basket still showed the right count, so it read as the program losing
         // selections at random.
-        let (rows, total) = basket_rows(&library(), &basket(&["1", "3", "4"]), 25);
+        let (rows, total) = basket_rows(&library(), &basket(&["1", "3", "4"]), 25, |_| true);
         assert_eq!(total, 3);
         assert_eq!(
             rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
@@ -1860,7 +1985,7 @@ mod tests {
         // somewhere stable rather than from a HashSet's iteration order.
         let picked = basket(&["4", "2", "1"]);
         for _ in 0..8 {
-            let (rows, _) = basket_rows(&library(), &picked, 25);
+            let (rows, _) = basket_rows(&library(), &picked, 25, |_| true);
             assert_eq!(
                 rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
                 ["1", "2", "4"]
@@ -1870,14 +1995,81 @@ mod tests {
 
     #[test]
     fn the_cap_limits_what_is_queued_but_reports_the_whole_basket() {
-        let (rows, total) = basket_rows(&library(), &basket(&["1", "2", "3", "4"]), 2);
+        let (rows, total) = basket_rows(&library(), &basket(&["1", "2", "3", "4"]), 2, |_| true);
         assert_eq!(rows.len(), 2);
         assert_eq!(total, 4, "the caller needs the real total to warn with");
     }
 
     #[test]
+    fn the_cap_applies_to_what_is_left_to_search_not_the_whole_basket() {
+        // The bug: capping before this filter meant a basket over the cap only
+        // ever offered its first `cap` items, and once those were queued every
+        // further press said "nothing new to search".
+        let all = basket(&["1", "2", "3", "4"]);
+        let done = ["1", "2"];
+        let (rows, total) = basket_rows(&library(), &all, 2, |r| !done.contains(&r.id.as_str()));
+        assert_eq!(
+            rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["3", "4"],
+            "the second press must reach the items the first one did not"
+        );
+        assert_eq!(total, 2, "the total counts what is still to search");
+    }
+
+    fn queued(what: &str, src: Option<&str>) -> QueuedFetch {
+        QueuedFetch {
+            what: what.to_string(),
+            src: src.map(str::to_string),
+            item: crate::acquire::ItemRef::new(
+                crate::acquire::BackendId::Bandcamp,
+                format!("k:{what}"),
+            ),
+        }
+    }
+
+    #[test]
+    fn each_finished_download_is_paired_with_its_own_source_track() {
+        // The bug this guards: one shared `fetch_src` slot meant the second
+        // download's file was queued as a transfer against the *third* track's
+        // source, silently pairing the wrong old→new tracks.
+        let mut q = FetchQueue::default();
+        q.push(queued("a", Some("src-a")));
+        q.push(queued("b", Some("src-b")));
+        q.push(queued("c", None));
+
+        assert_eq!(q.label(), Some("a"), "the front one is the running one");
+        assert_eq!(q.finish_front().as_deref(), Some("src-a"));
+        assert_eq!(q.label(), Some("b"));
+        assert_eq!(q.finish_front().as_deref(), Some("src-b"));
+        assert_eq!(q.finish_front(), None, "'just download it' stays unpaired");
+        assert!(q.is_empty());
+        assert_eq!(q.label(), None);
+    }
+
+    #[test]
+    fn the_same_offer_twice_reports_its_place_rather_than_queueing_again() {
+        let mut q = FetchQueue::default();
+        q.push(queued("a", None));
+        q.push(queued("b", None));
+
+        assert_eq!(q.ahead_of(&queued("a", None).item), Some(0));
+        assert_eq!(q.ahead_of(&queued("b", None).item), Some(1));
+        assert_eq!(q.ahead_of(&queued("c", None).item), None);
+        assert_eq!(q.len(), 2);
+    }
+
+    #[test]
+    fn a_dead_worker_abandons_the_whole_queue_not_just_the_running_one() {
+        let mut q = FetchQueue::default();
+        q.push(queued("a", None));
+        q.push(queued("b", None));
+        q.abandon_all();
+        assert!(q.is_empty(), "nothing will ever answer these");
+    }
+
+    #[test]
     fn an_id_no_longer_in_the_library_is_ignored() {
-        let (rows, total) = basket_rows(&library(), &basket(&["2", "999"]), 25);
+        let (rows, total) = basket_rows(&library(), &basket(&["2", "999"]), 25, |_| true);
         assert_eq!(rows.len(), 1);
         assert_eq!(total, 1);
         assert_eq!(rows[0].id, "2");

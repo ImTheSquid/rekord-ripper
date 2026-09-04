@@ -5,14 +5,6 @@ use crate::db::safety_preflight;
 
 use super::app::{App, ConfirmKind, Focus, InputMode, PendingBatch, Screen, ShopFocus};
 
-/// Most tracks one `S` will queue at once.
-///
-/// Each track is a full fan-out across every backend, so this is a guard against
-/// filling the basket with half the library by accident, not a limit on how many
-/// you can shop for — tap `s` on individual tracks and they queue up behind each
-/// other with no cap.
-const BULK_SHOP_CAP: usize = 25;
-
 pub fn handle_key(app: &mut App, key: KeyEvent) {
     // Ignore key-release / repeat events from crossterm's KittyKeyboard-style
     // enhanced events. Only process Press.
@@ -441,7 +433,7 @@ fn handle_shop(app: &mut App, key: KeyEvent) {
             app.open_queue();
         }
         (KeyCode::Char('S'), _) => {
-            app.shop_selected(BULK_SHOP_CAP);
+            app.shop_selected();
         }
         // Re-run one search, keeping every other result.
         (KeyCode::Char('r'), _) => {

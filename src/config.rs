@@ -62,6 +62,12 @@ pub struct Search {
     /// This is the rate-limit mitigation: probing every hit would mean an item
     /// page fetch per result, which is the quickest route to a 429.
     pub enrich_top_n: usize,
+    /// Most tracks one bulk shop (`S` in the TUI) queues at once.
+    ///
+    /// Each track is a full fan-out across every backend, so this guards against
+    /// searching half the library by accident. Not a limit on how many you can
+    /// shop for: `S` again takes the next batch.
+    pub bulk_max: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,6 +215,7 @@ impl Default for Search {
             timeout_secs: 20,
             limit: 8,
             enrich_top_n: 5,
+            bulk_max: 25,
         }
     }
 }

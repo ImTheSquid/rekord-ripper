@@ -1114,12 +1114,6 @@ fn offer_body(app: &App, width: u16, focused: bool) -> OfferView {
                     ),
                     Style::new().fg(Color::DarkGray),
                 )));
-                if crate::acquire::shop::has_mixed_currencies(&all_offers) {
-                    lines.push(Line::from(Span::styled(
-                        "different currencies are not compared — no exchange rates available",
-                        Style::new().fg(Color::DarkGray),
-                    )));
-                }
             }
 
             let title = if multi {
@@ -1162,6 +1156,15 @@ fn detail_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                 Span::raw(what.clone()),
                 Span::styled(
                     format!("  ({}s)", since.elapsed().as_secs()),
+                    Style::new().fg(Color::DarkGray),
+                ),
+                // Waiting downloads are invisible otherwise: the panel only ever
+                // shows the one in flight.
+                Span::styled(
+                    match app.fetch_queue.len() {
+                        0 | 1 => String::new(),
+                        n => format!("  +{} queued", n - 1),
+                    },
                     Style::new().fg(Color::DarkGray),
                 ),
             ]));
@@ -1516,7 +1519,7 @@ SHOP SCREEN — find and download better copies
   S                Search every track in the basket
   c                Empty the basket
   r                Re-run one search, keeping every other result
-  Enter            (Tracks) Search it   (Offers) Download it
+  Enter            (Tracks) Search it   (Offers) Download it, or queue it
   f                Download the highlighted offer, and queue an analysis
                    transfer from its own source track onto the download
   o                Open the offer's page in a browser (to buy it)

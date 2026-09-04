@@ -280,7 +280,7 @@ fn main() -> anyhow::Result<()> {
             "the filter should be hiding the whole basket"
         );
 
-        if app.shop_selected(25) {
+        if app.shop_selected() {
             let t = Instant::now();
             loop {
                 term.draw(|f| render::draw(f, &mut app))?;

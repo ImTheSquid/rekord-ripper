@@ -9,7 +9,7 @@
 
 use owo_colors::OwoColorize;
 
-use super::shop::{RankedOffer, SearchOutcome, cheapest_per_currency, has_mixed_currencies};
+use super::shop::{RankedOffer, SearchOutcome, cheapest_per_currency};
 use super::types::*;
 
 /// Truncate to `max` display columns, ending in `…` when shortened.
@@ -159,23 +159,14 @@ fn backend_footer(out: &SearchOutcome) -> String {
     s
 }
 
-/// The cheapest offer per currency, and why that cannot be a single number.
+/// The cheapest offer per currency.
 fn currency_footer(offers: &[RankedOffer]) -> String {
     let cheap = cheapest_per_currency(offers);
     if cheap.is_empty() {
         return String::new();
     }
     let parts: Vec<String> = cheap.iter().map(|(p, b)| format!("{p} ({b})")).collect();
-    let mut s = format!("cheapest per currency: {}\n", parts.join("   "));
-    if has_mixed_currencies(offers) {
-        s.push_str(&format!(
-            "{}\n",
-            "note: prices in different currencies are not compared — \
-             no exchange rates available."
-                .dimmed()
-        ));
-    }
-    s
+    format!("cheapest per currency: {}\n", parts.join("   "))
 }
 
 #[cfg(test)]
@@ -299,15 +290,14 @@ mod tests {
         };
         let t = table(&out);
         assert!(t.contains("4.00 GBP"), "{t}");
-        assert!(t.contains("1.29 USD"), "{t}");
         assert!(
-            t.contains("no exchange rates available"),
-            "the caveat must be printed whenever currencies are mixed:\n{t}"
+            t.contains("1.29 USD"),
+            "each currency gets its own entry rather than one overall winner:\n{t}"
         );
     }
 
     #[test]
-    fn a_single_currency_table_omits_the_caveat() {
+    fn a_single_currency_table_still_reports_the_cheapest() {
         let mut a = offer();
         a.pricing = Pricing::Flat(Price::new(400, "GBP"));
         let out = SearchOutcome {
@@ -315,8 +305,8 @@ mod tests {
             per_backend: vec![],
         };
         let t = table(&out);
-        assert!(t.contains("cheapest per currency"));
-        assert!(!t.contains("no exchange rates"), "{t}");
+        assert!(t.contains("cheapest per currency"), "{t}");
+        assert!(t.contains("4.00 GBP"), "{t}");
     }
 
     #[test]
