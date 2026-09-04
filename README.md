@@ -189,7 +189,8 @@ analysis transfer against that offer's own source track, which after a batch of
 searches is not necessarily the track under the list cursor. `Enter` on further
 offers stacks them behind the running download rather than refusing: they run
 one at a time, for the same reason searches do, and each finished file is paired
-with the source track its own offer came from. `Esc` goes back.
+with the source track its own offer came from. The `D` column says which is
+which — `↓` downloading, `…` queued, `✓` landed. `Esc` goes back.
 
 Searches run on a background thread, so leaving the screen loses nothing and `s`
 returns to it. They run sequentially rather than in parallel: each track is

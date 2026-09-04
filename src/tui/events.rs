@@ -40,9 +40,10 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
 /// Read-only for now: navigation, and the state each entry is in.
 fn handle_pending(app: &mut App, key: KeyEvent) {
     match (key.code, key.modifiers) {
-        // Esc leaves the screen rather than quitting, matching the shop screen.
+        // Esc leaves the screen rather than quitting, matching the shop screen,
+        // and returns to whichever screen `p` was pressed on.
         (KeyCode::Esc, _) | (KeyCode::Char('q'), _) => {
-            app.screen = Screen::Transfer;
+            app.close_queue();
         }
         (KeyCode::Char('?'), _) => app.mode = InputMode::Help,
         (KeyCode::Up, _) | (KeyCode::Char('k'), _) => app.queue.move_by(-1),

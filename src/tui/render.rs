@@ -7,8 +7,8 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use crate::format::{file_type_name, format_bpm, format_length};
 
 use super::app::{
-    App, ConfirmKind, Focus, InputMode, PendingBatch, Screen, ShopFocus, ShopTrackState,
-    StatusLevel,
+    App, ConfirmKind, Focus, InputMode, OfferFetch, PendingBatch, Screen, ShopFocus,
+    ShopTrackState, StatusLevel,
 };
 use super::diff::render_pair;
 use crate::library::TrackRow;
@@ -571,10 +571,26 @@ fn draw_shop_screen(f: &mut Frame, app: &App) {
 }
 
 /// The queue of downloads that have not become transfers yet.
+/// Downloads listed on the pending screen before it says "and N more". Enough to
+/// see what is happening without the block crowding out the queue itself.
+const MAX_DL_ROWS: usize = 5;
+
+/// Height of the downloads block, or 0 when nothing is downloading — the queue
+/// keeps the whole pane the rest of the time.
+fn downloading_height(queued: usize) -> u16 {
+    if queued == 0 {
+        return 0;
+    }
+    let overflow = usize::from(queued > MAX_DL_ROWS);
+    (queued.min(MAX_DL_ROWS) + overflow) as u16 + 2
+}
+
 fn draw_pending_screen(f: &mut Frame, app: &App) {
     let status = status_bar(app, f.area());
+    let dl = downloading_height(app.fetch_queue.len());
     let outer = Layout::vertical([
         Constraint::Length(1),                   // top bar
+        Constraint::Length(dl),                  // downloads in flight
         Constraint::Min(0),                      // the queue
         Constraint::Length(status.len() as u16), // status bar
     ])
@@ -587,15 +603,65 @@ fn draw_pending_screen(f: &mut Frame, app: &App) {
     }
     f.render_widget(Paragraph::new(Line::from(spans)), outer[0]);
 
-    draw_pending_list(f, outer[1], app);
-    f.render_widget(Paragraph::new(status), outer[2]);
+    if dl > 0 {
+        draw_downloading(f, outer[1], app);
+    }
+    draw_pending_list(f, outer[2], app);
+    f.render_widget(Paragraph::new(status), outer[3]);
+}
+
+/// Downloads that have not landed yet.
+///
+/// Their own block rather than rows in the queue list below: they have no entry
+/// id or file yet, and the list's cursor indexes real entries that keys act on.
+fn draw_downloading(f: &mut Frame, area: Rect, app: &App) {
+    let n = app.fetch_queue.len();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(Color::Cyan))
+        .title(format!(" DOWNLOADING ({n}) "));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let since = match &app.fetch {
+        super::app::FetchState::Running { since, .. } => Some(*since),
+        _ => None,
+    };
+    let mut lines: Vec<Line> = Vec::new();
+    for (what, running) in app.fetch_queue.iter().take(MAX_DL_ROWS) {
+        let mut spans = if running {
+            vec![Span::styled(
+                format!("{} ", spinner(since)),
+                Style::new().fg(Color::Cyan),
+            )]
+        } else {
+            vec![Span::styled("… ", Style::new().fg(Color::DarkGray))]
+        };
+        spans.push(Span::raw(what.to_string()));
+        if let Some(since) = since.filter(|_| running) {
+            spans.push(Span::styled(
+                format!("  ({}s)", since.elapsed().as_secs()),
+                Style::new().fg(Color::DarkGray),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    if n > MAX_DL_ROWS {
+        lines.push(Line::from(Span::styled(
+            format!("  and {} more queued", n - MAX_DL_ROWS),
+            Style::new().fg(Color::DarkGray),
+        )));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_pending_list(f: &mut Frame, area: Rect, app: &App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::new().fg(Color::Cyan))
-        .title(format!(" DOWNLOADS ({}) ", app.queue.entries.len()));
+        // Not "DOWNLOADS": these have already downloaded, and the block above
+        // holds the ones that have not.
+        .title(format!(" AWAITING TRANSFER ({}) ", app.queue.entries.len()));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -1054,6 +1120,7 @@ fn offer_body(app: &App, width: u16, focused: bool) -> OfferView {
                         offer_row(
                             Row {
                                 marker: lossless_marker(o),
+                                dl: dl_marker(app.offer_fetch(&o.item_ref)),
                                 backend: o.backend().as_str(),
                                 title: &format!("{} — {}", o.artist, o.title),
                                 formats: &crate::acquire::render::format_cell(o),
@@ -1213,6 +1280,10 @@ fn detail_lines(app: &App, width: u16) -> Vec<Line<'static>> {
             MARKER_LEGEND,
             Style::new().fg(Color::DarkGray),
         )));
+        lines.push(Line::from(Span::styled(
+            DL_LEGEND,
+            Style::new().fg(Color::DarkGray),
+        )));
         for (label, value) in [
             ("artist", o.artist.clone()),
             ("title", o.title.clone()),
@@ -1270,6 +1341,22 @@ fn lossless_marker(o: &crate::acquire::types::Offer) -> &'static str {
 /// The legend for [`lossless_marker`]. Kept next to it so the two stay in step.
 const MARKER_LEGEND: &str = "L: * lossless, ? formats not checked (only top offers are probed)";
 
+/// The download-state marker, so a row says for itself that you asked for it.
+///
+/// Without this the only sign was the detail panel, which shows one download at
+/// a time — with a queue behind it, `Enter` looked like it had done nothing.
+fn dl_marker(state: OfferFetch) -> &'static str {
+    match state {
+        OfferFetch::None => " ",
+        OfferFetch::Queued => "…",
+        OfferFetch::Running => "↓",
+        OfferFetch::Done => "✓",
+    }
+}
+
+/// The legend for [`dl_marker`]. Kept next to it so the two stay in step.
+const DL_LEGEND: &str = "D: ↓ downloading, … queued, ✓ downloaded";
+
 /// Wide enough for three format names, which is what `format_cell` shows.
 const FORMATS_W: u16 = 23;
 
@@ -1279,6 +1366,7 @@ const OWN_W: u16 = 4;
 const BACKEND_W: u16 = 11;
 const PRICE_W: u16 = 16;
 const MARKER_W: u16 = 2;
+const DL_W: u16 = 2;
 
 /// Narrowest artist/title worth showing.
 const MIN_TITLE_W: u16 = 20;
@@ -1286,7 +1374,7 @@ const MIN_TITLE_W: u16 = 20;
 /// Every column except artist/title and `own`, plus the three separators between
 /// them. Derived from the same pieces [`offer_row`] formats, so the two cannot
 /// drift — they did, by one column, and the row silently ran off the pane.
-const FIXED_NO_OWN: u16 = MARKER_W + BACKEND_W + FORMATS_W + PRICE_W + 3;
+const FIXED_NO_OWN: u16 = MARKER_W + DL_W + BACKEND_W + FORMATS_W + PRICE_W + 3;
 
 /// The same, with `own` and its separator.
 const FIXED_COLUMNS: u16 = FIXED_NO_OWN + 1 + OWN_W;
@@ -1309,6 +1397,7 @@ fn title_width(content_width: u16) -> usize {
 /// The cells of one offer-table row.
 struct Row<'a> {
     marker: &'a str,
+    dl: &'a str,
     backend: &'a str,
     title: &'a str,
     formats: &'a str,
@@ -1324,13 +1413,15 @@ struct Row<'a> {
 fn offer_row(r: Row<'_>, content_width: u16) -> String {
     let tw = title_width(content_width);
     let mut s = format!(
-        "{:<mw$}{:<bw$} {:<tw$} {:<fw$} {:<pw$}",
+        "{:<mw$}{:<dw$}{:<bw$} {:<tw$} {:<fw$} {:<pw$}",
         r.marker,
+        r.dl,
         clip_cell(r.backend, BACKEND_W as usize),
         clip_cell(r.title, tw),
         clip_cell(r.formats, FORMATS_W as usize),
         clip_cell(r.price, PRICE_W as usize),
         mw = MARKER_W as usize,
+        dw = DL_W as usize,
         bw = BACKEND_W as usize,
         fw = FORMATS_W as usize,
         pw = PRICE_W as usize,
@@ -1346,6 +1437,7 @@ fn offer_header(content_width: u16) -> String {
     offer_row(
         Row {
             marker: "L",
+            dl: "D",
             backend: "backend",
             title: "artist / title",
             formats: "formats",
@@ -1544,11 +1636,12 @@ PENDING SCREEN — downloads that have not become transfers yet
                    loosening score_max
   c                Forget the highlighted entry (a hard delete, no undo)
   R                Re-read the queue, retiring anything stale
-  Esc / q          Back to the transfer screen
+  Esc / q          Back to the screen you opened this from
 
   A download queued by 'f' on the shop screen lands here. Each row shows
   where it has got to: awaiting import until rekordbox (or this tool) has
-  a row for the file, then the fingerprint verdict, then applied.
+  a row for the file, then the fingerprint verdict, then applied. Downloads
+  still running are listed above it, since they have no entry yet.
 
   Nothing here bypasses a gate: the fingerprint still has to agree the two
   files are the same recording and time-aligned, master.db is still backed
@@ -1673,6 +1766,7 @@ mod tests {
             let row = offer_row(
                 Row {
                     marker: "*",
+                    dl: "↓",
                     backend: "bandcamp",
                     title: "Some Artist — Some Very Long Track Title Indeed",
                     formats: "FLAC AIFF WAV",
@@ -1710,6 +1804,7 @@ mod tests {
         let row = offer_row(
             Row {
                 marker: "*",
+                dl: "✓",
                 backend: "bandcamp",
                 title: "A — B",
                 formats: "FLAC",
@@ -1734,13 +1829,69 @@ mod tests {
     }
 
     #[test]
+    fn the_downloads_block_is_sized_to_what_it_actually_draws() {
+        // Too short clips the last row, too tall steals it from the queue.
+        assert_eq!(downloading_height(0), 0, "no block when nothing downloads");
+        assert_eq!(downloading_height(1), 3, "one row plus the borders");
+        assert_eq!(downloading_height(MAX_DL_ROWS), MAX_DL_ROWS as u16 + 2);
+        assert_eq!(
+            downloading_height(MAX_DL_ROWS + 1),
+            MAX_DL_ROWS as u16 + 3,
+            "the overflow line needs a row of its own"
+        );
+        assert_eq!(
+            downloading_height(500),
+            downloading_height(MAX_DL_ROWS + 1),
+            "a long queue must not grow the block without bound"
+        );
+    }
+
+    #[test]
     fn the_legend_fits_the_narrowest_pane_it_is_drawn_in() {
         let narrowest = (FIXED_NO_OWN + MIN_TITLE_W) as usize;
-        assert!(
-            MARKER_LEGEND.chars().count() <= narrowest,
-            "legend is {} wide, pane is {narrowest}",
-            MARKER_LEGEND.chars().count()
+        for legend in [MARKER_LEGEND, DL_LEGEND] {
+            assert!(
+                legend.chars().count() <= narrowest,
+                "legend is {} wide, pane is {narrowest}: {legend}",
+                legend.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn every_download_state_has_its_own_marker_and_the_legend_explains_it() {
+        use OfferFetch::*;
+        let asked_for = [Queued, Running, Done];
+        let mut seen: Vec<&str> = vec![dl_marker(None)];
+        for s in asked_for {
+            let m = dl_marker(s);
+            assert!(!seen.contains(&m), "{s:?} reuses the marker {m:?}");
+            assert!(
+                DL_LEGEND.contains(m),
+                "the legend must say what {m:?} means: {DL_LEGEND}"
+            );
+            seen.push(m);
+        }
+        assert_eq!(
+            dl_marker(None),
+            " ",
+            "an offer nobody asked for carries no marker"
         );
+    }
+
+    #[test]
+    fn the_download_marker_column_is_one_cell_plus_its_gap() {
+        // Every marker has to be a single character: the column is padded by
+        // char count, so a two-character one shifts the whole row.
+        for s in [
+            OfferFetch::None,
+            OfferFetch::Queued,
+            OfferFetch::Running,
+            OfferFetch::Done,
+        ] {
+            assert_eq!(dl_marker(s).chars().count(), 1, "{s:?}");
+        }
+        assert_eq!(DL_W, 2, "one for the marker, one for the gap");
     }
 
     #[test]
