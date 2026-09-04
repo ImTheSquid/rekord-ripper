@@ -416,6 +416,132 @@ fn fold(
     }
 }
 
+/// The track row itself.
+///
+/// Column set and constants taken from a row rekordbox created on this device:
+/// rb_data_status 256, SearchStr NULL, ExtInfo "null", ColorID/VideoAssociate
+/// "0", HotCueAutoLoad/DeliveryControl "on", OrgFolderPath NULL for local files.
+/// `usn` is left NULL because that counter is server-assigned.
+/// Named parameters, not positional: this writes 50 columns into the user's
+/// library and a misaligned `?n` would put an album name in DiscNo without
+/// anything failing.
+const CONTENT_INSERT: &str = "INSERT INTO djmdContent
+       (ID, FolderPath, FileNameL, FileNameS, Title,
+        ArtistID, AlbumID, GenreID,
+        BPM, Length, TrackNo, DiscNo, BitRate, BitDepth, FileType, Rating,
+        ReleaseYear, Commnt,
+        StockDate, DateCreated, ColorID, DJPlayCount,
+        MasterDBID, MasterSongID,
+        AnalysisDataPath, SearchStr, FileSize, SampleRate,
+        Analysed, ContentLink, HotCueAutoLoad, DeliveryControl,
+        SamplerTrackInfo, SamplerPlayOffset, SamplerGain, VideoAssociate,
+        LyricStatus, ServiceID, OrgFolderPath, ExtInfo, DeviceID, UUID,
+        rb_data_status, rb_local_data_status, rb_local_deleted, rb_local_synced,
+        usn, rb_local_usn, created_at, updated_at)
+     VALUES
+       (:id, :folder_path, :file_name, NULL, :title,
+        :artist_id, :album_id, :genre_id,
+        NULL, :length, :track_no, :disc_no, :bit_rate, :bit_depth, :file_type, 0,
+        :release_year, :comment,
+        :today, :today, '0', 0,
+        :master_db_id, :id,
+        NULL, NULL, :file_size, :sample_rate,
+        0, :content_link, 'on', 'on',
+        0, 0, 0.0, '0',
+        0, 0, NULL, 'null', :device_id, :uuid,
+        256, 0, 0, 0,
+        NULL, :usn, :now, :now)";
+
+/// The insert for a name-keyed lookup table. `{}` is the table name.
+///
+/// The three tables do not share a column set: `djmdGenre` has no `SearchStr`,
+/// so naming it here failed the whole import with "no column named SearchStr".
+/// Only the columns all three have are named, which is every column this writes
+/// a value to — `SearchStr` was being set to the NULL it defaults to anyway.
+const LOOKUP_INSERT: &str = "INSERT INTO {} (ID, Name, UUID,
+        rb_data_status, rb_local_data_status, rb_local_deleted, rb_local_synced,
+        rb_local_usn, created_at, updated_at)
+     VALUES (?1, ?2, ?3, 256, 0, 0, 0, ?4, ?5, ?5)";
+
+/// Mint one row in a name-keyed lookup table.
+fn insert_lookup(
+    tx: &rusqlite::Transaction<'_>,
+    lookup: &NewLookup,
+    usn: i64,
+    now: &str,
+) -> Result<()> {
+    tx.execute(
+        &LOOKUP_INSERT.replace("{}", lookup.table),
+        params![lookup.id, lookup.name, lookup.uuid, usn, now],
+    )?;
+    Ok(())
+}
+
+/// The column names an INSERT statement lists, in order.
+fn named_columns(insert: &str) -> Vec<&str> {
+    let open = insert.find('(').expect("an INSERT names its columns");
+    let close = open + insert[open..].find(')').expect("unclosed column list");
+    split_list(&insert[open + 1..close])
+}
+
+fn split_list(s: &str) -> Vec<&str> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .collect()
+}
+
+/// Columns of `wanted` that `table` does not have.
+///
+/// The table name is interpolated because `PRAGMA` takes no bound parameters.
+/// Every name reaching here is one of this module's own constants.
+fn missing_columns(db: &MasterDb, table: &str, wanted: &[&str]) -> Result<Vec<String>> {
+    let mut stmt = db.conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let have: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<rusqlite::Result<_>>()?;
+    if have.is_empty() {
+        bail!("this database has no {table} table");
+    }
+    Ok(wanted
+        .iter()
+        .filter(|c| !have.iter().any(|h| h.eq_ignore_ascii_case(c)))
+        .map(|c| c.to_string())
+        .collect())
+}
+
+/// Refuse the import when this rekordbox's schema is not the one the statements
+/// below were written against.
+///
+/// Up front, and naming the table: the missing `SearchStr` on `djmdGenre`
+/// surfaced as a bare "no column named SearchStr" from inside the transaction,
+/// which said nothing about which of the four tables it meant.
+pub fn check_schema(db: &MasterDb, new: &NewContent) -> Result<()> {
+    let content = named_columns(CONTENT_INSERT);
+    let lookup = named_columns(LOOKUP_INSERT);
+
+    let lookups = [&new.new_artist, &new.new_album, &new.new_genre]
+        .into_iter()
+        .flatten()
+        .map(|l| (l.table, &lookup));
+    let mut problems: Vec<String> = Vec::new();
+    for (table, wanted) in [("djmdContent", &content)].into_iter().chain(lookups) {
+        let missing = missing_columns(db, table, wanted)?;
+        if !missing.is_empty() {
+            problems.push(format!("{table} has no {}", missing.join(", ")));
+        }
+    }
+
+    if !problems.is_empty() {
+        bail!(
+            "this rekordbox database's schema is not the one import was written \
+             against: {}",
+            problems.join("; ")
+        );
+    }
+    Ok(())
+}
+
 /// Insert the row (and its artist, if new).
 ///
 /// Takes `&mut MasterDb` and does its own transaction and USN allocation, in the
@@ -427,6 +553,8 @@ pub fn insert(db: &mut MasterDb, new: &NewContent) -> Result<UndoNote> {
     if let Some(existing) = existing_row_for_path(db, Path::new(&new.folder_path))? {
         bail!("{} was imported already as {existing}", new.folder_path);
     }
+    // Before the transaction, so a schema mismatch cannot half-write anything.
+    check_schema(db, new)?;
 
     let base_usn = db.read_local_usn()?;
     let mut next_usn = base_usn;
@@ -439,57 +567,15 @@ pub fn insert(db: &mut MasterDb, new: &NewContent) -> Result<UndoNote> {
 
     let tx = db.conn.unchecked_transaction()?;
 
-    // The three lookup tables share a column shape, so one statement shape does.
     for lookup in [&new.new_artist, &new.new_album, &new.new_genre]
         .into_iter()
         .flatten()
     {
-        tx.execute(
-            &format!(
-                "INSERT INTO {} (ID, Name, SearchStr, UUID,
-                    rb_data_status, rb_local_data_status, rb_local_deleted, rb_local_synced,
-                    rb_local_usn, created_at, updated_at)
-                 VALUES (?1, ?2, NULL, ?3, 256, 0, 0, 0, ?4, ?5, ?5)",
-                lookup.table
-            ),
-            params![lookup.id, lookup.name, lookup.uuid, allocate(), now],
-        )?;
+        insert_lookup(&tx, lookup, allocate(), &now)?;
     }
 
-    // Column set and constants taken from a row rekordbox created on this device:
-    // rb_data_status 256, SearchStr NULL, ExtInfo "null", ColorID/VideoAssociate
-    // "0", HotCueAutoLoad/DeliveryControl "on", OrgFolderPath NULL for local files.
-    // `usn` is left NULL because that counter is server-assigned.
-    // Named parameters, not positional: this writes 46 columns into the user's
-    // library and a misaligned `?n` would put an album name in DiscNo without
-    // anything failing.
     tx.execute(
-        "INSERT INTO djmdContent
-           (ID, FolderPath, FileNameL, FileNameS, Title,
-            ArtistID, AlbumID, GenreID,
-            BPM, Length, TrackNo, DiscNo, BitRate, BitDepth, FileType, Rating,
-            ReleaseYear, Commnt,
-            StockDate, DateCreated, ColorID, DJPlayCount,
-            MasterDBID, MasterSongID,
-            AnalysisDataPath, SearchStr, FileSize, SampleRate,
-            Analysed, ContentLink, HotCueAutoLoad, DeliveryControl,
-            SamplerTrackInfo, SamplerPlayOffset, SamplerGain, VideoAssociate,
-            LyricStatus, ServiceID, OrgFolderPath, ExtInfo, DeviceID, UUID,
-            rb_data_status, rb_local_data_status, rb_local_deleted, rb_local_synced,
-            usn, rb_local_usn, created_at, updated_at)
-         VALUES
-           (:id, :folder_path, :file_name, NULL, :title,
-            :artist_id, :album_id, :genre_id,
-            NULL, :length, :track_no, :disc_no, :bit_rate, :bit_depth, :file_type, 0,
-            :release_year, :comment,
-            :today, :today, '0', 0,
-            :master_db_id, :id,
-            NULL, NULL, :file_size, :sample_rate,
-            0, :content_link, 'on', 'on',
-            0, 0, 0.0, '0',
-            0, 0, NULL, 'null', :device_id, :uuid,
-            256, 0, 0, 0,
-            NULL, :usn, :now, :now)",
+        CONTENT_INSERT,
         rusqlite::named_params! {
             ":id": new.id,
             ":folder_path": new.folder_path,
@@ -590,6 +676,144 @@ pub fn anlz_path_for(new: &NewContent) -> String {
 mod tests {
     use super::*;
     use crate::audio::AudioInfo;
+
+    /// The columns an INSERT supplies values for, so a test can compare the two
+    /// halves of a statement it must not desync.
+    fn supplied_values(insert: &str) -> Vec<&str> {
+        let at = insert.find("VALUES").expect("an INSERT supplies values");
+        let open = at + insert[at..].find('(').expect("no value list");
+        let close = open + insert[open..].find(')').expect("unclosed value list");
+        split_list(&insert[open + 1..close])
+    }
+
+    #[test]
+    fn every_insert_supplies_exactly_one_value_per_column_it_names() {
+        // These statements are long enough that a column added to one half and
+        // not the other is easy to miss, and SQLite would only say "N values for
+        // M columns" at import time.
+        for (what, sql) in [("djmdContent", CONTENT_INSERT), ("lookup", LOOKUP_INSERT)] {
+            let cols = named_columns(sql);
+            let vals = supplied_values(sql);
+            assert_eq!(
+                cols.len(),
+                vals.len(),
+                "{what}: {} columns, {} values",
+                cols.len(),
+                vals.len()
+            );
+            assert!(cols.len() > 1, "{what}: the column list did not parse");
+        }
+    }
+
+    /// A database whose tables carry exactly the columns the inserts name, minus
+    /// anything in `drop_from`.
+    fn schema_db(drop_from: &[(&str, &str)]) -> MasterDb {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let tables = [
+            ("djmdContent", named_columns(CONTENT_INSERT)),
+            ("djmdArtist", named_columns(LOOKUP_INSERT)),
+            ("djmdAlbum", named_columns(LOOKUP_INSERT)),
+            ("djmdGenre", named_columns(LOOKUP_INSERT)),
+        ];
+        for (table, columns) in tables {
+            let cols: Vec<String> = columns
+                .iter()
+                .filter(|c| !drop_from.contains(&(table, c)))
+                .map(|c| format!("{c} TEXT"))
+                .collect();
+            conn.execute_batch(&format!("CREATE TABLE {table} ({})", cols.join(", ")))
+                .unwrap();
+        }
+        MasterDb {
+            conn,
+            app_dir: std::path::PathBuf::from("."),
+        }
+    }
+
+    fn with_genre() -> NewContent {
+        NewContent {
+            new_genre: Some(NewLookup {
+                table: "djmdGenre",
+                id: "1".into(),
+                uuid: "u".into(),
+                name: "ducter".into(),
+            }),
+            ..content()
+        }
+    }
+
+    #[test]
+    fn a_schema_carrying_every_named_column_passes_the_preflight() {
+        check_schema(&schema_db(&[]), &with_genre()).unwrap();
+    }
+
+    #[test]
+    fn the_preflight_names_the_table_and_the_column_that_is_missing() {
+        // The failure that prompted this: the error said "no column named
+        // SearchStr" and nothing about which of the four tables meant it.
+        let db = schema_db(&[("djmdGenre", "Name")]);
+        let e = check_schema(&db, &with_genre()).unwrap_err().to_string();
+        assert!(e.contains("djmdGenre"), "{e}");
+        assert!(e.contains("Name"), "{e}");
+    }
+
+    #[test]
+    fn the_preflight_says_so_when_a_table_is_absent_entirely() {
+        let db = schema_db(&[]);
+        db.conn.execute_batch("DROP TABLE djmdGenre").unwrap();
+        let e = check_schema(&db, &with_genre()).unwrap_err().to_string();
+        assert!(e.contains("no djmdGenre table"), "{e}");
+    }
+
+    #[test]
+    fn a_lookup_table_is_only_checked_when_something_is_going_into_it() {
+        // No genre in the tags means no genre row, so a genre table this build
+        // does not recognise must not block the import.
+        let db = schema_db(&[("djmdGenre", "Name")]);
+        check_schema(&db, &content()).unwrap();
+    }
+
+    #[test]
+    fn a_lookup_row_lands_in_every_table_including_one_without_searchstr() {
+        // The three tables do not share a column set. Naming `SearchStr` failed
+        // the whole import on `djmdGenre`, which does not have it, so the insert
+        // must name only what all three do.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        for (table, search_str) in [
+            ("djmdArtist", ", SearchStr TEXT"),
+            ("djmdAlbum", ", SearchStr TEXT"),
+            ("djmdGenre", ""),
+        ] {
+            conn.execute_batch(&format!(
+                "CREATE TABLE {table} (
+                     ID TEXT PRIMARY KEY, Name TEXT, UUID TEXT{search_str},
+                     rb_data_status INTEGER, rb_local_data_status INTEGER,
+                     rb_local_deleted INTEGER, rb_local_synced INTEGER,
+                     rb_local_usn INTEGER, created_at TEXT, updated_at TEXT)"
+            ))
+            .unwrap();
+        }
+
+        let tx = conn.unchecked_transaction().unwrap();
+        for table in ["djmdArtist", "djmdAlbum", "djmdGenre"] {
+            let lookup = NewLookup {
+                table,
+                id: "1".into(),
+                uuid: "u".into(),
+                name: "ducter".into(),
+            };
+            insert_lookup(&tx, &lookup, 7, "2026-01-01 00:00:00.000 +00:00")
+                .unwrap_or_else(|e| panic!("{table}: {e}"));
+        }
+        tx.commit().unwrap();
+
+        for table in ["djmdArtist", "djmdAlbum", "djmdGenre"] {
+            let name: String = conn
+                .query_row(&format!("SELECT Name FROM {table}"), [], |r| r.get(0))
+                .unwrap_or_else(|e| panic!("{table}: {e}"));
+            assert_eq!(name, "ducter", "{table}");
+        }
+    }
 
     fn info() -> AudioInfo {
         AudioInfo {
