@@ -24,6 +24,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     match app.mode {
         InputMode::Confirm(ConfirmKind::Transfer) => draw_confirm(f, app),
         InputMode::Confirm(ConfirmKind::ImportRows) => draw_import_confirm(f, app),
+        InputMode::Confirm(ConfirmKind::ForceApply) => draw_force_confirm(f, app),
+        InputMode::Confirm(ConfirmKind::ClearQueue) => draw_clear_confirm(f, app),
         InputMode::Help => draw_help(f, app),
         _ => {}
     }
@@ -250,7 +252,7 @@ fn key_hints(screen: Screen) -> &'static str {
             "tab pane  / filter  s search  space basket  S search basket  r re-search  enter download  o buy page  y ref  p queue  esc back"
         }
         Screen::Pending => {
-            "↑↓ move  i import  a apply  r retry  c forget  R refresh  ? help  esc back"
+            "↑↓ move  i import  a apply  F force  r retry  c forget  C clear all  R refresh  ? help  esc back"
         }
     }
 }
@@ -382,6 +384,87 @@ fn draw_import_confirm(f: &mut Frame, app: &mut App) {
             .scroll((scroll as u16, 0)),
         area,
     );
+}
+
+/// The one gate a forced transfer still has: the plan, and what is being waived.
+///
+/// Red rather than yellow, and it leads with the waiver — the plan below looks
+/// exactly like a checked one, so the difference has to be said, not inferred.
+fn draw_force_confirm(f: &mut Frame, app: &mut App) {
+    let Some(batch) = app.force_batch.as_ref() else {
+        return;
+    };
+    let area = popup_area(f.area(), 88, 80);
+    f.render_widget(Clear, area);
+
+    let mut lines: Vec<Line> = vec![
+        Line::styled(
+            "TRANSFERRING WITHOUT THE FINGERPRINT CHECK",
+            Style::new().fg(Color::Red).bold(),
+        ),
+        Line::styled(batch.verdict.summary(), Style::new().fg(Color::Red)),
+        Line::styled(
+            "Nothing proves these are the same recording at the same alignment. \
+             Cues and the beat grid may land anywhere. master.db is backed up first.",
+            Style::new().fg(Color::Yellow),
+        ),
+        Line::from(""),
+    ];
+    lines.extend(
+        batch
+            .plan
+            .render()
+            .lines()
+            .map(|l| Line::raw(l.to_string()))
+            .collect::<Vec<_>>(),
+    );
+    for w in &batch.plan.warnings {
+        lines.push(Line::styled(
+            format!("warning: {w}"),
+            Style::new().fg(Color::Yellow),
+        ));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::styled(
+        "y apply unverified   n cancel   ↑↓ scroll",
+        Style::new().bold(),
+    ));
+
+    let viewport = area.height.saturating_sub(2) as usize;
+    let scroll = clamp_help_scroll(batch.scroll as usize, viewport, lines.len());
+    if let Some(b) = app.force_batch.as_mut() {
+        b.scroll = scroll as u16;
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(Color::Red))
+        .title(" FORCE APPLY — UNVERIFIED ");
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .scroll((scroll as u16, 0)),
+        area,
+    );
+}
+
+/// Emptying the queue: a hard delete, so it says how many and what survives.
+fn draw_clear_confirm(f: &mut Frame, app: &mut App) {
+    let n = app.queue.entries.len();
+    let body = format!(
+        "Forget all {n} queued transfer(s)?\n\
+         \n\
+         This cannot be undone. The downloaded files stay on disk, and nothing\n\
+         in your rekordbox collection is touched — only the queue is emptied.\n\
+         \n\
+         y clear   n cancel"
+    );
+    let area = content_popup(f.area(), &body);
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(Color::Yellow))
+        .title(" CLEAR QUEUE ");
+    f.render_widget(Paragraph::new(body).block(block), area);
 }
 
 /// Gate 2 for a transfer: every destination that will be written, before any is.
@@ -1631,10 +1714,16 @@ PENDING SCREEN — downloads that have not become transfers yet
   a                Fingerprint what has a row, then apply what passes. One
                    at a time: a check against a streaming source downloads
                    it first, so a queue of them takes minutes
+  F                Transfer the highlighted entry with NO fingerprint check,
+                   after showing you the plan. For a source the check cannot
+                   answer for at all — a DRM stream, a file on another
+                   machine — and for one it rejected that you disagree with.
+                   The entry is recorded as UNVERIFIED
   r                Put the highlighted entry back in the queue — a rejection
                    is meant to be retryable after re-encoding or after
                    loosening score_max
   c                Forget the highlighted entry (a hard delete, no undo)
+  C                Forget every entry. The downloaded files stay on disk
   R                Re-read the queue, retiring anything stale
   Esc / q          Back to the screen you opened this from
 
@@ -1643,9 +1732,10 @@ PENDING SCREEN — downloads that have not become transfers yet
   a row for the file, then the fingerprint verdict, then applied. Downloads
   still running are listed above it, since they have no entry yet.
 
-  Nothing here bypasses a gate: the fingerprint still has to agree the two
-  files are the same recording and time-aligned, master.db is still backed
-  up first, and it still refuses to write while rekordbox is running.
+  'a' bypasses nothing: the fingerprint has to agree the two files are the
+  same recording and time-aligned. 'F' waives that one check and only that
+  one — master.db is still backed up first, it still refuses to write while
+  rekordbox is running, and the entry keeps a record that it was unverified.
 
 ?                  This help. ↑ ↓ / k j / PgUp / PgDn / g / G scroll it,
                    Esc or q closes it

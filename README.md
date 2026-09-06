@@ -168,6 +168,16 @@ rekord-ripper fetch https://soundcloud.com/artist/track --src-track-id 12345678
 rekord-ripper pending --list
 rekord-ripper pending --apply --import
 rekord-ripper pending --apply          # if you dragged them in yourself
+
+# When the check cannot run at all — a DRM stream, a source file on another
+# machine — or when it rejected something you disagree with. Nothing then
+# proves the two files are the same recording, so cues and the beat grid may
+# land anywhere; master.db is still backed up and the entry is kept as
+# UNVERIFIED.
+rekord-ripper pending --apply --force
+
+rekord-ripper pending --clear 12       # forget one entry
+rekord-ripper pending --clear-all      # forget the lot; the files stay put
 ```
 
 ### In the TUI

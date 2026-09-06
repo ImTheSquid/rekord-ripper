@@ -230,9 +230,16 @@ pub enum PendingAction {
         import: bool,
         /// Skip the confirmation in front of those inserts.
         yes: bool,
+        /// Transfer without the fingerprint gate, and take rejected entries as
+        /// well as waiting ones.
+        force: bool,
     },
     Clear {
         id: i64,
+    },
+    /// Forget the whole queue.
+    ClearAll {
+        yes: bool,
     },
 }
 
@@ -254,6 +261,22 @@ pub fn pending(
         PendingAction::Clear { id } => {
             store.remove(id)?;
             println!("removed #{id}");
+            Ok(())
+        }
+        PendingAction::ClearAll { yes } => {
+            let n = store.all()?.len();
+            if n == 0 {
+                println!("{}", "nothing pending.".dimmed());
+                return Ok(());
+            }
+            if !yes && !confirm(&format!("forget all {n} queued transfer(s)?"))? {
+                bail!("cancelled.");
+            }
+            let removed = store.clear_all()?;
+            println!(
+                "{} forgot {removed} entr(y/ies). The downloaded files are untouched.",
+                "ok:".green()
+            );
             Ok(())
         }
         PendingAction::List => {
@@ -295,10 +318,12 @@ pub fn pending(
             dry_run,
             import,
             yes,
-        } => apply_pending(db, &store, cfg, safety, dry_run, import, yes),
+            force,
+        } => apply_pending(db, &store, cfg, safety, dry_run, import, yes, force),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_pending(
     db: &mut MasterDb,
     store: &PendingStore,
@@ -307,8 +332,16 @@ fn apply_pending(
     dry_run: bool,
     import_missing_rows: bool,
     yes: bool,
+    force: bool,
 ) -> Result<()> {
-    let waiting = store.in_state(State::AwaitingImport)?;
+    let mut waiting = store.in_state(State::AwaitingImport)?;
+    // --force takes every entry that has not finished, not just the waiting
+    // ones. A rejection is what it is usually aimed at, and `matched` is where
+    // a dry run leaves anything it planned — neither is reachable otherwise.
+    if force {
+        waiting.extend(store.in_state(State::Rejected)?);
+        waiting.extend(store.in_state(State::Matched)?);
+    }
 
     // Before anything is fingerprinted: give the files rekordbox has not
     // imported a row, so they stop reading as "still waiting".
@@ -322,7 +355,23 @@ fn apply_pending(
 
     let mut ready = Vec::new();
     for entry in waiting {
-        match transfer::process(db, store, &entry, cfg)? {
+        // Per-entry, not `?`: an unverifiable source ("cannot verify source
+        // …: apple-music:… is a streaming source this tool cannot fetch")
+        // used to abort the whole run and strand every other download behind it.
+        let processed = match transfer::process(db, store, &entry, cfg, force) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("{} #{}: {e}", "fp FAILED".red(), entry.id);
+                if !force {
+                    eprintln!(
+                        "      {}",
+                        "--force transfers it anyway, with no check at all".dimmed()
+                    );
+                }
+                continue;
+            }
+        };
+        match processed {
             transfer::Processed::NotImported => {
                 let name = entry
                     .acquired_path
@@ -342,6 +391,12 @@ fn apply_pending(
             }
             transfer::Processed::Rejected(why) => {
                 eprintln!("{} #{}: {why}", "fp REJECT".red(), entry.id);
+                if !force {
+                    eprintln!(
+                        "      {}",
+                        "--force transfers it anyway, with no check at all".dimmed()
+                    );
+                }
             }
             transfer::Processed::Ready { plan, verdict, .. } => {
                 println!("{}", transfer::report(&plan, &verdict));

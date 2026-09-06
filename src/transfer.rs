@@ -224,12 +224,32 @@ pub enum Processed {
     },
 }
 
+/// Why a forced pairing could not be verified, for the record kept against it.
+///
+/// Taken from `resolve_audio_source` rather than from a real gate run: forcing
+/// exists precisely because the gate cannot answer, and ripping a stream just to
+/// write down what it said would cost minutes for a line of text.
+pub fn bypass_verdict(src: &TrackHeader) -> Verdict {
+    let reason = match resolve_audio_source(src) {
+        AudioSource::Unavailable { reason } => reason,
+        AudioSource::Streaming { uri, .. } => format!("streaming source {uri}, not fetched"),
+        AudioSource::Local(_) => "not checked".into(),
+    };
+    Verdict::Bypassed { reason }
+}
+
 /// Check one pending entry: has it been imported, and if so does it pass?
+///
+/// `force` skips the gate rather than loosening it. Everything else still
+/// holds — the row must exist, the source must still be the track this was
+/// queued for — and the entry is recorded as `Bypassed`, so an unverified
+/// transfer is never mistaken later for one that passed.
 pub fn process(
     db: &MasterDb,
     store: &PendingStore,
     entry: &Entry,
     cfg: &Config,
+    force: bool,
 ) -> Result<Processed> {
     let Some(dst_id) = find_imported_row(db, &entry.acquired_path)? else {
         return Ok(Processed::NotImported);
@@ -245,12 +265,17 @@ pub fn process(
         )));
     }
 
-    let outcome = gate(&src, &entry.acquired_path, dst.length, dst.bpm, cfg)?;
-    if !outcome.verdict.is_accept() {
-        let why = outcome.verdict.summary();
-        store.set_rejected(entry.id, &why)?;
-        return Ok(Processed::Rejected(why));
-    }
+    let verdict = if force {
+        bypass_verdict(&src)
+    } else {
+        let outcome = gate(&src, &entry.acquired_path, dst.length, dst.bpm, cfg)?;
+        if !outcome.verdict.is_accept() {
+            let why = outcome.verdict.summary();
+            store.set_rejected(entry.id, &why)?;
+            return Ok(Processed::Rejected(why));
+        }
+        outcome.verdict
+    };
 
     let plan = analysis::build_plan(
         db,
@@ -261,12 +286,12 @@ pub fn process(
             lock: entry.lock,
         },
     )?;
-    store.set_matched(entry.id, &dst_id, &outcome.verdict.summary())?;
+    store.set_matched(entry.id, &dst_id, &verdict.summary())?;
 
     Ok(Processed::Ready {
         dst_content_id: dst_id,
         plan: Box::new(plan),
-        verdict: outcome.verdict,
+        verdict,
     })
 }
 
@@ -278,7 +303,12 @@ pub fn process(
 /// hoisted here so it is actually seen.
 pub fn report(plan: &analysis::Plan, verdict: &Verdict) -> String {
     let mut s = String::new();
-    s.push_str(&format!("{} {}\n", "fp ok".green(), verdict.summary()));
+    let tag = if verdict.is_bypassed() {
+        "fp SKIPPED".red().to_string()
+    } else {
+        "fp ok".green().to_string()
+    };
+    s.push_str(&format!("{tag} {}\n", verdict.summary()));
     s.push_str(&plan.render());
     if !plan.warnings.is_empty() {
         s.push('\n');
@@ -338,6 +368,18 @@ mod tests {
             }
             other => panic!("got {other:?}"),
         }
+    }
+
+    #[test]
+    fn forcing_records_why_the_source_could_not_be_verified() {
+        // The reason is the whole value of the record: "UNVERIFIED" alone does
+        // not say whether the check disagreed or was never able to run.
+        let v = bypass_verdict(&header(Some("apple-music:tracks:6801280292")));
+        assert!(v.is_bypassed());
+        assert!(!v.is_accept(), "a bypass must never read as a pass");
+        let s = v.summary();
+        assert!(s.contains("UNVERIFIED"), "got {s}");
+        assert!(s.contains("apple-music:tracks:6801280292"), "got {s}");
     }
 
     #[test]

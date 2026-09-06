@@ -266,6 +266,15 @@ impl PendingStore {
         Ok(())
     }
 
+    /// Forget every entry, returning how many went. A hard delete with no undo,
+    /// so both callers put a confirmation in front of it.
+    ///
+    /// Only the queue is touched: nothing here has ever written to `master.db`,
+    /// and downloaded files stay on disk.
+    pub fn clear_all(&self) -> Result<usize> {
+        Ok(self.conn.execute("DELETE FROM pending_transfer", [])?)
+    }
+
     /// Retire entries that can no longer make progress.
     ///
     /// Returns what changed, so the caller can say so rather than silently
@@ -635,6 +644,37 @@ mod tests {
             .unwrap();
         s.remove(id).unwrap();
         assert!(s.all().unwrap().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn clearing_the_queue_takes_every_state_with_it() {
+        // Including applied and rejected rows: "clear the queue" that left the
+        // ones you were trying to get rid of would be no use at all.
+        let (s, dir) = store();
+        let ids: Vec<i64> = ["a.flac", "b.flac", "c.flac"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                let f = a_file(&dir, name);
+                s.add(
+                    &header(&i.to_string(), &format!("u{i}")),
+                    &f,
+                    None,
+                    true,
+                    false,
+                    14,
+                )
+                .unwrap()
+            })
+            .collect();
+        s.set_rejected(ids[1], "different recording").unwrap();
+        s.set_state(ids[2], State::Applied).unwrap();
+
+        assert_eq!(s.clear_all().unwrap(), 3);
+        assert!(s.all().unwrap().is_empty());
+        // And an empty queue clears to nothing rather than erroring.
+        assert_eq!(s.clear_all().unwrap(), 0);
         std::fs::remove_dir_all(&dir).ok();
     }
 

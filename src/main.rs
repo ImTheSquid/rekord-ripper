@@ -240,12 +240,25 @@ enum Cmd {
         /// Needs `insert_content_rows = true` under [import] in your config.
         #[arg(long, conflicts_with_all = ["list", "clear"])]
         import: bool,
-        /// Skip the confirmation in front of --import's row creation.
+        /// Skip the confirmation in front of --import's row creation, and in
+        /// front of --clear-all.
         #[arg(short = 'y', long)]
         yes: bool,
+        /// Transfer without the fingerprint check, for sources this tool cannot
+        /// verify — a DRM stream, a file that lives on another machine — and for
+        /// entries it already rejected.
+        ///
+        /// Nothing then proves the two files are the same recording at the same
+        /// alignment, so cues and the beat grid may land anywhere. master.db is
+        /// still backed up first, and the entry is recorded as UNVERIFIED.
+        #[arg(long, conflicts_with_all = ["list", "clear", "clear_all"])]
+        force: bool,
         /// Forget a queued transfer.
         #[arg(long, value_name = "ID")]
         clear: Option<i64>,
+        /// Forget every queued transfer. The downloaded files are left alone.
+        #[arg(long, conflicts_with_all = ["list", "apply", "import", "clear"])]
+        clear_all: bool,
     },
 
     /// Create rekordbox track rows for audio files, so you don't have to drag
@@ -464,16 +477,20 @@ fn main() -> Result<()> {
             apply,
             import,
             yes,
+            force,
             clear,
+            clear_all,
         } => {
             let cfg = Config::load(&config_path)?;
-            let action = match (clear, list) {
-                (Some(id), _) => acquire::cmd::PendingAction::Clear { id },
-                (None, true) => acquire::cmd::PendingAction::List,
-                (None, false) => acquire::cmd::PendingAction::Apply {
+            let action = match (clear, clear_all, list) {
+                (Some(id), _, _) => acquire::cmd::PendingAction::Clear { id },
+                (None, true, _) => acquire::cmd::PendingAction::ClearAll { yes },
+                (None, false, true) => acquire::cmd::PendingAction::List,
+                (None, false, false) => acquire::cmd::PendingAction::Apply {
                     dry_run: !apply,
                     import,
                     yes,
+                    force,
                 },
             };
             acquire::cmd::pending(
