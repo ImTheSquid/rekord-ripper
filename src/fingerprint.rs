@@ -306,6 +306,10 @@ pub enum Verdict {
         coverage: f32,
         shift_ms: i64,
     },
+    /// The check was skipped on the user's explicit instruction. Never produced
+    /// by [`compare`]: only an override makes one, and `reason` is whatever the
+    /// gate would have said, so the store keeps a record of what was waived.
+    Bypassed { reason: String },
 }
 
 impl Verdict {
@@ -313,9 +317,16 @@ impl Verdict {
         matches!(self, Self::Accept { .. })
     }
 
+    /// Deliberately unverified. Not an accept — every automatic path must still
+    /// refuse it, and only an explicit override may act on one.
+    pub fn is_bypassed(&self) -> bool {
+        matches!(self, Self::Bypassed { .. })
+    }
+
     pub fn shift_ms(&self) -> i64 {
         match self {
             Self::Accept { shift_ms, .. } | Self::Reject { shift_ms, .. } => *shift_ms,
+            Self::Bypassed { .. } => 0,
         }
     }
 
@@ -365,6 +376,9 @@ impl Verdict {
                     (a - b).abs()
                 ),
             },
+            Self::Bypassed { reason } => {
+                format!("UNVERIFIED — fingerprint check overridden by hand ({reason})")
+            }
         }
     }
 }

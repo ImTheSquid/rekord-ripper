@@ -58,6 +58,10 @@ pub enum ConfirmKind {
     Transfer,
     /// Creating `djmdContent` rows for queued downloads.
     ImportRows,
+    /// Transferring one queued entry with the fingerprint gate skipped.
+    ForceApply,
+    /// Emptying the whole download queue.
+    ClearQueue,
 }
 
 /// Rows a confirmed import will write.
@@ -432,6 +436,19 @@ pub struct PendingBatch {
     pub scroll: u16,
 }
 
+/// The one entry behind `ConfirmKind::ForceApply`.
+///
+/// The plan is built when the modal opens, so the yes is given against the
+/// actual writes — the same discipline as every other gate here, minus the one
+/// check being waived.
+pub struct ForceBatch {
+    pub entry_id: i64,
+    pub dst_content_id: String,
+    pub plan: Box<Plan>,
+    pub verdict: crate::fingerprint::Verdict,
+    pub scroll: u16,
+}
+
 pub struct App {
     pub db: MasterDb,
     pub safety: SafetyOpts,
@@ -483,6 +500,8 @@ pub struct App {
     pub store: Option<crate::pending::PendingStore>,
     /// The snapshot behind `ConfirmKind::ImportRows`.
     pub import_batch: Option<ImportBatch>,
+    /// The snapshot behind `ConfirmKind::ForceApply`.
+    pub force_batch: Option<ForceBatch>,
     /// First visible line of the help popup. Clamped during render, which is
     /// the only place the popup's height is known.
     pub help_scroll: u16,
@@ -531,6 +550,7 @@ impl App {
             queue: super::queue::QueueState::default(),
             store: crate::pending::PendingStore::open().ok(),
             import_batch: None,
+            force_batch: None,
             help_scroll: 0,
             quit_pending: false,
             should_quit: false,
@@ -1651,12 +1671,147 @@ impl App {
         }
     }
 
+    /// Build the plan for a transfer with the fingerprint gate skipped, and ask.
+    ///
+    /// For the sources the gate cannot answer for at all — a DRM stream, a file
+    /// on another machine — and for one it rejected that you disagree with.
+    /// Everything else still holds: the row must exist, the source must still be
+    /// the track this was queued for, master.db is backed up, and the entry is
+    /// recorded as UNVERIFIED rather than as having passed.
+    pub fn start_force(&mut self) {
+        let Some(entry) = self.queue.selected().cloned() else {
+            return;
+        };
+        if self.queue.in_flight(entry.id) {
+            self.status
+                .info("still checking that one — give it a moment.");
+            return;
+        }
+        let Some(dst_content_id) =
+            crate::pending::find_imported_row(&self.db, &entry.acquired_path)
+                .ok()
+                .flatten()
+        else {
+            self.status
+                .err("rekordbox has no row for this file yet — press 'i', or drag it in.");
+            return;
+        };
+        let Ok(src) = crate::analysis::load_track(&self.db, &entry.src_content_id) else {
+            self.status.err("the source track is gone.");
+            return;
+        };
+        if src.uuid != entry.src_uuid {
+            self.status
+                .err("the source track was replaced — 'c' forgets this entry.");
+            return;
+        }
+        let opts = CopyOpts {
+            replace: entry.replace,
+            lock: entry.lock,
+        };
+        match crate::analysis::build_plan(&self.db, &entry.src_content_id, &dst_content_id, &opts) {
+            Ok(plan) => {
+                self.force_batch = Some(ForceBatch {
+                    entry_id: entry.id,
+                    dst_content_id,
+                    plan: Box::new(plan),
+                    verdict: crate::transfer::bypass_verdict(&src),
+                    scroll: 0,
+                });
+                self.mode = InputMode::Confirm(ConfirmKind::ForceApply);
+            }
+            Err(e) => self.status.err(format!("no plan for it: {e}")),
+        }
+    }
+
+    /// Write the forced plan.
+    pub fn apply_force_batch(&mut self) {
+        self.mode = InputMode::Normal;
+        let Some(batch) = self.force_batch.take() else {
+            return;
+        };
+        // The row the plan was built against may have been replaced since the
+        // modal opened. Skipping the fingerprint does not mean writing to
+        // whatever happens to be there now.
+        let entry = self
+            .queue
+            .entries
+            .iter()
+            .find(|e| e.id == batch.entry_id)
+            .cloned();
+        let still = entry.as_ref().and_then(|e| {
+            crate::pending::find_imported_row(&self.db, &e.acquired_path)
+                .ok()
+                .flatten()
+        });
+        if still.as_deref() != Some(batch.dst_content_id.as_str()) {
+            self.status
+                .err("the rekordbox row changed since you were shown the plan — press 'F' again.");
+            return;
+        }
+        if let Err(e) = crate::db::safety_preflight(self.safety) {
+            self.status.err(format!("{e}"));
+            return;
+        }
+        match crate::analysis::apply_plan(&mut self.db, &batch.plan) {
+            Ok(_backup) => {
+                if let (Some(store), Some(entry)) = (self.store.as_ref(), entry.as_ref()) {
+                    let _ = store.set_matched(
+                        batch.entry_id,
+                        &batch.plan.dst.id,
+                        &batch.verdict.summary(),
+                    );
+                    let _ = crate::transfer::mark_applied(store, entry);
+                }
+                self.queue.clear_work(batch.entry_id);
+                self.reload_queue();
+                self.status.warn(format!(
+                    "applied #{} unverified — check the cues in rekordbox.",
+                    batch.entry_id
+                ));
+            }
+            Err(e) => {
+                self.unresolved_errors = true;
+                self.status.err(format!("could not apply it: {e}"));
+            }
+        }
+    }
+
+    /// Ask before emptying the queue.
+    pub fn start_clear_queue(&mut self) {
+        if self.queue.entries.is_empty() {
+            self.status.info("the queue is already empty.");
+            return;
+        }
+        self.mode = InputMode::Confirm(ConfirmKind::ClearQueue);
+    }
+
+    /// Forget every entry. The downloaded files are left on disk.
+    pub fn clear_queue(&mut self) {
+        self.mode = InputMode::Normal;
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        match store.clear_all() {
+            Ok(n) => {
+                self.reload_queue();
+                self.status.info(format!(
+                    "forgot {n} entr(y/ies). The files are still there."
+                ));
+            }
+            Err(e) => self.status.err(format!("could not clear the queue: {e}")),
+        }
+    }
+
     /// Scroll whichever modal is open.
     pub fn scroll_confirm(&mut self, delta: i32) {
         if let Some(batch) = self.import_batch.as_mut() {
             batch.scroll = (batch.scroll as i32 + delta).max(0) as u16;
         }
         if let Some(batch) = self.pending.as_mut() {
+            batch.scroll = (batch.scroll as i32 + delta).max(0) as u16;
+        }
+        if let Some(batch) = self.force_batch.as_mut() {
             batch.scroll = (batch.scroll as i32 + delta).max(0) as u16;
         }
     }

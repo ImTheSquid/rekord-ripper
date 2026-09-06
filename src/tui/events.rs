@@ -36,8 +36,6 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
 }
 
 /// The queue of downloads that have not become transfers yet.
-///
-/// Read-only for now: navigation, and the state each entry is in.
 fn handle_pending(app: &mut App, key: KeyEvent) {
     match (key.code, key.modifiers) {
         // Esc leaves the screen rather than quitting, matching the shop screen,
@@ -57,6 +55,8 @@ fn handle_pending(app: &mut App, key: KeyEvent) {
         (KeyCode::Char('a'), _) => app.start_apply(),
         (KeyCode::Char('r'), _) => app.retry_selected(),
         (KeyCode::Char('c'), _) => app.forget_selected(),
+        (KeyCode::Char('F'), _) => app.start_force(),
+        (KeyCode::Char('C'), _) => app.start_clear_queue(),
         _ => {}
     }
 }
@@ -277,10 +277,13 @@ fn handle_confirm(app: &mut App, kind: ConfirmKind, key: KeyEvent) {
         (KeyCode::Char('y'), _) | (KeyCode::Enter, _) => match kind {
             ConfirmKind::Transfer => apply_pending(app),
             ConfirmKind::ImportRows => app.apply_import_batch(),
+            ConfirmKind::ForceApply => app.apply_force_batch(),
+            ConfirmKind::ClearQueue => app.clear_queue(),
         },
         (KeyCode::Char('n'), _) | (KeyCode::Esc, _) | (KeyCode::Char('q'), _) => {
             app.pending = None;
             app.import_batch = None;
+            app.force_batch = None;
             app.mode = InputMode::Normal;
         }
         // The row detail runs to about 24 lines each, so the modal scrolls.
