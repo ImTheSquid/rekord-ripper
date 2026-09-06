@@ -777,16 +777,19 @@ impl super::AcquisitionBackend for Bandcamp {
         parse_search(&body, query.limit)
     }
 
-    fn enrich(&self, offers: &mut [Offer]) -> Result<()> {
-        // Ownership first: one request covers every offer, so it is nearly free
-        // and it can make a paid offer turn out to cost nothing.
+    fn check_ownership(&self, offers: &mut [Offer]) -> Result<()> {
+        // One request covers every offer, so this runs over the full result set
+        // rather than the enriched slice.
         let owned = self.owned();
         for offer in offers.iter_mut() {
             if let Some((kind, id)) = parse_item_key(&offer.item_ref.key) {
                 offer.ownership = owned.contains(kind, id);
             }
         }
+        Ok(())
+    }
 
+    fn enrich(&self, offers: &mut [Offer]) -> Result<()> {
         // Pricing needs one page per offer, so it is the part the caller budgets.
         for offer in offers.iter_mut() {
             if let Err(e) = self.enrich_one(offer) {

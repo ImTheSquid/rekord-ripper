@@ -267,6 +267,16 @@ fn run_one(
     };
     report.raw_hits = offers.len();
 
+    // Ownership costs one request for the whole collection, so every hit gets it
+    // — including the ones below the enrich cutoff, which would otherwise render
+    // as `?` and hide something already paid for.
+    if b.capabilities().ownership_check
+        && !offers.is_empty()
+        && let Err(e) = b.check_ownership(&mut offers)
+    {
+        report.error = Some(e);
+    }
+
     // Probe only the top few by textual similarity. Enriching every hit would
     // mean an item-page fetch per result, which is the quickest way to a 429.
     if opts.enrich_top_n > 0 && !offers.is_empty() && Instant::now() < deadline {
@@ -531,6 +541,62 @@ mod tests {
 
         let r = ranked(vec![paid, owned], SortMode::Quality);
         assert_eq!(r[0].offer.cost_class(), CostClass::AlreadyOwned);
+    }
+
+    /// Three hits, ownership known for all, pricing only for the first.
+    struct OwnershipBackend;
+
+    impl AcquisitionBackend for OwnershipBackend {
+        fn id(&self) -> BackendId {
+            BackendId::Bandcamp
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                ownership_check: true,
+                ..Default::default()
+            }
+        }
+
+        fn search(&self, _query: &SearchQuery) -> super::super::error::Result<Vec<Offer>> {
+            Ok(["a", "b", "c"]
+                .into_iter()
+                .map(|t| offer(BackendId::Bandcamp, t, "x"))
+                .collect())
+        }
+
+        fn check_ownership(&self, offers: &mut [Offer]) -> super::super::error::Result<()> {
+            for o in offers {
+                o.ownership = Ownership::Yes {
+                    redownloadable: true,
+                };
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn ownership_covers_hits_below_the_enrich_cutoff() {
+        // It is one request for the whole collection, so capping it at the
+        // enriched slice would render already-bought items as `?`.
+        let opts = SearchOpts {
+            enrich_top_n: 1,
+            ..Default::default()
+        };
+        let (_, offers) = run_one(
+            &OwnershipBackend,
+            &SearchQuery::from_text("anything", 10),
+            &opts,
+            Instant::now() + Duration::from_secs(60),
+        );
+        assert_eq!(offers.len(), 3);
+        assert!(
+            offers
+                .iter()
+                .all(|o| matches!(o.ownership, Ownership::Yes { .. })),
+            "every hit should carry ownership: {:?}",
+            offers.iter().map(|o| o.ownership).collect::<Vec<_>>()
+        );
     }
 
     #[test]
