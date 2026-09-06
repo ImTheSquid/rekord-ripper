@@ -50,10 +50,21 @@ pub trait AcquisitionBackend: Send + Sync {
         Err(BackendError::unsupported(self.id(), "search"))
     }
 
-    /// Fill in pricing, formats, and ownership.
+    /// Fill in `ownership` for every offer.
     ///
-    /// Batched on purpose: Bandcamp answers ownership for an entire collection in
-    /// one request, so a per-offer call would multiply that by N and earn a 429.
+    /// Separate from `enrich` because it is cheap and wide: Bandcamp answers
+    /// ownership for an entire collection in one request, so it runs over the
+    /// whole result set while `enrich` is capped at the top few.
+    ///
+    /// Same contract as `enrich`: no reordering, idempotent, `Err` only for a
+    /// whole-batch failure.
+    fn check_ownership(&self, _offers: &mut [Offer]) -> Result<()> {
+        Ok(())
+    }
+
+    /// Fill in pricing and formats.
+    ///
+    /// Batched on purpose: one call per top-N slice, not per offer.
     ///
     /// - Every offer's `item_ref.backend` equals `self.id()`; callers guarantee it.
     /// - Must not reorder, drop, or replace elements.
