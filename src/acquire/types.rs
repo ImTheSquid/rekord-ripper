@@ -386,11 +386,32 @@ impl SearchQuery {
     /// What a backend should actually send. Artist and title together, because
     /// both Bandcamp's autocomplete and `scsearch:` are single-field.
     pub fn search_text(&self) -> String {
-        match self.artist.as_deref() {
-            Some(a) if !a.trim().is_empty() => format!("{} {}", a.trim(), self.title.trim()),
-            _ => self.title.trim().to_string(),
+        match self.artist.as_deref().map(strip_handles) {
+            Some(a) if !a.is_empty() => format!("{a} {}", self.title_text()),
+            _ => self.title_text(),
         }
     }
+
+    /// The title alone, for a backend widening a search that found nothing.
+    pub fn title_text(&self) -> String {
+        strip_handles(&self.title)
+    }
+}
+
+/// Drop `@handle` mentions from a query term.
+///
+/// Rips off SoundCloud carry the uploader's handle in the artist tag — `DJ MAWIG
+/// (@j999de)` — and `scsearch:` requires every token to match, so one handle
+/// nobody put in the track's own title takes the result count to zero. Bandcamp
+/// and slskd narrow on it just as hard.
+fn strip_handles(s: &str) -> String {
+    let brackets = |c: char| matches!(c, '(' | ')' | '[' | ']' | '{' | '}');
+    s.split_whitespace()
+        .filter(|tok| !tok.trim_matches(brackets).starts_with('@'))
+        // A dropped handle can leave its brackets behind as their own token.
+        .filter(|tok| !tok.chars().all(brackets))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// A remote listing. Not a track — see the module docs.
@@ -897,6 +918,42 @@ mod tests {
         let q = SearchQuery {
             title: "T".into(),
             artist: Some("   ".into()),
+            ..Default::default()
+        };
+        assert_eq!(q.search_text(), "T");
+    }
+
+    #[test]
+    fn a_soundcloud_handle_is_dropped_from_the_query() {
+        // Observed: `DJ MAWIG (@j999de) I WANNA TWERK ON PROC FISKAL BLEND`
+        // returned nothing, while the same words without the handle found the
+        // track. scsearch requires every token.
+        let q = SearchQuery {
+            title: "I WANNA TWERK ON PROC FISKAL BLEND".into(),
+            artist: Some("DJ MAWIG (@j999de)".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            q.search_text(),
+            "DJ MAWIG I WANNA TWERK ON PROC FISKAL BLEND"
+        );
+        assert_eq!(q.title_text(), "I WANNA TWERK ON PROC FISKAL BLEND");
+    }
+
+    #[test]
+    fn stripping_a_handle_leaves_the_rest_of_the_name_alone() {
+        assert_eq!(strip_handles("Four Tet"), "Four Tet");
+        assert_eq!(strip_handles("@someone"), "");
+        assert_eq!(strip_handles("[@a] b"), "b");
+        // A parenthetical that is not a handle is part of the name.
+        assert_eq!(
+            strip_handles("Dream Baby Dream (Four Tet remix)"),
+            "Dream Baby Dream (Four Tet remix)"
+        );
+        // An artist that is nothing but a handle leaves the title to search on.
+        let q = SearchQuery {
+            title: "T".into(),
+            artist: Some("@dj".into()),
             ..Default::default()
         };
         assert_eq!(q.search_text(), "T");
