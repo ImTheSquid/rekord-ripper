@@ -796,7 +796,10 @@ pub fn apply_file_type_fixes(db: &mut MasterDb, fixes: &[FileTypeFix]) -> Result
             params![fix.content_id, fix.correct, usn, now],
         )?;
         if n != 1 {
-            bail!("expected to update track {}, updated {n} rows", fix.content_id);
+            bail!(
+                "expected to update track {}, updated {n} rows",
+                fix.content_id
+            );
         }
     }
     let next_usn = base_usn + fixes.len() as i64;
