@@ -12,10 +12,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::paths;
 
-/// Lossless first, then the lossy fallbacks rekordbox can actually read.
-/// Ogg/Vorbis is deliberately absent: rekordbox cannot open it at all, so
-/// "downloaded successfully" would mean "downloaded uselessly".
-const DEFAULT_FORMAT_PREFERENCE: &[&str] = &["flac", "aiff", "wav", "alac", "mp3-320", "mp3-v0"];
+/// Lossless first, then the lossy fallbacks rekordbox can actually read, best
+/// bitrate first. The low tiers are last on purpose: they are what a SoundCloud
+/// transcode or a thin Soulseek result actually is, and refusing them outright
+/// means no download at all rather than a worse one.
+///
+/// Ogg/Vorbis and Opus are deliberately absent: rekordbox cannot open them at
+/// all, so "downloaded successfully" would mean "downloaded uselessly".
+const DEFAULT_FORMAT_PREFERENCE: &[&str] = &[
+    "flac", "aiff", "wav", "alac", "mp3-320", "aac-256", "mp3-v0", "aac-128", "mp3-128",
+];
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {

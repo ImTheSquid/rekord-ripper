@@ -75,12 +75,14 @@ pub(crate) fn track_tags(f: TrackFacts) -> String {
     }
     // Streaming rows get no format tag on purpose: `is:lossy` should mean "you
     // have a lossy file", which is the question worth asking before shopping.
+    // FileType 0 gets none either: rekordbox cannot open it, so it is neither a
+    // lossy file you have nor a lossless one.
     match f.file_type {
-        Some(0) => tags.extend(["mp3", "lossy"]),
-        Some(1) => tags.extend(["m4a", "lossy"]),
-        Some(4) => tags.extend(["wav", "lossless"]),
+        Some(1) => tags.extend(["mp3", "lossy"]),
+        Some(4 | 6) => tags.extend(["m4a", "lossy"]),
         Some(5) => tags.extend(["flac", "lossless"]),
-        Some(11) => tags.extend(["aiff", "lossless"]),
+        Some(11) => tags.extend(["wav", "lossless"]),
+        Some(12) => tags.extend(["aiff", "lossless"]),
         _ => {}
     }
     if f.cue_count > 0 {
@@ -196,7 +198,33 @@ mod tests {
     fn a_path_is_local_whichever_machine_wrote_it() {
         assert!(tags(5, "/Users/x/Music/a.flac", 0).contains(" local "));
         assert!(tags(1, "C:/users/x/Music/a.mp3", 0).contains(" local "));
-        assert!(tags(11, "D:/Contents/a.aiff", 0).contains(" local "));
+        assert!(tags(11, "D:/Contents/a.wav", 0).contains(" local "));
+    }
+
+    #[test]
+    fn a_format_keyword_names_the_format_rekordbox_recorded() {
+        // The counts behind these ids are in `file_type_name`; the two tables
+        // must not drift apart.
+        assert!(tags(1, "/a/b.mp3", 0).contains(" mp3 "));
+        assert!(tags(4, "/a/b.m4a", 0).contains(" m4a "));
+        assert!(tags(6, "/a/b.m4a", 0).contains(" m4a "));
+        assert!(tags(5, "/a/b.flac", 0).contains(" flac "));
+        assert!(tags(11, "/a/b.wav", 0).contains(" wav "));
+        assert!(tags(12, "/a/b.aiff", 0).contains(" aiff "));
+
+        assert!(tags(1, "/a/b.mp3", 0).contains(" lossy "));
+        assert!(tags(4, "/a/b.m4a", 0).contains(" lossy "));
+        for lossless in [5, 11, 12] {
+            let t = tags(lossless, "/a/b.x", 0);
+            assert!(t.contains(" lossless ") && !t.contains(" lossy "), "{t}");
+        }
+
+        // Unplayable is not a format you have; it is neither side of the axis.
+        let broken = tags(0, "/a/b.mp3", 0);
+        assert!(
+            !broken.contains(" lossy ") && !broken.contains(" lossless "),
+            "{broken}"
+        );
     }
 
     #[test]
@@ -208,7 +236,7 @@ mod tests {
         // It is still a real FLAC, so shopping filters can see the format.
         assert!(cloud.contains(" flac ") && cloud.contains(" lossless "));
         // A cloud row synced from a Windows machine is still cloud.
-        assert!(tags(1, "C:/Users/x/Music/contents_4204620759/a.m4a", 2).contains(" cloud "));
+        assert!(tags(1, "C:/Users/x/Music/contents_4204620759/a.mp3", 2).contains(" cloud "));
     }
 
     #[test]

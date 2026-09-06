@@ -144,7 +144,7 @@ pub fn format_preference(cfg: &Config) -> anyhow::Result<Vec<AudioFormat>> {
     if out.is_empty() {
         anyhow::bail!(
             "format_preference has no formats rekordbox can read; \
-             expected some of flac, aiff, wav, alac, mp3-320"
+             expected some of flac, aiff, wav, alac, mp3-320, mp3-v0, aac-256"
         );
     }
     Ok(out)
