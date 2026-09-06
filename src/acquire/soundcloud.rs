@@ -282,6 +282,13 @@ impl SoundCloud {
             String::from_utf8_lossy(&out.stderr).into_owned(),
         ))
     }
+
+    /// One `scsearch` pass. Asks for exactly as many as we will keep.
+    fn scsearch(&self, text: &str, limit: usize) -> Result<Vec<Offer>> {
+        let target = format!("scsearch{limit}:{text}");
+        let (json, _) = self.run_json(&["--flat-playlist", "--dump-single-json", &target])?;
+        parse_search(&json, limit)
+    }
 }
 
 /// True when yt-dlp found an artist-enabled original and was refused it.
@@ -509,10 +516,19 @@ impl super::AcquisitionBackend for SoundCloud {
         if text.is_empty() || query.limit == 0 {
             return Ok(Vec::new());
         }
-        // Ask for exactly as many as we will keep.
-        let target = format!("scsearch{}:{text}", query.limit);
-        let (json, _) = self.run_json(&["--flat-playlist", "--dump-single-json", &target])?;
-        parse_search(&json, query.limit)
+        let offers = self.scsearch(&text, query.limit)?;
+        if !offers.is_empty() {
+            return Ok(offers);
+        }
+        // scsearch is an AND over tokens, so anything in the artist tag that the
+        // uploader did not put in the title takes the count to zero. Retry on
+        // the title alone rather than report a track SoundCloud does have as
+        // missing; ranking still scores the wider hits against the artist.
+        let title = query.title_text();
+        if title.is_empty() || title == text {
+            return Ok(offers);
+        }
+        self.scsearch(&title, query.limit)
     }
 
     fn enrich(&self, offers: &mut [Offer]) -> Result<()> {
@@ -939,7 +955,10 @@ mod tests {
             return; // no ffmpeg here; the check is exercised where there is one
         }
 
-        assert!(short_download(&wav, Some(3.0)).is_ok(), "full length passes");
+        assert!(
+            short_download(&wav, Some(3.0)).is_ok(),
+            "full length passes"
+        );
         assert!(short_download(&wav, None).is_ok(), "unknown length passes");
         let err = short_download(&wav, Some(200.0)).unwrap_err();
         assert!(format!("{err}").contains("truncated"), "got {err}");
@@ -954,7 +973,10 @@ mod tests {
         assert_eq!(meta.artist.as_deref(), Some("nanode"));
         assert_eq!(meta.title.as_deref(), Some("AMB"));
         assert_eq!(meta.duration_secs, Some(203.6));
-        assert_eq!(parse_download_metadata("not json"), DownloadMetadata::default());
+        assert_eq!(
+            parse_download_metadata("not json"),
+            DownloadMetadata::default()
+        );
     }
 
     #[test]
