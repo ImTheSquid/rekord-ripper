@@ -222,30 +222,35 @@ impl FromStr for AudioFormat {
     type Err = anyhow::Error;
 
     /// Accepts both our own names and Bandcamp's download slugs, so a config
-    /// value and an API response parse through the same path.
+    /// value and an API response parse through the same path. Spaces and
+    /// underscores read as dashes, so `mp3 320` spells `mp3-320`.
     fn from_str(s: &str) -> Result<Self> {
-        let s = s.trim().to_ascii_lowercase();
+        let s = s.trim().to_ascii_lowercase().replace([' ', '_'], "-");
         Ok(match s.as_str() {
-            "flac" => Self::Flac,
+            "flac" | "flac-16" | "flac-24" => Self::Flac,
             "aiff" | "aiff-lossless" | "aif" => Self::Aiff,
-            "wav" => Self::Wav,
-            "alac" => Self::Alac,
+            "wav" | "wave" | "wav-lossless" => Self::Wav,
+            "alac" | "m4a-lossless" => Self::Alac,
             "mp3" => Self::Mp3(None),
-            "mp3-320" => Self::Mp3(Some(320)),
-            "mp3-v0" => Self::Mp3V0,
-            "mp3-128" => Self::Mp3(Some(128)),
+            "mp3-v0" | "v0" => Self::Mp3V0,
             // Container extensions, so a downloaded file's own extension parses
             // rather than falling back to a guess and misreporting the format.
-            "aac" | "m4a" | "mp4" | "alac-m4a" => Self::Aac(None),
+            "aac" | "m4a" | "mp4" | "alac-m4a" | "aac-lc" => Self::Aac(None),
             "aac-hi" => Self::Aac(Some(256)),
-            "vorbis" | "ogg" => Self::Ogg,
+            "vorbis" | "ogg" | "oga" => Self::Ogg,
             "opus" => Self::Opus,
             other => {
-                // Tolerate an unseen "mp3-NNN" rather than failing the whole parse.
-                if let Some(rest) = other.strip_prefix("mp3-")
+                // A bitrate is whatever the encoder happened to use — SoundCloud
+                // alone serves AAC at 160, 256 and 258 — so any `family-NNN`
+                // parses rather than failing on a number nobody listed.
+                if let Some((family, rest)) = other.rsplit_once('-')
                     && let Ok(k) = rest.parse::<u16>()
                 {
-                    return Ok(Self::Mp3(Some(k)));
+                    match family {
+                        "mp3" => return Ok(Self::Mp3(Some(k))),
+                        "aac" | "m4a" | "mp4" => return Ok(Self::Aac(Some(k))),
+                        _ => {}
+                    }
                 }
                 bail!("unknown audio format '{other}'")
             }
@@ -655,6 +660,28 @@ mod tests {
             AudioFormat::Mp3(Some(192))
         );
         assert!("wma".parse::<AudioFormat>().is_err());
+    }
+
+    #[test]
+    fn any_bitrate_parses_in_the_families_that_carry_one() {
+        // The shapes SoundCloud actually serves, none of them spelled out.
+        for (s, want) in [
+            ("aac-160", AudioFormat::Aac(Some(160))),
+            ("aac-258", AudioFormat::Aac(Some(258))),
+            ("m4a-256", AudioFormat::Aac(Some(256))),
+            ("mp3-128", AudioFormat::Mp3(Some(128))),
+        ] {
+            assert_eq!(s.parse::<AudioFormat>().unwrap(), want, "{s}");
+            // Whatever parses must render back to something that parses.
+            assert_eq!(want.to_string().parse::<AudioFormat>().unwrap(), want);
+        }
+        // A separator the user typed instead of a dash is the same format.
+        assert_eq!(
+            "mp3 320".parse::<AudioFormat>().unwrap(),
+            AudioFormat::Mp3(Some(320))
+        );
+        // A bitrate on a family that has none is still an error, not a guess.
+        assert!("flac-1000".parse::<AudioFormat>().is_err());
     }
 
     #[test]
