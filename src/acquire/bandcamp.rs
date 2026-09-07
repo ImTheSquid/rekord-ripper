@@ -357,6 +357,30 @@ fn download_when_ready(
     })
 }
 
+/// The cover on a download page, as a URL.
+///
+/// Scraped rather than read out of the `pagedata` blob: the blob's field for
+/// this is not something their album pages expose, whereas the image URL itself
+/// is a stable, documented-by-convention shape —
+/// `f4.bcbits.com/img/a<id>_<size>.jpg`. Most Bandcamp downloads carry an
+/// embedded cover anyway, so this is the fallback for the ones that do not.
+/// The full-size cover for any text carrying a bcbits image URL — a download
+/// page's HTML, or the thumbnail URL a search result hands back.
+///
+/// Their search results give a ~210px thumbnail, smaller than rekordbox's own
+/// cache. Every size is generated from one upload, so swapping the suffix is not
+/// a guess. `_10` is 1200px: past what rekordbox keeps, but the copy embedded in
+/// the file outlives this library, and it is a tenth the size of the original.
+fn full_size_artwork(text: &str) -> Option<String> {
+    const HOST: &str = "://f4.bcbits.com/img/a";
+    let at = text.find(HOST)?;
+    let id: String = text[at + HOST.len()..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    (!id.is_empty()).then(|| format!("https://f4.bcbits.com/img/a{id}_10.jpg"))
+}
+
 /// Artist and title from a download page, for naming the file.
 fn item_artist(html: &str) -> Option<String> {
     blob::id_attr_json(html, "pagedata", "data-blob")
@@ -602,7 +626,9 @@ fn parse_search(body: &str, limit: usize) -> Result<Vec<Offer>> {
             url,
         );
         offer.album = h.album_name;
-        offer.artwork_url = h.img;
+        // Upgraded from the thumbnail their autocomplete returns, so a cover
+        // taken from a search result is worth keeping.
+        offer.artwork_url = h.img.as_deref().and_then(full_size_artwork).or(h.img);
         offers.push(offer);
     }
     Ok(offers)
@@ -863,7 +889,14 @@ impl super::AcquisitionBackend for Bandcamp {
         );
         let target = super::fs::unique_path(&opts.dest_dir.join(name));
 
-        let bytes = download_when_ready(&agent, &url, &cookie, chosen, &target)?;
+        download_when_ready(&agent, &url, &cookie, chosen, &target)?;
+
+        // Most Bandcamp downloads already carry the cover, in which case this
+        // leaves the file alone; the page's art URL covers the ones that do not.
+        super::ensure_cover(&target, full_size_artwork(&page).as_deref(), opts.deadline);
+        // Re-read rather than trusting the download's count: embedding rewrites
+        // the file, and this is rekordbox's FileSize and the pending queue's guard.
+        let bytes = std::fs::metadata(&target)?.len();
 
         Ok(vec![AcquiredFile {
             path: target,
@@ -1100,6 +1133,71 @@ mod tests {
           &quot;mp3-320&quot;:{&quot;url&quot;:&quot;https://popplers.bcbits.com/mp3&quot;},
           &quot;vorbis&quot;:{&quot;url&quot;:&quot;https://popplers.bcbits.com/ogg&quot;},
           &quot;some-new-format&quot;:{&quot;url&quot;:&quot;https://popplers.bcbits.com/new&quot;}}}]}"></div></html>"#;
+
+    #[test]
+    fn finds_the_cover_url_on_a_download_page_and_asks_for_the_large_size() {
+        let html = r#"<html><img class="album-art"
+            src="https://f4.bcbits.com/img/a0104561231_16.jpg"></html>"#;
+        assert_eq!(
+            full_size_artwork(html).as_deref(),
+            Some("https://f4.bcbits.com/img/a0104561231_10.jpg")
+        );
+    }
+
+    #[test]
+    fn a_search_thumbnail_is_upgraded_to_the_full_size_cover() {
+        // Their autocomplete returns a ~210px `_9`, which is smaller than
+        // rekordbox's own cache — useless as artwork without this.
+        assert_eq!(
+            full_size_artwork("https://f4.bcbits.com/img/a0104561231_9.jpg").as_deref(),
+            Some("https://f4.bcbits.com/img/a0104561231_10.jpg")
+        );
+        // Already full size, and idempotent.
+        assert_eq!(
+            full_size_artwork("https://f4.bcbits.com/img/a0104561231_10.jpg").as_deref(),
+            Some("https://f4.bcbits.com/img/a0104561231_10.jpg")
+        );
+        // Not one of theirs: left for the caller to use as-is.
+        assert_eq!(full_size_artwork("https://example.com/cover.jpg"), None);
+    }
+
+    #[test]
+    fn a_search_offer_carries_the_full_size_cover() {
+        let body = r#"{"auto":{"results":[
+            {"type":"a","id":1,"name":"Untrue","band_name":"Burial",
+             "item_url_path":"https://burial.bandcamp.com/album/untrue",
+             "img":"https://f4.bcbits.com/img/a0104561231_9.jpg"}
+        ]}}"#;
+        let offers = parse_search(body, 10).unwrap();
+        assert_eq!(
+            offers[0].artwork_url.as_deref(),
+            Some("https://f4.bcbits.com/img/a0104561231_10.jpg"),
+            "a thumbnail-sized cover is not worth backfilling with"
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_image_url_is_kept_rather_than_dropped() {
+        // The fixture's `img` carries no numeric id, so the upgrade cannot
+        // apply — but throwing the only cover away would be worse.
+        let offers = parse_search(SEARCH_FIXTURE, 10).unwrap();
+        assert_eq!(
+            offers[0].artwork_url.as_deref(),
+            Some("https://f4.bcbits.com/img/a.jpg")
+        );
+        // And a hit whose `img` was null must not invent one.
+        assert!(offers.iter().any(|o| o.artwork_url.is_none()));
+    }
+
+    #[test]
+    fn a_page_with_no_cover_yields_none_rather_than_a_malformed_url() {
+        // A URL built from an empty id would 404 on every download.
+        assert_eq!(full_size_artwork(DOWNLOAD_PAGE), None);
+        assert_eq!(
+            full_size_artwork("https://f4.bcbits.com/img/anope.jpg"),
+            None
+        );
+    }
 
     #[test]
     fn parses_the_per_format_download_links() {

@@ -348,6 +348,23 @@ is listed in slskd's `shares` the file continues to be shared. Set
 `remote_file_management` to be enabled; without it the delete is refused and
 skipped silently.
 
+Set `fetch_folder_image = true` to also pull the `cover.jpg` / `folder.jpg` most
+releases are shared with, and give it to the track. It is off by default because
+it is a *second* transfer from the same peer, with its own place in their upload
+queue. Three things keep it from slowing a download down:
+
+- It runs only after the audio has already arrived.
+- It is skipped entirely when the file has a cover of its own, which most FLACs
+  on Soulseek do.
+- It gets a short budget of its own (150s) rather than the download's, so the
+  worst case is a bounded wait and no image.
+
+The cover is embedded in the file where the container allows it, and saved
+beside it as a hidden sidecar where it does not — WAV, which cannot carry a
+picture. Either way `import` picks it up and puts it in rekordbox. Named covers
+are preferred over an arbitrary image, the largest wins among equals, and
+anything over 12 MB is treated as a booklet scan and left alone.
+
 Timing behaviour:
 
 - **A search blocks, and `search_limit` bounds it.** `search_window_secs` (8,
@@ -453,3 +470,54 @@ that audio and rewrite `FolderPath`.
 
 `REKORDBOX_DIR` overrides the rekordbox directory, which is how the write paths
 are tested against a copy of `master.db` rather than the real thing.
+
+## Cover art
+
+Rekordbox keeps art as a file under `share/PIONEER/Artwork/` and stores the path
+on the track row (`djmdContent.ImagePath`), keyed on the row's own UUID. There is
+no artwork table — `imageFile` is cloud-sync bookkeeping and stays empty. Three
+copies are written per track: the source capped to 800px, plus a 240px and an
+80px thumbnail, which is what rekordbox's own cache holds.
+
+A download gets its cover automatically. `import` then takes it out of the file,
+so nothing extra is needed. `rekord-ripper artwork` backfills rows that predate
+this:
+
+```bash
+rekord-ripper artwork                          # dry-run: what the files can supply
+rekord-ripper artwork --apply
+rekord-ripper artwork --from-sources --limit 5 # also search the backends, on 5 tracks
+rekord-ripper artwork --from-sources --apply --match 'p:"jn next"'
+```
+
+Without `--from-sources` it only uses what is already on disk: a cover embedded
+in the file, or a sidecar a download left beside it. That is free and certain.
+
+`--from-sources` handles the rest by searching the enabled backends — one search
+per track — and taking the art off the best match. Bandcamp and SoundCloud both
+return an artwork URL in their search results, so no extra request is needed;
+Soulseek cannot help here, because its art is a queued transfer per track (use
+`fetch_folder_image` at download time instead).
+
+This is the one path where art does **not** come from the file it belongs to, so
+a bad text match means a wrong cover. Matches are scored 0-100 on title, artist
+and duration, and split in two:
+
+- **80 or above** applies in bulk. That needs an exact title *and* the artist or
+  the duration to agree. Note what it does *not* rule out: a re-upload with the
+  same title and length under a different uploader also scores 80. Pass
+  `--auto-score 90` to insist the artist agrees too.
+- **Below that** is shown to you one at a time, with the cover drawn in the
+  terminal where it supports inline images (Kitty protocol for Ghostty, kitty,
+  WezTerm and Konsole; `OSC 1337` for iTerm2; otherwise the URL is printed).
+  Answer `y`, `n`, `a` for all remaining, or `q` to stop. `--min-score` sets the
+  floor worth showing at all.
+- `-y` skips the review entirely rather than accepting it blind.
+
+Everything is a dry-run until `--apply`, and the review runs before any write,
+so quitting half way leaves the database untouched.
+
+The cover is embedded in the file as well as given to rekordbox, which changes
+the file's size — so `FileSize` on the row is corrected in the same transaction,
+and tracks with a queued analysis transfer are skipped, since rewriting the file
+would expire the pairing.

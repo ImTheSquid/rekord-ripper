@@ -201,6 +201,16 @@ pub struct Soulseek {
     /// Needs slskd's `remote_file_management` enabled either way; without it the
     /// delete is refused and skipped quietly.
     pub clean_up_remote: bool,
+    /// Also fetch the cover image sitting next to a download in the peer's
+    /// folder — the `cover.jpg` / `folder.jpg` most releases are shared with.
+    ///
+    /// Off by default because it is a *second* transfer from the same peer, with
+    /// its own place in their upload queue. It is only attempted once the audio
+    /// has already arrived, only when the file has no cover of its own, and it
+    /// gets a short budget of its own rather than the download's — so the worst
+    /// case is a bounded wait and no image, never a slower download. Most FLACs
+    /// on Soulseek carry their own cover and skip this entirely.
+    pub fetch_folder_image: bool,
 }
 
 impl Default for General {
@@ -284,6 +294,7 @@ impl Default for Soulseek {
             search_limit: 50,
             fetch_timeout_secs: 1800,
             clean_up_remote: false,
+            fetch_folder_image: false,
         }
     }
 }

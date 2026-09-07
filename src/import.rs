@@ -78,6 +78,11 @@ pub struct NewContent {
     pub release_year: Option<i64>,
     pub track_no: Option<i64>,
     pub disc_no: Option<i64>,
+
+    /// Cover to install into rekordbox's artwork cache, for the cases where the
+    /// file cannot hold one itself — a WAV rip, whose art only ever existed as a
+    /// URL. Left unset, [`insert`] takes the cover out of the file instead.
+    pub artwork: Option<PathBuf>,
 }
 
 /// A row to mint in one of rekordbox's name-keyed lookup tables.
@@ -306,6 +311,7 @@ pub fn plan_insert(
         release_year: info.tags.year,
         track_no: info.tags.track_no,
         disc_no: info.tags.disc_no,
+        artwork: None,
     })
 }
 
@@ -468,14 +474,14 @@ fn fold(
 /// rb_data_status 256, SearchStr NULL, ExtInfo "null", ColorID/VideoAssociate
 /// "0", HotCueAutoLoad/DeliveryControl "on", OrgFolderPath NULL for local files.
 /// `usn` is left NULL because that counter is server-assigned.
-/// Named parameters, not positional: this writes 50 columns into the user's
+/// Named parameters, not positional: this writes 51 columns into the user's
 /// library and a misaligned `?n` would put an album name in DiscNo without
 /// anything failing.
 const CONTENT_INSERT: &str = "INSERT INTO djmdContent
        (ID, FolderPath, FileNameL, FileNameS, Title,
         ArtistID, AlbumID, GenreID,
         BPM, Length, TrackNo, DiscNo, BitRate, BitDepth, FileType, Rating,
-        ReleaseYear, Commnt,
+        ReleaseYear, Commnt, ImagePath,
         StockDate, DateCreated, ColorID, DJPlayCount,
         MasterDBID, MasterSongID,
         AnalysisDataPath, SearchStr, FileSize, SampleRate,
@@ -488,7 +494,7 @@ const CONTENT_INSERT: &str = "INSERT INTO djmdContent
        (:id, :folder_path, :file_name, NULL, :title,
         :artist_id, :album_id, :genre_id,
         NULL, :length, :track_no, :disc_no, :bit_rate, :bit_depth, :file_type, 0,
-        :release_year, :comment,
+        :release_year, :comment, :image_path,
         :today, :today, '0', 0,
         :master_db_id, :id,
         NULL, NULL, :file_size, :sample_rate,
@@ -610,6 +616,10 @@ pub fn insert(db: &mut MasterDb, new: &NewContent) -> Result<UndoNote> {
     // Before the transaction, so a schema mismatch cannot half-write anything.
     check_schema(db, new)?;
 
+    // Before the transaction too, since the files are not part of it. A cover is
+    // cosmetic and a track row is not, so a failure here warns and moves on.
+    let image_path = install_artwork(db, new);
+
     let base_usn = db.read_local_usn()?;
     let mut next_usn = base_usn;
     let mut allocate = || {
@@ -646,6 +656,7 @@ pub fn insert(db: &mut MasterDb, new: &NewContent) -> Result<UndoNote> {
             ":file_type": new.file_type,
             ":release_year": new.release_year,
             ":comment": new.comment,
+            ":image_path": image_path,
             ":today": today,
             ":master_db_id": new.master_db_id,
             ":file_size": new.file_size,
@@ -671,6 +682,62 @@ pub fn insert(db: &mut MasterDb, new: &NewContent) -> Result<UndoNote> {
         backup: None,
     })
 }
+
+/// Put this row's cover into rekordbox's artwork cache, returning the
+/// `ImagePath` to store.
+///
+/// Three sources, in order: one the caller staged, the audio file's own embedded
+/// cover — where the download path leaves it, so a plain `import` of any tagged
+/// file is covered too — and finally a [`crate::artwork::sidecar_for`] file, for
+/// the containers that cannot carry a cover at all.
+///
+/// `None` for every failure, warned about but never fatal: a track row without a
+/// browser tile is worth having, and rekordbox fills the tile in itself the next
+/// time it reads the file.
+fn install_artwork(db: &MasterDb, new: &NewContent) -> Option<String> {
+    let share = db.app_dir.join("share");
+    let audio = Path::new(&new.folder_path);
+    let (staged, sidecar);
+    let cover = match &new.artwork {
+        Some(p) => p.as_path(),
+        None => {
+            let scratch = crate::paths::scratch_root()
+                .ok()?
+                .join(format!("art-{}.jpg", new.uuid));
+            match crate::artwork::extract(audio, &scratch) {
+                Ok(true) => {
+                    staged = ScratchFile(scratch);
+                    staged.0.as_path()
+                }
+                Ok(false) => {
+                    // No embedded cover is ordinary, not worth a warning; fall
+                    // back to a sidecar if the download left one.
+                    sidecar = crate::artwork::sidecar_for(audio).filter(|p| p.exists())?;
+                    sidecar.as_path()
+                }
+                Err(e) => {
+                    crate::acquire::note_line(&format!(
+                        "warning: could not read cover art from {}: {e}",
+                        new.folder_path
+                    ));
+                    return None;
+                }
+            }
+        }
+    };
+    match crate::artwork::install(&share, &new.uuid, cover) {
+        Ok(rel) => Some(rel),
+        Err(e) => {
+            crate::acquire::note_line(&format!(
+                "warning: could not install cover art for {}: {e}",
+                new.folder_path
+            ));
+            None
+        }
+    }
+}
+
+use crate::artwork::ScratchFile;
 
 /// Mark an inserted row deleted, the way rekordbox does.
 ///
@@ -806,6 +873,298 @@ pub fn apply_file_type_fixes(db: &mut MasterDb, fixes: &[FileTypeFix]) -> Result
     db.write_local_usn(next_usn)?;
     tx.commit()?;
     Ok(fixes.len())
+}
+
+/// Where a backfilled cover is going to come from.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ArtworkSource {
+    /// Embedded in the audio file — what a download leaves behind.
+    Embedded,
+    /// A [`crate::artwork::sidecar_for`] file, for containers that cannot embed.
+    Sidecar,
+}
+
+impl std::fmt::Display for ArtworkSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Embedded => write!(f, "embedded"),
+            Self::Sidecar => write!(f, "sidecar"),
+        }
+    }
+}
+
+/// One local row with no cover whose file has one to give it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArtworkFix {
+    pub content_id: String,
+    /// The artwork path is derived from this, so it has to come from the row.
+    pub uuid: String,
+    pub path: String,
+    pub source: ArtworkSource,
+}
+
+/// A local row with no cover and nothing on disk to give it one.
+///
+/// Carries what a backend search needs, so finding art for it never has to go
+/// back to the database.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArtworkGap {
+    pub content_id: String,
+    pub uuid: String,
+    pub path: String,
+    pub title: String,
+    pub artist: Option<String>,
+    pub duration_secs: Option<i64>,
+    /// What the row currently claims. Embedding a cover changes the real size,
+    /// so the row has to be corrected in the same breath — see
+    /// [`apply_source_covers`].
+    pub file_size: i64,
+}
+
+/// What one pass over the local library found, split by what can fix it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ArtworkScan {
+    /// Rows whose own file can supply the cover, free and certain.
+    pub local: Vec<ArtworkFix>,
+    /// Rows that would need a cover found somewhere else.
+    pub gaps: Vec<ArtworkGap>,
+    /// Rows with no cover whose file is not on this machine. Nothing here can
+    /// help them, and counting them stops the totals looking like the whole
+    /// story when most of a synced library lives on another machine.
+    pub absent: usize,
+}
+
+/// Find local rows with no `ImagePath` whose file can supply one.
+///
+/// Read-only: one ffprobe per candidate to see whether a cover is there at all,
+/// and no extraction until [`apply_artwork_fixes`] runs. Rows whose file has
+/// moved are skipped rather than reported — a missing file is a different
+/// problem, and this must not be the thing that tells you about it.
+pub fn scan_artwork(db: &MasterDb) -> Result<ArtworkScan> {
+    // Artist by join rather than a second query per row: this walks the whole
+    // local library and a lookup each would dominate the ffprobe cost.
+    let mut stmt = db.conn.prepare(
+        "SELECT c.ID, c.UUID, c.FolderPath, c.Title, a.Name, c.Length, c.FileSize
+         FROM djmdContent c LEFT JOIN djmdArtist a ON a.ID = c.ArtistID
+         WHERE (c.rb_local_deleted = 0 OR c.rb_local_deleted IS NULL)
+           AND c.ServiceID = 0
+           AND c.FolderPath LIKE '/%'
+           AND (c.ImagePath IS NULL OR c.ImagePath = '')",
+    )?;
+    type Row = (
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+    );
+    let rows: Vec<Row> = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+            ))
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+
+    let mut scan = ArtworkScan::default();
+    for (content_id, uuid, path, title, artist, length, file_size) in rows {
+        let p = Path::new(&path);
+        if !p.is_file() {
+            scan.absent += 1;
+            continue;
+        }
+        let source = match crate::artwork::has_embedded(p) {
+            Ok(true) => Some(ArtworkSource::Embedded),
+            Ok(false) => crate::artwork::sidecar_for(p)
+                .filter(|s| s.exists())
+                .map(|_| ArtworkSource::Sidecar),
+            // Unreadable is not the same as coverless, and guessing either way
+            // would be wrong — a file ffprobe cannot open is nobody's cover.
+            Err(_) => continue,
+        };
+        match source {
+            Some(source) => scan.local.push(ArtworkFix {
+                content_id,
+                uuid,
+                path,
+                source,
+            }),
+            // Nothing on disk to take. Only worth a source search if there is
+            // something to search *with*.
+            None => {
+                let Some(title) = title
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty())
+                else {
+                    continue;
+                };
+                scan.gaps.push(ArtworkGap {
+                    content_id,
+                    uuid,
+                    path,
+                    title,
+                    artist: artist
+                        .map(|a| a.trim().to_string())
+                        .filter(|a| !a.is_empty()),
+                    duration_secs: length.filter(|l| *l > 0),
+                    file_size: file_size.unwrap_or(0),
+                });
+            }
+        }
+    }
+    Ok(scan)
+}
+
+/// Install each cover and point its row at it, one USN per row.
+///
+/// The files are written before the transaction, since they cannot be part of
+/// one. A row whose cover will not install is warned about and left alone rather
+/// than failing the batch — the same call every other artwork path here makes.
+///
+/// The caller owns the backup and the running-rekordbox refuse.
+pub fn apply_artwork_fixes(db: &mut MasterDb, fixes: &[ArtworkFix]) -> Result<usize> {
+    let share = db.app_dir.join("share");
+    let mut installed: Vec<(&str, String)> = Vec::new();
+    for fix in fixes {
+        let audio = Path::new(&fix.path);
+        let staged;
+        let cover = match fix.source {
+            ArtworkSource::Embedded => {
+                let scratch = crate::paths::scratch_root()?.join(format!("art-{}.jpg", fix.uuid));
+                match crate::artwork::extract(audio, &scratch) {
+                    Ok(true) => {
+                        staged = ScratchFile(scratch);
+                        staged.0.clone()
+                    }
+                    // The file changed under us between the scan and now.
+                    Ok(false) => continue,
+                    Err(e) => {
+                        crate::acquire::note_line(&format!("warning: {}: {e}", fix.path));
+                        continue;
+                    }
+                }
+            }
+            ArtworkSource::Sidecar => match crate::artwork::sidecar_for(audio) {
+                Some(s) => s,
+                None => continue,
+            },
+        };
+        match crate::artwork::install(&share, &fix.uuid, &cover) {
+            Ok(rel) => installed.push((&fix.content_id, rel)),
+            Err(e) => {
+                crate::acquire::note_line(&format!("warning: {}: {e}", fix.path));
+            }
+        }
+    }
+    if installed.is_empty() {
+        return Ok(0);
+    }
+
+    let base_usn = db.read_local_usn()?;
+    let now = now_db_string();
+    let tx = db.conn.unchecked_transaction()?;
+    for (i, (content_id, rel)) in installed.iter().enumerate() {
+        let usn = base_usn + 1 + i as i64;
+        let n = tx.execute(
+            "UPDATE djmdContent
+             SET ImagePath = ?2, rb_local_synced = 0, rb_local_usn = ?3, updated_at = ?4
+             WHERE ID = ?1",
+            params![content_id, rel, usn, now],
+        )?;
+        if n != 1 {
+            bail!("expected to update track {content_id}, updated {n} rows");
+        }
+    }
+    db.write_local_usn(base_usn + installed.len() as i64)?;
+    tx.commit()?;
+    Ok(installed.len())
+}
+
+/// A cover found somewhere other than the audio file, ready to be applied.
+#[derive(Debug, Clone)]
+pub struct SourceCover {
+    pub content_id: String,
+    pub uuid: String,
+    /// The track's audio file, which the cover is embedded into.
+    pub audio: PathBuf,
+    /// The image on disk, already checked to be one.
+    pub image: PathBuf,
+}
+
+/// Install covers found from a source, embed them, and correct the rows.
+///
+/// Unlike [`apply_artwork_fixes`] this also rewrites `FileSize`. Embedding into
+/// a file that already has a row makes the stored size wrong, and that size is
+/// what [`existing_row_for_content`] dedups on — so leaving it stale would make
+/// every later import of the same audio look like a new track. The audio stream
+/// itself is copied, not re-encoded, so cues and fingerprints are unaffected.
+///
+/// A cover that will not install or embed is warned about and skipped; the rest
+/// of the batch still lands.
+pub fn apply_source_covers(db: &mut MasterDb, covers: &[SourceCover]) -> Result<usize> {
+    let share = db.app_dir.join("share");
+    // (content_id, ImagePath, new FileSize when the file was rewritten)
+    let mut done: Vec<(&str, String, Option<i64>)> = Vec::new();
+
+    for c in covers {
+        let rel = match crate::artwork::install(&share, &c.uuid, &c.image) {
+            Ok(rel) => rel,
+            Err(e) => {
+                crate::acquire::note_line(&format!("warning: {}: {e}", c.audio.display()));
+                continue;
+            }
+        };
+        // The cache art is already valid, so a failed embed still leaves the
+        // row worth pointing at it — only the size stays as it was.
+        let size = if crate::artwork::container_holds_art(&c.audio) {
+            match crate::artwork::embed(&c.audio, &c.image) {
+                Ok(()) => std::fs::metadata(&c.audio).ok().map(|m| m.len() as i64),
+                Err(e) => {
+                    crate::acquire::note_line(&format!(
+                        "warning: could not embed into {}: {e}",
+                        c.audio.display()
+                    ));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        done.push((&c.content_id, rel, size));
+    }
+    if done.is_empty() {
+        return Ok(0);
+    }
+
+    let base_usn = db.read_local_usn()?;
+    let now = now_db_string();
+    let tx = db.conn.unchecked_transaction()?;
+    for (i, (content_id, rel, size)) in done.iter().enumerate() {
+        let usn = base_usn + 1 + i as i64;
+        // COALESCE so one statement covers both cases: a rewritten file gets its
+        // new size, an untouched one keeps the value already there.
+        let n = tx.execute(
+            "UPDATE djmdContent
+             SET ImagePath = ?2, FileSize = COALESCE(?3, FileSize),
+                 rb_local_synced = 0, rb_local_usn = ?4, updated_at = ?5
+             WHERE ID = ?1",
+            params![content_id, rel, size, usn, now],
+        )?;
+        if n != 1 {
+            bail!("expected to update track {content_id}, updated {n} rows");
+        }
+    }
+    db.write_local_usn(base_usn + done.len() as i64)?;
+    tx.commit()?;
+    Ok(done.len())
 }
 
 #[cfg(test)]
@@ -1007,6 +1366,7 @@ mod tests {
             content_link: Some(2885134),
             master_db_id: Some("2768718261".into()),
             device_id: Some("f742efc6-df09-4a29-876e-fdc38806710b".into()),
+            artwork: None,
         }
     }
 

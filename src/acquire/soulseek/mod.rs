@@ -59,6 +59,7 @@ pub struct Soulseek {
     search_limit: usize,
     fetch_timeout: Duration,
     clean_up_remote: bool,
+    fetch_folder_image: bool,
     budget: Duration,
 }
 
@@ -78,6 +79,7 @@ impl Soulseek {
             search_limit: cfg.search_limit.max(1),
             fetch_timeout: Duration::from_secs(cfg.fetch_timeout_secs.max(1)),
             clean_up_remote: cfg.clean_up_remote,
+            fetch_folder_image: cfg.fetch_folder_image,
             budget,
         }
     }
@@ -162,6 +164,15 @@ fn batch_id(username: &str, filename: &str, attempt: u32) -> String {
 /// turn up in the same search.
 fn basename(path: &str) -> &str {
     path.rsplit(['\\', '/']).next().unwrap_or(path)
+}
+
+/// The containing directory, as a path the peer would recognise.
+///
+/// Keeps the peer's own separator, because this goes straight back to them as
+/// the directory to list.
+fn parent_path(path: &str) -> Option<&str> {
+    let at = path.rfind(['\\', '/'])?;
+    (at > 0).then(|| &path[..at])
 }
 
 /// The containing directory's name, which usually carries the release.
@@ -385,6 +396,56 @@ fn rank_and_truncate(mut hits: Vec<Hit>, limit: usize) -> Vec<Offer> {
 // ---------------------------------------------------------------------------
 // Fetch
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Cover art sitting next to the download
+// ---------------------------------------------------------------------------
+
+/// Filenames that mean "this is the cover", best first.
+///
+/// Matched on the stem, so `Cover.jpg` and `folder.jpeg` both land. Anything
+/// else that is an image is still taken as a last resort, since a release shared
+/// with `art01.png` and nothing else still has art.
+const COVER_STEMS: [&str; 6] = ["cover", "folder", "front", "album", "artwork", "art"];
+
+/// Extensions worth taking. Matches what [`crate::artwork::looks_like_image`]
+/// will accept off the wire, so a pick cannot be rejected later on its magic.
+const IMAGE_EXTS: [&str; 4] = ["jpg", "jpeg", "png", "webp"];
+
+/// Bigger than this is a booklet scan or a folder of them, not a browser tile.
+const MAX_COVER_BYTES: u64 = 12 * 1024 * 1024;
+
+/// How long to wait for a cover, counted from when the audio finished.
+///
+/// Deliberately far below `fetch_timeout`: this is a second place in the same
+/// peer's queue for something cosmetic, so it gets a bounded wait and is
+/// abandoned rather than allowed to hold up the download it belongs to.
+const COVER_TIMEOUT: Duration = Duration::from_secs(150);
+
+/// The best cover candidate in a peer's folder listing.
+fn pick_cover(files: &[api::File]) -> Option<&api::File> {
+    files
+        .iter()
+        .filter(|f| !f.is_locked && f.size > 0 && f.size <= MAX_COVER_BYTES)
+        .filter_map(|f| {
+            let name = basename(&f.filename);
+            let (stem, ext) = stem_and_ext(name);
+            let ext = ext?.to_ascii_lowercase();
+            if !IMAGE_EXTS.contains(&ext.as_str()) {
+                return None;
+            }
+            let stem = stem.trim().to_ascii_lowercase();
+            // A named cover beats an arbitrary image; among equals, the biggest
+            // is the one most likely to be the full-size front.
+            let rank = COVER_STEMS
+                .iter()
+                .position(|c| stem == *c || stem.starts_with(c))
+                .unwrap_or(COVER_STEMS.len());
+            Some((rank, f))
+        })
+        .min_by(|(ra, a), (rb, b)| ra.cmp(rb).then(b.size.cmp(&a.size)))
+        .map(|(_, f)| f)
+}
 
 /// A collected file has to be the size slskd said it finished at.
 ///
@@ -645,6 +706,150 @@ impl Soulseek {
         target: &Path,
         deadline: Instant,
     ) -> Result<u64> {
+        let mut resp = self.files_get(staging, name, deadline)?;
+        let mut reader = resp.body_mut().as_reader();
+        super::fs::write_audio_atomically(target, &mut reader)
+    }
+
+    /// Same, for a cover. The audio path's markup guard would be the wrong test
+    /// here, so the bytes are checked against image magic instead.
+    fn http_collect_image(
+        &self,
+        staging: &str,
+        name: &str,
+        target: &Path,
+        deadline: Instant,
+    ) -> Result<u64> {
+        let mut resp = self.files_get(staging, name, deadline)?;
+        let body = resp
+            .body_mut()
+            .read_to_vec()
+            .map_err(|e| BackendError::Other(anyhow::anyhow!("reading cover: {e}")))?;
+        if !crate::artwork::looks_like_image(&body) {
+            return Err(BackendError::Other(anyhow::anyhow!(
+                "{name} is not an image ({} bytes)",
+                body.len()
+            )));
+        }
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(target, &body)?;
+        Ok(body.len() as u64)
+    }
+
+    /// Give `audio` the cover sitting beside it in the peer's folder.
+    ///
+    /// Best effort from start to finish: the download has already succeeded by
+    /// the time this runs, so nothing here is allowed to turn into an error. The
+    /// embedded-cover check comes first because it is local and free, and it is
+    /// what keeps this from queueing a transfer for art the file already has.
+    fn attach_folder_cover(
+        &self,
+        client: &api::Client,
+        username: &str,
+        filename: &str,
+        audio: &Path,
+    ) {
+        match crate::artwork::has_embedded(audio) {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(e) => {
+                note!(
+                    "warning: could not check {} for cover art: {e}",
+                    audio.display()
+                );
+                return;
+            }
+        }
+        if let Err(e) = self.folder_cover(client, username, filename, audio) {
+            note!("soulseek: no cover art for this download ({e})");
+        }
+    }
+
+    fn folder_cover(
+        &self,
+        client: &api::Client,
+        username: &str,
+        filename: &str,
+        audio: &Path,
+    ) -> Result<()> {
+        let other = |m: String| BackendError::Other(anyhow::anyhow!(m));
+        let dir =
+            parent_path(filename).ok_or_else(|| other(format!("{filename} is not in a folder")))?;
+        let listing = client.peer_directory(username, dir)?;
+        let cover = pick_cover(&listing.files)
+            .ok_or_else(|| other("the peer's folder holds no image".into()))?;
+
+        // Worked out before a queue slot is spent on the transfer.
+        let staged = crate::artwork::sidecar_for(audio)
+            .ok_or_else(|| other("nowhere to stage the cover".into()))?;
+
+        note!(
+            "soulseek: fetching cover {} ({} KB)",
+            basename(&cover.filename),
+            cover.size / 1024
+        );
+        // Its own budget, counted from now: the audio has already spent most of
+        // the fetch deadline, and a cover must not extend it.
+        let deadline = Instant::now() + COVER_TIMEOUT;
+        let id = self.start_or_attach(client, username, &cover.filename, cover.size)?;
+        let staging = Self::staging(&id);
+        let done = Self::await_transfer(client, &id, &cover.filename, deadline)?;
+        let found = Self::locate(client, &staging, &done)?;
+
+        let got = if self.files_url.is_empty() {
+            let downloads = client.options()?.directories.downloads;
+            let produced = Path::new(&downloads).join(&staging).join(&found.name);
+            let body = std::fs::read(&produced)?;
+            if !crate::artwork::looks_like_image(&body) {
+                return Err(other(format!("{} is not an image", found.name)));
+            }
+            std::fs::write(&staged, &body)?;
+            body.len() as u64
+        } else {
+            self.http_collect_image(&staging, &found.name, &staged, deadline)?
+        };
+        // A truncated cover passes its magic bytes and then fails to decode,
+        // which is a much worse message than this one.
+        if let Err(e) = check_size(got, done.size) {
+            let _ = std::fs::remove_file(&staged);
+            return Err(e);
+        }
+        if self.clean_up_remote {
+            client.delete_download_subdirectory(&staging);
+        }
+
+        // The same convention every other backend uses: into the file where the
+        // container allows it, beside the file where it does not.
+        //
+        // A failed embed is not the end of the road — the sidecar left behind is
+        // exactly what the import path falls back to — so it reports where the
+        // art ended up rather than propagating and claiming there is none.
+        if crate::artwork::container_holds_art(audio) {
+            match crate::artwork::embed(audio, &staged) {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(&staged);
+                    note!("soulseek: cover art embedded");
+                }
+                Err(e) => note!(
+                    "soulseek: could not embed the cover ({e}) — left beside the \
+                     file, where the import will still find it"
+                ),
+            }
+        } else {
+            note!("soulseek: cover art saved beside the file");
+        }
+        Ok(())
+    }
+
+    /// A GET against `files_url`, carrying basic auth if it is configured.
+    fn files_get(
+        &self,
+        staging: &str,
+        name: &str,
+        deadline: Instant,
+    ) -> Result<ureq::http::Response<ureq::Body>> {
         let url = format!(
             "{}/{}/{}",
             self.files_url,
@@ -669,9 +874,7 @@ impl Soulseek {
                 .unwrap_or_default();
             req = req.header("Authorization", &api::basic_auth(&self.files_user, &pw));
         }
-        let mut resp = req.call().map_err(|e| super::http::map_err(ID, &url, e))?;
-        let mut reader = resp.body_mut().as_reader();
-        super::fs::write_audio_atomically(target, &mut reader)
+        req.call().map_err(|e| super::http::map_err(ID, &url, e))
     }
 }
 
@@ -865,6 +1068,16 @@ impl super::AcquisitionBackend for Soulseek {
         if self.clean_up_remote {
             client.delete_download_subdirectory(&staging);
         }
+
+        // After `check_size`, so the verification is against the bytes the peer
+        // actually sent, and before the row is described, since embedding
+        // rewrites the file.
+        let bytes = if self.fetch_folder_image {
+            self.attach_folder_cover(&client, username, filename, &path);
+            std::fs::metadata(&path).map(|m| m.len()).unwrap_or(bytes)
+        } else {
+            bytes
+        };
 
         Ok(vec![AcquiredFile {
             path,
@@ -2290,5 +2503,646 @@ mod server_tests {
         let b = Soulseek::new(&cfg, &creds, Duration::from_secs(5));
         let _ = b.search(&SearchQuery::from_text("x", 5));
         assert!(seen_key.load(Ordering::Relaxed), "X-API-Key must be sent");
+    }
+
+    // -----------------------------------------------------------------------
+    // Cover art from the peer's folder
+    // -----------------------------------------------------------------------
+
+    fn img(name: &str, size: u64) -> api::File {
+        api::File {
+            filename: format!(r"@@peer\Album\{name}"),
+            size,
+            extension: None,
+            bit_rate: None,
+            bit_depth: None,
+            sample_rate: None,
+            is_variable_bit_rate: None,
+            length: None,
+            is_locked: false,
+        }
+    }
+
+    #[test]
+    fn the_folder_path_keeps_the_peers_own_separator() {
+        // It goes straight back to them as the directory to list, so rewriting
+        // the separator would ask for a directory they do not have.
+        assert_eq!(
+            parent_path(r"@@peer\Burial - Untrue\02 - Archangel.flac"),
+            Some(r"@@peer\Burial - Untrue")
+        );
+        assert_eq!(
+            parent_path("share/Burial - Untrue/02.flac"),
+            Some("share/Burial - Untrue")
+        );
+        // Nothing to list: no separator, or the separator leads.
+        assert_eq!(parent_path("loose.flac"), None);
+        assert_eq!(parent_path(r"\loose.flac"), None);
+    }
+
+    #[test]
+    fn a_named_cover_beats_an_arbitrary_image_however_big() {
+        let files = vec![img("scan_page_03.png", 5_000_000), img("cover.jpg", 40_000)];
+        assert_eq!(
+            pick_cover(&files).map(|f| basename(&f.filename)),
+            Some("cover.jpg")
+        );
+    }
+
+    #[test]
+    fn the_cover_names_are_preferred_in_order() {
+        // `cover` over `folder` over `front`, so a folder shared with several
+        // still yields the one most likely to be the front.
+        let files = vec![
+            img("front.jpg", 90_000),
+            img("folder.jpg", 90_000),
+            img("cover.jpg", 90_000),
+        ];
+        assert_eq!(
+            pick_cover(&files).map(|f| basename(&f.filename)),
+            Some("cover.jpg")
+        );
+    }
+
+    #[test]
+    fn among_equally_named_covers_the_largest_wins() {
+        let files = vec![img("cover.jpg", 20_000), img("cover.jpeg", 400_000)];
+        assert_eq!(
+            pick_cover(&files).map(|f| f.size),
+            Some(400_000),
+            "the bigger one is the full-size front"
+        );
+    }
+
+    #[test]
+    fn an_unnamed_image_is_still_taken_when_it_is_all_there_is() {
+        // A release shared with `art01.png` and nothing else still has art.
+        let files = vec![img("art01.png", 120_000)];
+        assert_eq!(
+            pick_cover(&files).map(|f| basename(&f.filename)),
+            Some("art01.png")
+        );
+    }
+
+    #[test]
+    fn nothing_usable_yields_none_rather_than_a_doomed_transfer() {
+        // Each of these would cost a place in the peer's queue for nothing.
+        let mut locked = img("cover.jpg", 90_000);
+        locked.is_locked = true;
+        assert!(pick_cover(&[locked]).is_none(), "locked is not gettable");
+        assert!(
+            pick_cover(&[img("cover.jpg", 0)]).is_none(),
+            "an empty file is not a cover"
+        );
+        assert!(
+            pick_cover(&[img("booklet.jpg", 40 * 1024 * 1024)]).is_none(),
+            "a booklet scan is not a browser tile"
+        );
+        assert!(
+            pick_cover(&[img("notes.txt", 500), img("00 - track.flac", 40_000_000)]).is_none(),
+            "neither of these is an image"
+        );
+        assert!(pick_cover(&[]).is_none());
+    }
+
+    #[test]
+    fn a_peer_directory_parses_whether_slskd_wraps_it_in_a_list_or_not() {
+        // Both shapes are in the wild and neither is worth failing a cosmetic
+        // cover over.
+        let one: api::PeerDirectory = serde_json::from_value(json!({"name": r"@@p\A", "files": [
+            {"filename": r"@@p\A\cover.jpg", "size": 90}
+        ]}))
+        .unwrap();
+        assert_eq!(one.files.len(), 1);
+
+        // The list shape goes through the client, so exercise it there.
+        let d = Fake::start(|method, path| {
+            if method == "POST" && path.ends_with("/directory") {
+                return json_reply(
+                    200,
+                    json!([{"name": r"@@p\A", "files": []},
+                           {"name": r"@@p\A", "files": [
+                               {"filename": r"@@p\A\folder.jpg", "size": 90}]}]),
+                );
+            }
+            empty_reply(204)
+        });
+        let dir = d
+            .backend(|_| {})
+            .client()
+            .unwrap()
+            .peer_directory("p", r"@@p\A")
+            .unwrap();
+        assert_eq!(
+            dir.files.first().map(|f| basename(&f.filename)),
+            Some("folder.jpg"),
+            "the empty directory must not win"
+        );
+    }
+
+    /// A real FLAC and a real JPEG, since the cover path runs ffprobe and ffmpeg
+    /// over what it is given. `None` where there is no ffmpeg.
+    fn real_media() -> Option<(std::path::PathBuf, Vec<u8>, Vec<u8>)> {
+        let dir = std::env::temp_dir().join(format!("rr-slskd-art-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).ok()?;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let flac = dir.join("a.flac");
+        let jpg = dir.join("c.jpg");
+
+        let mut cmd = crate::proc::capture("ffmpeg");
+        cmd.args([
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=2",
+        ])
+        .arg(&flac);
+        if crate::proc::run_with_deadline(cmd, deadline)
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            return None;
+        }
+        let mut cmd = crate::proc::capture("ffmpeg");
+        cmd.args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+            .arg("testsrc=size=400x400:duration=1")
+            .args(["-frames:v", "1"])
+            .arg(&jpg);
+        crate::proc::run_with_deadline(cmd, deadline).ok()?;
+
+        Some((dir, std::fs::read(&flac).ok()?, std::fs::read(&jpg).ok()?))
+    }
+
+    #[test]
+    fn the_folder_cover_is_fetched_and_embedded_when_the_option_is_on() {
+        let Some((tmp, audio, cover)) = real_media() else {
+            return; // no ffmpeg here
+        };
+        let (asize, csize) = (audio.len() as u64, cover.len() as u64);
+        let track = r"@@peer\Burial - Untrue\02 - Archangel.flac";
+
+        let (a2, c2) = (audio.clone(), cover.clone());
+        let d = Fake::start(move |method, path| {
+            if method == "POST" && path.ends_with("/directory") {
+                return json_reply(
+                    200,
+                    json!({"name": r"@@peer\Burial - Untrue", "files": [
+                        {"filename": r"@@peer\Burial - Untrue\notes.txt", "size": 12},
+                        {"filename": r"@@peer\Burial - Untrue\cover.jpg", "size": csize,
+                         "extension": ".jpg"}
+                    ]}),
+                );
+            }
+            if method == "POST" && path.contains("/downloads/batches") {
+                return json_reply(201, json!({"batch": {"id": "b", "transfers": []}}));
+            }
+            // Both transfers in every answer; `await_transfer` picks by basename.
+            if method == "GET" && path.contains("/downloads/batches/") {
+                return json_reply(
+                    200,
+                    json!({"id": "b", "transfers": [
+                        {"id": "t-1", "username": "peer", "filename": track,
+                         "size": asize, "state": "Completed, Succeeded",
+                         "bytesTransferred": asize},
+                        {"id": "t-2", "username": "peer",
+                         "filename": r"@@peer\Burial - Untrue\cover.jpg",
+                         "size": csize, "state": "Completed, Succeeded",
+                         "bytesTransferred": csize}
+                    ]}),
+                );
+            }
+            if method == "GET" && path.contains("/files/downloads/directories") {
+                return json_reply(
+                    200,
+                    json!({"files": [
+                        {"name": "02 - Archangel.flac", "length": asize},
+                        {"name": "cover.jpg", "length": csize}
+                    ], "directories": []}),
+                );
+            }
+            if method == "GET" && path.starts_with("/files/") {
+                return if path.ends_with(".jpg") {
+                    bytes_reply(&c2)
+                } else {
+                    bytes_reply(&a2)
+                };
+            }
+            empty_reply(204)
+        });
+
+        let dest = tmp.join("dest");
+        let files = d
+            .backend(|c| c.fetch_folder_image = true)
+            .fetch(
+                &ItemRef::new(ID, item_key(asize, 1006, "peer", track)),
+                &FetchOpts {
+                    dest_dir: dest.clone(),
+                    format_pref: vec![AudioFormat::Flac],
+                    retention: Retention::Keep,
+                    overwrite: false,
+                    deadline: Instant::now() + Duration::from_secs(60),
+                },
+            )
+            .unwrap();
+
+        let f = &files[0];
+        assert!(
+            crate::artwork::has_embedded(&f.path).unwrap(),
+            "the cover should be in the file"
+        );
+        // Embedding rewrote the file, so the reported size has to be the one on
+        // disk — it is what rekordbox stores and what the pending queue guards.
+        assert_eq!(
+            f.bytes,
+            std::fs::metadata(&f.path).unwrap().len(),
+            "bytes must be re-read after the embed"
+        );
+        assert!(f.bytes > asize, "a cover was added");
+        // Embedded, so nothing is left lying beside the file.
+        let sidecar = crate::artwork::sidecar_for(&f.path).unwrap();
+        assert!(!sidecar.exists(), "{} should be gone", sidecar.display());
+
+        assert!(
+            d.asked().iter().any(|a| a.contains("/directory")),
+            "the peer's folder should have been listed: {:?}",
+            d.asked()
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn the_option_defaults_off_so_no_folder_is_listed() {
+        assert!(!config::Soulseek::default().fetch_folder_image);
+    }
+
+    /// One way the cover can go wrong, everything else held normal.
+    struct CoverCase {
+        /// What `POST /users/{u}/directory` answers.
+        dir_status: u16,
+        dir_body: String,
+        /// The state the cover's transfer settles in.
+        cover_state: &'static str,
+        /// What the file route serves for the `.jpg`.
+        cover_body: Vec<u8>,
+        /// What slskd claims the cover's size is, which the size check trusts.
+        cover_claimed: Option<u64>,
+    }
+
+    impl CoverCase {
+        /// A case where everything about the cover works.
+        fn healthy(cover: &[u8]) -> Self {
+            Self {
+                dir_status: 200,
+                dir_body: json!({"name": r"@@peer\Burial - Untrue", "files": [
+                    {"filename": r"@@peer\Burial - Untrue\cover.jpg",
+                     "size": cover.len(), "extension": ".jpg"}
+                ]})
+                .to_string(),
+                cover_state: "Completed, Succeeded",
+                cover_body: cover.to_vec(),
+                cover_claimed: None,
+            }
+        }
+    }
+
+    /// What a cover case produced.
+    struct CoverOutcome {
+        file: AcquiredFile,
+        tmp: std::path::PathBuf,
+        asked: Vec<String>,
+        /// The audio's size before any cover touched it, so a test never has to
+        /// regenerate the file to know what it should still weigh.
+        audio_size: u64,
+    }
+
+    /// Run a fetch with the cover option on, and hand back the audio file.
+    ///
+    /// Every caller asserts the same thing in the end: a cover that goes wrong
+    /// must not cost you the download.
+    fn run_cover_case(case: CoverCase) -> CoverOutcome {
+        let (tmp, audio, _) = real_media().expect("ffmpeg checked by the caller");
+        let asize = audio.len() as u64;
+        let track = r"@@peer\Burial - Untrue\02 - Archangel.flac";
+        let csize = case.cover_claimed.unwrap_or(case.cover_body.len() as u64);
+
+        let CoverCase {
+            dir_status,
+            dir_body,
+            cover_state,
+            cover_body,
+            ..
+        } = case;
+        let a2 = audio.clone();
+        let d = Fake::start(move |method, path| {
+            if method == "POST" && path.ends_with("/directory") {
+                return Reply {
+                    status: dir_status,
+                    body: dir_body.clone().into_bytes(),
+                    json: true,
+                };
+            }
+            if method == "POST" && path.contains("/downloads/batches") {
+                return json_reply(201, json!({"batch": {"id": "b", "transfers": []}}));
+            }
+            if method == "GET" && path.contains("/downloads/batches/") {
+                return json_reply(
+                    200,
+                    json!({"id": "b", "transfers": [
+                        {"id": "t-1", "username": "peer", "filename": track,
+                         "size": asize, "state": "Completed, Succeeded",
+                         "bytesTransferred": asize},
+                        {"id": "t-2", "username": "peer",
+                         "filename": r"@@peer\Burial - Untrue\cover.jpg",
+                         "size": csize, "state": cover_state,
+                         "bytesTransferred": csize,
+                         "exception": "the peer went away"}
+                    ]}),
+                );
+            }
+            if method == "GET" && path.contains("/files/downloads/directories") {
+                return json_reply(
+                    200,
+                    json!({"files": [
+                        {"name": "02 - Archangel.flac", "length": asize},
+                        {"name": "cover.jpg", "length": csize}
+                    ], "directories": []}),
+                );
+            }
+            if method == "GET" && path.starts_with("/files/") {
+                return if path.ends_with(".jpg") {
+                    bytes_reply(&cover_body)
+                } else {
+                    bytes_reply(&a2)
+                };
+            }
+            empty_reply(204)
+        });
+
+        let files = d
+            .backend(|c| c.fetch_folder_image = true)
+            .fetch(
+                &ItemRef::new(ID, item_key(asize, 1006, "peer", track)),
+                &FetchOpts {
+                    dest_dir: tmp.join("dest"),
+                    format_pref: vec![AudioFormat::Flac],
+                    retention: Retention::Keep,
+                    overwrite: false,
+                    deadline: Instant::now() + Duration::from_secs(60),
+                },
+            )
+            .expect("the download itself must survive a cover failure");
+        CoverOutcome {
+            file: files.into_iter().next().unwrap(),
+            tmp,
+            asked: d.asked(),
+            audio_size: asize,
+        }
+    }
+
+    /// The download arrived intact and no cover was attached to it.
+    fn assert_no_cover(f: &AcquiredFile, expected: u64) {
+        assert_eq!(f.bytes, expected, "the audio must not have been rewritten");
+        assert_eq!(
+            std::fs::metadata(&f.path).unwrap().len(),
+            expected,
+            "and the file on disk must agree with the row"
+        );
+        assert!(!crate::artwork::has_embedded(&f.path).unwrap());
+        // Nothing half-written left for the import to trip over.
+        let sidecar = crate::artwork::sidecar_for(&f.path).unwrap();
+        assert!(
+            !sidecar.exists(),
+            "{} should not have been left behind",
+            sidecar.display()
+        );
+    }
+
+    /// The cover art a case needs, or `None` where there is no ffmpeg.
+    ///
+    /// Made and thrown away separately from the fetch's own copy, so a test can
+    /// hand bytes to the fake before `run_cover_case` builds anything.
+    fn cover_bytes() -> Option<Vec<u8>> {
+        let (dir, _, cover) = real_media()?;
+        std::fs::remove_dir_all(&dir).ok();
+        Some(cover)
+    }
+
+    /// The positive control for every case below.
+    ///
+    /// Without this, a bug that stopped the cover path running at all would let
+    /// each failure test pass while proving nothing.
+    #[test]
+    fn the_same_harness_does_attach_a_cover_when_nothing_goes_wrong() {
+        let Some(cover) = cover_bytes() else {
+            return; // no ffmpeg here
+        };
+        let out = run_cover_case(CoverCase::healthy(&cover));
+        assert!(
+            crate::artwork::has_embedded(&out.file.path).unwrap(),
+            "the harness must be capable of succeeding"
+        );
+        assert!(out.file.bytes > out.audio_size, "a cover was added");
+        std::fs::remove_dir_all(&out.tmp).ok();
+    }
+
+    #[test]
+    fn a_peer_that_refuses_to_list_its_folder_still_gives_you_the_download() {
+        let Some(cover) = cover_bytes() else {
+            return;
+        };
+        let out = run_cover_case(CoverCase {
+            dir_status: 404,
+            dir_body: "{}".into(),
+            ..CoverCase::healthy(&cover)
+        });
+        assert_no_cover(&out.file, out.audio_size);
+        std::fs::remove_dir_all(&out.tmp).ok();
+    }
+
+    #[test]
+    fn an_unparseable_folder_listing_is_not_fatal() {
+        let Some(cover) = cover_bytes() else {
+            return;
+        };
+        let out = run_cover_case(CoverCase {
+            dir_status: 200,
+            dir_body: "not json at all".into(),
+            ..CoverCase::healthy(&cover)
+        });
+        assert_no_cover(&out.file, out.audio_size);
+        std::fs::remove_dir_all(&out.tmp).ok();
+    }
+
+    #[test]
+    fn a_folder_with_no_image_costs_nothing_but_the_listing() {
+        let Some(cover) = cover_bytes() else {
+            return;
+        };
+        let out = run_cover_case(CoverCase {
+            dir_status: 200,
+            dir_body: json!({"files": [
+                {"filename": r"@@peer\Burial - Untrue\notes.txt", "size": 20}
+            ]})
+            .to_string(),
+            ..CoverCase::healthy(&cover)
+        });
+        assert_no_cover(&out.file, out.audio_size);
+        // One batch for the audio and none for a cover that does not exist.
+        assert_eq!(
+            out.asked
+                .iter()
+                .filter(|a| a.starts_with("POST /api/v0/transfers/downloads/batches"))
+                .count(),
+            1,
+            "no queue slot should be spent: {:?}",
+            out.asked
+        );
+        std::fs::remove_dir_all(&out.tmp).ok();
+    }
+
+    #[test]
+    fn a_cover_transfer_that_fails_leaves_the_download_alone() {
+        let Some(cover) = cover_bytes() else {
+            return;
+        };
+        let out = run_cover_case(CoverCase {
+            cover_state: "Completed, Errored",
+            ..CoverCase::healthy(&cover)
+        });
+        assert_no_cover(&out.file, out.audio_size);
+        std::fs::remove_dir_all(&out.tmp).ok();
+    }
+
+    #[test]
+    fn something_that_is_not_an_image_is_refused_rather_than_saved() {
+        let Some(cover) = cover_bytes() else {
+            return;
+        };
+        // The realistic version: a reverse proxy answering with an error page.
+        let page = b"<!DOCTYPE html><html><body>404</body></html>".to_vec();
+        let out = run_cover_case(CoverCase {
+            cover_claimed: Some(page.len() as u64),
+            cover_body: page,
+            ..CoverCase::healthy(&cover)
+        });
+        assert_no_cover(&out.file, out.audio_size);
+        std::fs::remove_dir_all(&out.tmp).ok();
+    }
+
+    #[test]
+    fn a_cover_that_cannot_be_embedded_is_left_where_the_import_will_find_it() {
+        let Some(cover) = cover_bytes() else {
+            return;
+        };
+        // JPEG magic over bytes ffmpeg cannot decode: it gets past the magic
+        // check and the size check, and fails at the embed — the one failure
+        // where there is still art worth keeping.
+        let mut broken = vec![0xff, 0xd8, 0xff, 0xe0];
+        broken.extend(std::iter::repeat_n(0x41, 400));
+        let out = run_cover_case(CoverCase {
+            cover_claimed: Some(broken.len() as u64),
+            cover_body: broken,
+            ..CoverCase::healthy(&cover)
+        });
+
+        assert_eq!(
+            out.file.bytes, out.audio_size,
+            "a failed embed must not have rewritten the audio"
+        );
+        assert!(!crate::artwork::has_embedded(&out.file.path).unwrap());
+        // The part that matters: not thrown away. `install_artwork` reads this.
+        let sidecar = crate::artwork::sidecar_for(&out.file.path).unwrap();
+        assert!(
+            sidecar.exists(),
+            "the cover should survive as a sidecar at {}",
+            sidecar.display()
+        );
+        std::fs::remove_dir_all(&out.tmp).ok();
+    }
+
+    #[test]
+    fn a_truncated_cover_is_thrown_away_not_left_for_the_import() {
+        let Some(cover) = cover_bytes() else {
+            return;
+        };
+        // Real magic bytes, fewer of them than slskd said finished — so this
+        // gets past `looks_like_image` and has to be caught on size.
+        let out = run_cover_case(CoverCase {
+            cover_claimed: Some(cover.len() as u64 * 2),
+            ..CoverCase::healthy(&cover)
+        });
+        assert_no_cover(&out.file, out.audio_size);
+        std::fs::remove_dir_all(&out.tmp).ok();
+    }
+
+    #[test]
+    fn a_file_that_already_has_a_cover_costs_no_extra_transfer() {
+        let Some((tmp, audio, cover)) = real_media() else {
+            return;
+        };
+        // Give the served audio a cover of its own first: the release's own art
+        // wins, and the peer's queue should never be joined a second time.
+        let staged = tmp.join("with-art.flac");
+        std::fs::write(&staged, &audio).unwrap();
+        let jpg = tmp.join("in.jpg");
+        std::fs::write(&jpg, &cover).unwrap();
+        crate::artwork::embed(&staged, &jpg).unwrap();
+        let audio = std::fs::read(&staged).unwrap();
+        let asize = audio.len() as u64;
+        let track = r"@@peer\Burial - Untrue\02 - Archangel.flac";
+
+        let a2 = audio.clone();
+        let d = Fake::start(move |method, path| {
+            if method == "POST" && path.contains("/downloads/batches") {
+                return json_reply(201, json!({"batch": {"id": "b", "transfers": []}}));
+            }
+            if method == "GET" && path.contains("/downloads/batches/") {
+                return json_reply(
+                    200,
+                    json!({"id": "b", "transfers": [
+                        {"id": "t-1", "username": "peer", "filename": track,
+                         "size": asize, "state": "Completed, Succeeded",
+                         "bytesTransferred": asize}
+                    ]}),
+                );
+            }
+            if method == "GET" && path.contains("/files/downloads/directories") {
+                return json_reply(
+                    200,
+                    json!({"files": [{"name": "02 - Archangel.flac", "length": asize}],
+                           "directories": []}),
+                );
+            }
+            if method == "GET" && path.starts_with("/files/") {
+                return bytes_reply(&a2);
+            }
+            empty_reply(204)
+        });
+
+        let dest = tmp.join("dest");
+        let files = d
+            .backend(|c| c.fetch_folder_image = true)
+            .fetch(
+                &ItemRef::new(ID, item_key(asize, 1006, "peer", track)),
+                &FetchOpts {
+                    dest_dir: dest.clone(),
+                    format_pref: vec![AudioFormat::Flac],
+                    retention: Retention::Keep,
+                    overwrite: false,
+                    deadline: Instant::now() + Duration::from_secs(60),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(files[0].bytes, asize, "the file must not be rewritten");
+        assert!(
+            !d.asked().iter().any(|a| a.contains("/directory")),
+            "the folder must not be listed for a file that already has art: {:?}",
+            d.asked()
+        );
+        std::fs::remove_dir_all(&tmp).ok();
     }
 }
