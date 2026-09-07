@@ -125,6 +125,79 @@ impl Registry {
     }
 }
 
+/// Give a freshly downloaded `file` a cover, fetching `url` if it has none.
+///
+/// Called at fetch time rather than at import time on purpose. Embedding rewrites
+/// the file, and both [`crate::pending`]'s size-and-mtime guard and
+/// [`crate::import::existing_row_for_content`]'s dedup key off the file as it
+/// stands — so the rewrite has to happen before either has recorded it. The
+/// audio stream is copied, not re-encoded, so a fingerprint is unaffected.
+///
+/// Never fails the download: a track without a browser tile still plays.
+pub fn ensure_cover(file: &std::path::Path, url: Option<&str>, deadline: std::time::Instant) {
+    // A cover the file already carries is the one to keep — it came with the
+    // release, where an artwork URL is whatever the listing happened to show.
+    match crate::artwork::has_embedded(file) {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(e) => {
+            note!(
+                "warning: could not check {} for cover art: {e}",
+                file.display()
+            );
+            return;
+        }
+    }
+    let Some(url) = url.map(str::trim).filter(|u| !u.is_empty()) else {
+        return;
+    };
+    let Some(staged) = crate::artwork::sidecar_for(file) else {
+        return;
+    };
+    if let Err(e) = download_cover(url, &staged, deadline) {
+        note!("warning: could not fetch cover art from {url}: {e}");
+        let _ = std::fs::remove_file(&staged);
+        return;
+    }
+    // WAV cannot hold a picture; the sidecar stays put and the import picks it
+    // up from there instead.
+    if crate::artwork::container_holds_art(file) {
+        match crate::artwork::embed(file, &staged) {
+            // Embedded, so the sidecar has done its job.
+            Ok(()) => {
+                let _ = std::fs::remove_file(&staged);
+            }
+            Err(e) => note!(
+                "warning: could not embed cover art into {}: {e}",
+                file.display()
+            ),
+        }
+    }
+}
+
+/// Download a cover to `dest`, refusing anything that is not an image.
+pub fn download_cover(
+    url: &str,
+    dest: &std::path::Path,
+    deadline: std::time::Instant,
+) -> anyhow::Result<()> {
+    let budget = deadline
+        .saturating_duration_since(std::time::Instant::now())
+        .max(std::time::Duration::from_secs(10));
+    let agent = http::agent(budget);
+    let body = agent.get(url).call()?.body_mut().read_to_vec()?;
+    // Same guard as the audio path: an error page saved as artwork.jpg would
+    // give rekordbox a blank tile and no clue why.
+    if !crate::artwork::looks_like_image(&body) {
+        anyhow::bail!("the server sent {} bytes that are not an image", body.len());
+    }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(dest, &body)?;
+    Ok(())
+}
+
 /// Resolve the configured format preference, dropping anything unusable.
 ///
 /// A preference for a format rekordbox cannot open is a misconfiguration that
@@ -153,6 +226,89 @@ pub fn format_preference(cfg: &Config) -> anyhow::Result<Vec<AudioFormat>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A FLAC of silence, optionally with a cover already on it.
+    fn track(dir: &std::path::Path, name: &str, cover: bool) -> Option<std::path::PathBuf> {
+        std::fs::create_dir_all(dir).ok()?;
+        let audio = dir.join(name);
+        let mut cmd = crate::proc::capture("ffmpeg");
+        cmd.args([
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=1",
+        ])
+        .arg(&audio);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        if crate::proc::run_with_deadline(cmd, deadline)
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            return None; // no ffmpeg here
+        }
+        if cover {
+            let art = dir.join("cover.jpg");
+            let mut cmd = crate::proc::capture("ffmpeg");
+            cmd.args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+                .arg("testsrc=size=200x200:duration=1")
+                .args(["-frames:v", "1"])
+                .arg(&art);
+            crate::proc::run_with_deadline(cmd, deadline).ok()?;
+            crate::artwork::embed(&audio, &art).ok()?;
+        }
+        Some(audio)
+    }
+
+    fn scratch() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("rr-cover-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn a_cover_the_file_already_has_is_kept_and_nothing_is_fetched() {
+        // The release's own art beats whatever a listing happened to show, and
+        // the short-circuit is what keeps a download from making a needless
+        // request — the unreachable URL here is the proof it never calls out.
+        let dir = scratch();
+        let Some(audio) = track(&dir, "has-art.flac", true) else {
+            return;
+        };
+        let before = std::fs::read(&audio).unwrap();
+
+        ensure_cover(
+            &audio,
+            Some("http://127.0.0.1:1/nope.jpg"),
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+        );
+
+        assert_eq!(
+            std::fs::read(&audio).unwrap(),
+            before,
+            "file must not change"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_file_with_no_cover_and_no_url_is_left_exactly_as_it_was() {
+        let dir = scratch();
+        let Some(audio) = track(&dir, "no-art.flac", false) else {
+            return;
+        };
+        let before = std::fs::read(&audio).unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        ensure_cover(&audio, None, deadline);
+        ensure_cover(&audio, Some("   "), deadline);
+
+        assert_eq!(std::fs::read(&audio).unwrap(), before);
+        // And no sidecar was invented for art that does not exist.
+        let sidecar = crate::artwork::sidecar_for(&audio).unwrap();
+        assert!(!sidecar.exists(), "{} should not exist", sidecar.display());
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn a_routed_note_goes_to_the_sink_instead_of_stderr() {

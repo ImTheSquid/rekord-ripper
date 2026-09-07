@@ -128,6 +128,112 @@ fn main() -> Result<()> {
                     })?;
             println!("  djmdProperty         DBID={dbid:?} DeviceID={devid:?}");
         }
+        // Artwork: which tables exist, what a row looks like, how many rows on
+        // djmdContent actually carry an ArtworkID.
+        "art" => {
+            let mut stmt = db.conn.prepare(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'table'
+                 AND (name LIKE '%rtwork%' OR name LIKE '%mage%' OR name LIKE '%Jacket%')
+                 ORDER BY name",
+            )?;
+            let mut rows = stmt.query([])?;
+            while let Some(r) = rows.next()? {
+                println!(
+                    "== {}\n{}\n",
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?
+                );
+            }
+            let mut stmt = db.conn.prepare("PRAGMA table_info(djmdContent)")?;
+            let cols: Vec<String> = stmt
+                .query_map([], |r| r.get::<_, String>("name"))?
+                .collect::<rusqlite::Result<_>>()?;
+            println!(
+                "  djmdContent art-ish columns: {:?}",
+                cols.iter()
+                    .filter(|c| {
+                        let l = c.to_lowercase();
+                        l.contains("art") || l.contains("image") || l.contains("jacket")
+                    })
+                    .collect::<Vec<_>>()
+            );
+            for (label, sql) in [
+                ("imageFile rows", "SELECT COUNT(*) FROM imageFile"),
+                (
+                    "djmdAlbum with art",
+                    "SELECT COUNT(ImagePath) FROM djmdAlbum",
+                ),
+            ] {
+                match db.conn.query_row(sql, [], |r| r.get::<_, i64>(0)) {
+                    Ok(n) => println!("  {label:<22} {n}"),
+                    Err(e) => println!("  {label:<22} err: {e}"),
+                }
+            }
+            let mut stmt = db.conn.prepare(
+                "SELECT c.ID, c.UUID, c.ImagePath, c.AlbumID, a.UUID, a.ImagePath, c.ServiceID
+                 FROM djmdContent c LEFT JOIN djmdAlbum a ON a.ID = c.AlbumID
+                 WHERE c.ImagePath IS NOT NULL AND c.ImagePath != ''
+                   AND c.FolderPath LIKE ?1
+                 ORDER BY c.created_at DESC LIMIT 6",
+            )?;
+            let pattern = std::env::args().nth(2).unwrap_or_else(|| "/Users/%".into());
+            let mut rows = stmt.query([&pattern])?;
+            while let Some(r) = rows.next()? {
+                println!("  --");
+                println!("  content ID    {}", r.get::<_, String>(0)?);
+                println!("  content UUID  {}", r.get::<_, String>(1)?);
+                println!("  ImagePath     {}", r.get::<_, String>(2)?);
+                println!("  AlbumID       {:?}", r.get::<_, Option<String>>(3)?);
+                println!("  album UUID    {:?}", r.get::<_, Option<String>>(4)?);
+                println!("  album Image   {:?}", r.get::<_, Option<String>>(5)?);
+                println!("  ServiceID     {:?}", r.get::<_, Option<i64>>(6)?);
+            }
+        }
+        // Why the artwork backfill finds what it finds: each condition of its
+        // scan query, counted separately.
+        "artscan" => {
+            for (label, sql) in [
+                ("local rows", "ServiceID = 0 AND FolderPath LIKE '/%'"),
+                (
+                    "  of those, no art",
+                    "ServiceID = 0 AND FolderPath LIKE '/%'
+                     AND (ImagePath IS NULL OR ImagePath = '')",
+                ),
+                (
+                    "  of those, have art",
+                    "ServiceID = 0 AND FolderPath LIKE '/%'
+                     AND ImagePath IS NOT NULL AND ImagePath != ''",
+                ),
+            ] {
+                let n: i64 = db.conn.query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM djmdContent
+                         WHERE (rb_local_deleted = 0 OR rb_local_deleted IS NULL) AND {sql}"
+                    ),
+                    [],
+                    |r| r.get(0),
+                )?;
+                println!("  {label:<22} {n}");
+            }
+            // The condition the scan applies in Rust, not SQL.
+            let mut stmt = db.conn.prepare(
+                "SELECT FolderPath FROM djmdContent
+                 WHERE (rb_local_deleted = 0 OR rb_local_deleted IS NULL)
+                   AND ServiceID = 0 AND FolderPath LIKE '/%'
+                   AND (ImagePath IS NULL OR ImagePath = '')",
+            )?;
+            let paths: Vec<String> = stmt
+                .query_map([], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            let present = paths
+                .iter()
+                .filter(|p| std::path::Path::new(p).is_file())
+                .count();
+            println!("  of those, file on disk  {present} / {}", paths.len());
+            for p in paths.iter().filter(|p| std::path::Path::new(p).is_file()) {
+                println!("    {p}");
+            }
+        }
         other => println!("unknown mode {other}"),
     }
     Ok(())

@@ -346,6 +346,7 @@ mod tests {
             content_link: None,
             master_db_id: None,
             device_id: None,
+            artwork: None,
         }
     }
 }

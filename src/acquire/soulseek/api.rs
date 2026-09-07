@@ -280,6 +280,35 @@ pub struct FilesystemFile {
     pub length: u64,
 }
 
+/// One directory of a peer's shares, from `POST /api/v0/users/{user}/directory`.
+///
+/// The files are the same shape as a search response's, so a cover picked out of
+/// here can be enqueued exactly like an audio hit.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerDirectory {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub files: Vec<File>,
+}
+
+/// slskd has answered this with both a bare directory and a list of them
+/// depending on version, and neither shape is worth a hard failure when the
+/// whole feature is a nice-to-have cover.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum DirectoryReply {
+    One(PeerDirectory),
+    Many(Vec<PeerDirectory>),
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DirectoryRequest<'a> {
+    directory: &'a str,
+}
+
 /// The directories slskd is configured with, from `GET /api/v0/options`.
 ///
 /// Needed because a completed download's location is only knowable as
@@ -416,6 +445,42 @@ impl Client {
     /// slskd's running configuration, for the download directory.
     pub fn options(&self) -> Result<Options> {
         self.get_json("options", "options")
+    }
+
+    /// List one directory of a peer's shares.
+    ///
+    /// POST rather than GET because the directory is a Windows-shaped path with
+    /// backslashes and spaces, which belongs in a body rather than a URL.
+    ///
+    /// Costs a round-trip to the peer, so this is only worth calling once the
+    /// peer has already proved reachable by sending a file.
+    pub fn peer_directory(&self, username: &str, directory: &str) -> Result<PeerDirectory> {
+        let url = self.url(&format!(
+            "users/{}/directory",
+            encode_path_segment(username)
+        ));
+        let agent = http::agent(self.budget);
+        let body = http::with_retries(3, || {
+            agent
+                .post(&url)
+                .header("X-API-Key", &self.api_key)
+                .send_json(&DirectoryRequest { directory })
+                .map_err(|e| http::map_err(ID, &url, e))?
+                .body_mut()
+                .read_to_string()
+                .map_err(|e| http::map_err(ID, &url, e))
+        })?;
+        let reply: DirectoryReply = serde_json::from_str(&body)
+            .map_err(|e| BackendError::parse(ID, "peer directory", e.to_string()))?;
+        Ok(match reply {
+            DirectoryReply::One(d) => d,
+            // The one whose name matches is not knowable here — the caller asked
+            // for a single directory, so take the first with anything in it.
+            DirectoryReply::Many(list) => list
+                .into_iter()
+                .find(|d| !d.files.is_empty())
+                .unwrap_or_default(),
+        })
     }
 
     /// List slskd's download directory. `subdirectory` is relative to it.

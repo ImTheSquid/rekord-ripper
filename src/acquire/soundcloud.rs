@@ -390,6 +390,9 @@ fn parse_search(json: &str, limit: usize) -> Result<Vec<Offer>> {
             url,
         );
         offer.duration_secs = e["duration"].as_f64().map(|d| d.round() as i64);
+        // The flat listing carries thumbnails, so a cover costs no extra
+        // request — which is what makes `artwork --from-sources` viable here.
+        offer.artwork_url = best_thumbnail(&e);
         // SoundCloud has no purchase and no ownership. Stating that up front is
         // free and correct, unlike guessing at a price.
         offer.pricing = Pricing::Free;
@@ -647,6 +650,15 @@ impl super::AcquisitionBackend for SoundCloud {
 
         let (artist, title) = (meta.artist, meta.title);
         let final_path = super::fs::place(&produced, &opts.dest_dir, opts.overwrite)?;
+
+        // A soundcloud stream carries no cover, so the rip has to be given one.
+        // After `place`, so a sidecar for a container that cannot embed lands
+        // beside the finished file rather than in the staging directory.
+        super::ensure_cover(&final_path, meta.artwork_url.as_deref(), opts.deadline);
+        // Re-read: embedding rewrites the file, and this is what rekordbox
+        // stores as FileSize and what the pending queue guards the entry with.
+        let bytes = std::fs::metadata(&final_path)?.len();
+
         Ok(vec![AcquiredFile {
             path: final_path,
             format,
@@ -678,6 +690,8 @@ struct DownloadMetadata {
     title: Option<String>,
     /// What soundcloud says the track runs to, for checking what we got.
     duration_secs: Option<f64>,
+    /// Cover art, which a rip has to be given because the stream carries none.
+    artwork_url: Option<String>,
 }
 
 /// Best-effort: missing metadata leaves the acquired file untagged rather than
@@ -701,10 +715,39 @@ fn parse_download_metadata(stdout: &str) -> DownloadMetadata {
                     .find_map(|k| v[*k].as_str())
                     .map(str::to_string),
                 duration_secs: v["duration"].as_f64(),
+                artwork_url: best_thumbnail(&v),
             };
         }
     }
     DownloadMetadata::default()
+}
+
+/// The biggest cover art the info JSON offers.
+///
+/// `thumbnails` is ordered worst-first when yt-dlp knows the sizes, so the last
+/// entry with a URL beats the single `thumbnail` field.
+fn best_thumbnail(v: &serde_json::Value) -> Option<String> {
+    let from_list = v["thumbnails"]
+        .as_array()
+        .and_then(|list| list.iter().rev().find_map(|t| t["url"].as_str()));
+    let url = from_list.or_else(|| v["thumbnail"].as_str())?;
+    Some(upgrade_artwork_size(url))
+}
+
+/// Ask soundcloud for the 500px cover rather than the 100px one.
+///
+/// Their URLs name the size, and the default `-large` is 100×100 — too small for
+/// anything but the smallest rekordbox thumbnail. The variants are all generated
+/// from one upload, so swapping the suffix is not a guess.
+fn upgrade_artwork_size(url: &str) -> String {
+    for small in [
+        "-large.", "-t67x67.", "-badge.", "-small.", "-tiny.", "-mini.",
+    ] {
+        if let Some(at) = url.rfind(small) {
+            return format!("{}-t500x500.{}", &url[..at], &url[at + small.len()..]);
+        }
+    }
+    url.to_string()
 }
 
 /// How far short of the advertised duration a file may land before it counts as
@@ -976,6 +1019,78 @@ mod tests {
         assert_eq!(
             parse_download_metadata("not json"),
             DownloadMetadata::default()
+        );
+    }
+
+    #[test]
+    fn a_search_offer_carries_a_cover_so_a_backfill_has_something_to_use() {
+        // The flat listing includes thumbnails, so this costs no extra request.
+        // The `mini` variant is 20px, which is why it gets upgraded.
+        let json = r#"{"entries":[{"id":"1","title":"Archangel","uploader":"Burial",
+            "webpage_url":"https://soundcloud.com/burial/archangel","duration":238,
+            "thumbnails":[{"url":"https://i1.sndcdn.com/artworks-abc-mini.jpg"}]}]}"#;
+        let offers = parse_search(json, 10).unwrap();
+        assert_eq!(
+            offers[0].artwork_url.as_deref(),
+            Some("https://i1.sndcdn.com/artworks-abc-t500x500.jpg")
+        );
+    }
+
+    #[test]
+    fn a_search_offer_with_no_thumbnail_reports_none() {
+        let json = r#"{"entries":[{"id":"1","title":"X","webpage_url":"https://x/y"}]}"#;
+        let offers = parse_search(json, 10).unwrap();
+        assert_eq!(offers[0].artwork_url, None);
+    }
+
+    #[test]
+    fn the_info_json_also_yields_the_cover_a_rip_would_otherwise_lack() {
+        // A stream carries no picture, so this URL is the only art there is.
+        let meta = parse_download_metadata(
+            r#"{"track":"AMB","thumbnail":"https://i1.sndcdn.com/artworks-abc-large.jpg"}"#,
+        );
+        assert_eq!(
+            meta.artwork_url.as_deref(),
+            Some("https://i1.sndcdn.com/artworks-abc-t500x500.jpg")
+        );
+    }
+
+    #[test]
+    fn the_largest_listed_thumbnail_wins_over_the_single_field() {
+        // yt-dlp orders `thumbnails` worst-first, so the last one is the best.
+        // One object per line, the way `--print-json` emits it.
+        let meta = parse_download_metadata(
+            r#"{"track":"AMB","thumbnail":"https://i1.sndcdn.com/a-tiny.jpg","thumbnails":[{"url":"https://i1.sndcdn.com/a-small.jpg"},{"url":"https://i1.sndcdn.com/a-original.jpg"}]}"#,
+        );
+        assert_eq!(
+            meta.artwork_url.as_deref(),
+            Some("https://i1.sndcdn.com/a-original.jpg")
+        );
+    }
+
+    #[test]
+    fn a_track_with_no_art_at_all_reports_none_rather_than_an_empty_url() {
+        let meta = parse_download_metadata(r#"{"track":"AMB","duration":10}"#);
+        assert_eq!(meta.artwork_url, None);
+    }
+
+    #[test]
+    fn only_the_size_suffix_is_rewritten_and_unknown_shapes_are_left_alone() {
+        // The rewrite must not touch a URL whose size it does not recognise, or
+        // it would fabricate a 404.
+        assert_eq!(
+            upgrade_artwork_size("https://i1.sndcdn.com/artworks-abc-t500x500.jpg"),
+            "https://i1.sndcdn.com/artworks-abc-t500x500.jpg"
+        );
+        assert_eq!(
+            upgrade_artwork_size("https://example.com/cover.png"),
+            "https://example.com/cover.png"
+        );
+        // Only the last occurrence, so a path segment that happens to contain
+        // "-large." cannot corrupt the filename.
+        assert_eq!(
+            upgrade_artwork_size("https://i1.sndcdn.com/x-large.d/artworks-large.jpg"),
+            "https://i1.sndcdn.com/x-large.d/artworks-t500x500.jpg"
         );
     }
 

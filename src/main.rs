@@ -316,6 +316,47 @@ enum Cmd {
         unplayable_only: bool,
     },
 
+    /// Give local tracks with no cover art the one their file already carries,
+    /// or with --from-sources, one found on a backend.
+    ///
+    /// Rekordbox keeps art as a file under `share/PIONEER/Artwork` with the path
+    /// on the track row, so a row imported before this existed has a blank tile
+    /// even when the cover is sitting in the file. Every local row without art
+    /// is probed; anything moved or coverless is skipped. Default = dry-run.
+    Artwork {
+        /// Actually write to master.db. Without this, prints what it would do.
+        #[arg(long)]
+        apply: bool,
+        /// Skip the confirmation prompt. Matches needing review are skipped
+        /// rather than accepted blind.
+        #[arg(short = 'y', long)]
+        yes: bool,
+        /// For tracks whose file has no cover, search the enabled backends and
+        /// take the art off the best match. One search per track, and the art is
+        /// embedded in the file as well as given to rekordbox — so strong
+        /// matches apply in bulk and weaker ones are shown to you one at a time.
+        #[arg(long)]
+        from_sources: bool,
+        /// Tracks to search before stopping. Defaults to 50, since each one is
+        /// a search against every enabled backend.
+        #[arg(long, value_name = "N")]
+        limit: Option<usize>,
+        /// Only consider tracks matching this library query, in the same syntax
+        /// as `dump` and `shop --match`. A filter, not a selection — there is no
+        /// cap on how many it may match, only on how many are searched.
+        #[arg(long, value_name = "QUERY")]
+        r#match: Option<String>,
+        /// Lowest match confidence worth showing at all, 0-100.
+        #[arg(long, value_name = "N", default_value_t = 55)]
+        min_score: u8,
+        /// Confidence at which a match is applied without being shown to you.
+        /// 80 means an exact title plus either the artist or the duration; 90
+        /// insists on the artist, which is stricter about re-uploads and covers
+        /// that merely share a title and length.
+        #[arg(long, value_name = "N", default_value_t = STRONG_MATCH)]
+        auto_score: u8,
+    },
+
     /// Compare two audio files by fingerprint and print the raw numbers.
     ///
     /// This is the calibration tool. The accept thresholds shipped in config are
@@ -383,6 +424,33 @@ fn main() -> Result<()> {
             yes,
             unplayable_only,
         )?,
+        Cmd::Artwork {
+            apply,
+            yes,
+            from_sources,
+            limit,
+            r#match,
+            min_score,
+            auto_score,
+        } => {
+            let cfg = Config::load(&config_path)?;
+            let creds = Credentials::load(&paths::credentials_path()?)?;
+            run_artwork(
+                db.as_mut().expect("artwork needs the db"),
+                &cfg,
+                &creds,
+                safety,
+                ArtworkArgs {
+                    apply,
+                    yes,
+                    from_sources,
+                    limit,
+                    match_query: r#match,
+                    min_score,
+                    auto_score,
+                },
+            )?
+        }
         Cmd::Import {
             files,
             title,
@@ -741,6 +809,492 @@ fn run_repair(
     Ok(())
 }
 
+struct ArtworkArgs {
+    apply: bool,
+    yes: bool,
+    from_sources: bool,
+    limit: Option<usize>,
+    match_query: Option<String>,
+    min_score: u8,
+    auto_score: u8,
+}
+
+/// Backends whose search results carry a cover URL, so a source backfill has
+/// something to use without a second request.
+///
+/// Soulseek is deliberately absent: its art sits in the peer's folder and needs
+/// a transfer, which is `[soulseek] fetch_folder_image`'s job at download time.
+const ART_CAPABLE_BACKENDS: [acquire::BackendId; 2] =
+    [acquire::BackendId::Bandcamp, acquire::BackendId::SoundCloud];
+
+/// Tracks a source search will look for before it stops, unless `--limit` says
+/// otherwise. One search per track, so this is a network-cost guard.
+const DEFAULT_SEARCH_LIMIT: usize = 50;
+
+/// A match strong enough to apply without being looked at.
+///
+/// `shop::similarity` gives 70 for an exact title, +20 for the artist and +10
+/// for a duration within two seconds — so this needs the title to match exactly
+/// *and* one of the other two to agree. Anything less goes to the manual pass.
+const STRONG_MATCH: u8 = 80;
+
+/// One track's proposed cover, waiting to be applied or reviewed.
+struct CoverProposal {
+    gap: rekord_ripper::import::ArtworkGap,
+    /// How the offer described itself, for the review line.
+    offer: String,
+    backend: acquire::BackendId,
+    score: u8,
+    url: String,
+}
+
+/// Backfill cover art onto local rows that have none.
+fn run_artwork(
+    db: &mut MasterDb,
+    cfg: &Config,
+    creds: &Credentials,
+    safety: SafetyOpts,
+    args: ArtworkArgs,
+) -> Result<()> {
+    use owo_colors::OwoColorize;
+    use rekord_ripper::import;
+
+    eprintln!("looking for cover art on every local track without any …");
+    let scan = import::scan_artwork(db)?;
+
+    for fix in &scan.local {
+        println!(
+            "  {:<10} {}",
+            fix.source.to_string().cyan(),
+            base(&fix.path)
+        );
+    }
+    if !scan.local.is_empty() {
+        eprintln!(
+            "{} row(s) can be given the cover already in their file.",
+            scan.local.len()
+        );
+    }
+
+    // Searching a source is the only way to fix the rest, and it is opt-in
+    // because it is a request per track and a guess at the end of it.
+    let mut strong: Vec<CoverProposal> = Vec::new();
+    let mut weak: Vec<CoverProposal> = Vec::new();
+    if args.from_sources && !scan.gaps.is_empty() {
+        let (found, searched) = search_for_covers(db, cfg, creds, &scan.gaps, &args)?;
+        for p in found {
+            if p.score >= args.auto_score {
+                strong.push(p);
+            } else {
+                weak.push(p);
+            }
+        }
+        // Silent when nothing was searched: the reason was already reported, and
+        // a row of zeroes only buries it.
+        if searched > 0 {
+            eprintln!(
+                "searched {searched} track(s) with no cover: {} strong match(es), \
+                 {} to review, {} with nothing usable.",
+                strong.len(),
+                weak.len(),
+                searched - strong.len() - weak.len()
+            );
+        }
+    } else if !scan.gaps.is_empty() {
+        eprintln!(
+            "{} local row(s) have no cover in their file. Pass {} to look for \
+             one on the enabled backends.",
+            scan.gaps.len(),
+            "--from-sources".bold()
+        );
+    }
+
+    // Without this the counts above read as the whole picture, when most of a
+    // synced library's files live on another machine. Called on whichever path
+    // exits, so it lands last either way and never splits the proposal list.
+    let absent_note = || {
+        if scan.absent > 0 {
+            eprintln!(
+                "note: {} further row(s) have no cover either, but their file is \
+                 not on this machine, so nothing here can reach them.",
+                scan.absent
+            );
+        }
+    };
+
+    if scan.local.is_empty() && strong.is_empty() && weak.is_empty() {
+        eprintln!("{} nothing to do.", "ok:".green());
+        absent_note();
+        return Ok(());
+    }
+
+    for p in &strong {
+        println!(
+            "  {:<10} {}  {} {}",
+            "source".green(),
+            base(&p.gap.path),
+            format!("{}%", p.score).bold(),
+            format!("[{} {}]", p.backend, p.offer).dimmed()
+        );
+    }
+    for p in &weak {
+        println!(
+            "  {:<10} {}  {} {}",
+            "review".yellow(),
+            base(&p.gap.path),
+            format!("{}%", p.score).bold(),
+            format!("[{} {}]", p.backend, p.offer).dimmed()
+        );
+    }
+    println!();
+
+    absent_note();
+
+    if !args.apply {
+        eprintln!("Dry-run; pass --apply to write.");
+        return Ok(());
+    }
+
+    // The manual pass runs before anything is written, so a review that is
+    // abandoned half way leaves the database untouched.
+    let mut accepted = strong;
+    if !weak.is_empty() {
+        if args.yes {
+            eprintln!(
+                "skipping {} match(es) that need review, because -y cannot look \
+                 at them. Run without -y to go through them.",
+                weak.len()
+            );
+        } else {
+            accepted.extend(review_covers(weak)?);
+        }
+    }
+
+    let total = scan.local.len() + accepted.len();
+    if total == 0 {
+        eprintln!("{} nothing accepted.", "ok:".green());
+        return Ok(());
+    }
+    if !args.yes && !confirm_stdin(&format!("add art to {total} row(s) in master.db?"))? {
+        println!("cancelled.");
+        return Ok(());
+    }
+
+    db::safety_preflight(safety)?;
+    let backup = db.backup()?;
+    eprintln!("backed up to: {}", backup.display());
+
+    let mut n = import::apply_artwork_fixes(db, &scan.local)?;
+    if !accepted.is_empty() {
+        // Downloaded first, so a network failure costs no database write.
+        let staged = download_covers(&accepted, cfg)?;
+        n += import::apply_source_covers(db, &staged)?;
+    }
+    eprintln!("{} gave {n} row(s) their cover.", "ok:".green());
+    eprintln!("rekordbox must be restarted to re-read them.");
+    Ok(())
+}
+
+fn base(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string())
+}
+
+/// Search the enabled backends for a cover for each gap.
+///
+/// Returns the best candidate per track that actually has an artwork URL, plus
+/// how many tracks were searched.
+fn search_for_covers(
+    db: &MasterDb,
+    cfg: &Config,
+    creds: &Credentials,
+    gaps: &[rekord_ripper::import::ArtworkGap],
+    args: &ArtworkArgs,
+) -> Result<(Vec<CoverProposal>, usize)> {
+    use rekord_ripper::acquire::shop;
+
+    let mut wanted: Vec<&rekord_ripper::import::ArtworkGap> = Vec::new();
+    // `--match` narrows to a subset, which is how you try this on ten tracks
+    // before turning it loose on the library.
+    if let Some(q) = &args.match_query {
+        // Uncapped on purpose. `shop --match` caps because every hit becomes a
+        // backend fan-out you did not ask for; here the query is only a filter
+        // over tracks that are already missing art, and `--limit` is what bounds
+        // the searching. Capping twice is what made `--limit 30` do nothing.
+        let hits = rekord_ripper::select::hits(db, q, usize::MAX)?;
+        let ids: std::collections::HashSet<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        wanted.extend(gaps.iter().filter(|g| ids.contains(g.content_id.as_str())));
+        if wanted.is_empty() {
+            // Deliberately not "none are missing cover art" — most of a synced
+            // library is streaming rows and files that live on another machine,
+            // and claiming those already have covers would be a lie.
+            eprintln!(
+                "{} track(s) match {q:?}, but none of them are local files on \
+                 this machine without a cover — nothing to search for.",
+                hits.len()
+            );
+            return Ok((Vec::new(), 0));
+        }
+        eprintln!(
+            "{q:?} matches {} track(s), {} of them without cover art.",
+            hits.len(),
+            wanted.len()
+        );
+    } else {
+        wanted.extend(gaps.iter());
+    }
+
+    // Embedding rewrites the file, which is exactly what `pending`'s
+    // size-and-mtime guard treats as "no longer the file this pairing was
+    // reasoned about" — so a track waiting on a transfer is left alone.
+    let queued = queued_paths().unwrap_or_default();
+    let before = wanted.len();
+    wanted.retain(|g| !queued.contains(&g.path));
+    if wanted.len() != before {
+        eprintln!(
+            "skipping {} track(s) with a queued analysis transfer; applying art \
+             now would expire the pairing.",
+            before - wanted.len()
+        );
+    }
+
+    // Bounded by default: one search per track is real network work, and an
+    // unbounded first run across a whole library is nobody's intent.
+    let limit = args.limit.unwrap_or(DEFAULT_SEARCH_LIMIT);
+    if wanted.len() > limit {
+        eprintln!(
+            "searching the first {limit} of {}; raise with --limit N.",
+            wanted.len()
+        );
+        wanted.truncate(limit);
+    }
+    if wanted.is_empty() {
+        return Ok((Vec::new(), 0));
+    }
+
+    let reg = acquire::Registry::from_config(cfg, creds);
+    if reg.is_empty() {
+        anyhow::bail!("no acquisition backends are enabled; nothing to search");
+    }
+    let specs: Vec<shop::QuerySpec> = wanted
+        .iter()
+        .map(|g| shop::QuerySpec {
+            label: format!("{} — {}", g.artist.as_deref().unwrap_or("?"), g.title),
+            src_id: Some(g.content_id.clone()),
+            query: acquire::SearchQuery {
+                title: g.title.clone(),
+                artist: g.artist.clone(),
+                duration_secs: g.duration_secs,
+                limit: cfg.search.limit,
+                ..Default::default()
+            },
+        })
+        .collect();
+
+    let opts = shop::SearchOpts {
+        // Nothing here buys anything, so price and format probing is wasted
+        // work — the search results already carry the artwork URL.
+        enrich_top_n: 0,
+        // Only the backends whose *search* can hand back a cover. Soulseek's art
+        // is a queued transfer per track, so including it would add its whole
+        // search window to every single track for nothing — twenty seconds
+        // apiece across a few hundred tracks. `fetch_folder_image` is how
+        // Soulseek art gets in, at download time.
+        only: ART_CAPABLE_BACKENDS.to_vec(),
+        ..Default::default()
+    };
+    let groups = shop::search_many(&reg, &specs, &opts, |i, total, label| {
+        if i < total {
+            eprint!("\r  searching {}/{total}: {label:<48.48}", i + 1);
+        } else {
+            eprintln!("\r  searched {total} track(s).{:<48}", "");
+        }
+    });
+
+    let by_id: std::collections::HashMap<&str, &rekord_ripper::import::ArtworkGap> =
+        wanted.iter().map(|g| (g.content_id.as_str(), *g)).collect();
+
+    let mut out = Vec::new();
+    for g in groups {
+        let Some(gap) = g.src_id.as_deref().and_then(|id| by_id.get(id)) else {
+            continue;
+        };
+        // Best-scoring offer that actually has art to give.
+        let Some(best) = g
+            .outcome
+            .offers
+            .iter()
+            .filter(|r| r.offer.artwork_url.is_some())
+            .max_by_key(|r| r.match_score)
+        else {
+            continue;
+        };
+        if best.match_score < args.min_score {
+            continue;
+        }
+        out.push(CoverProposal {
+            gap: (*gap).clone(),
+            offer: format!("{} — {}", best.offer.artist, best.offer.title),
+            backend: best.offer.backend(),
+            score: best.match_score,
+            url: best.offer.artwork_url.clone().unwrap_or_default(),
+        });
+    }
+    Ok((out, specs.len()))
+}
+
+/// Files with a pending analysis transfer still open.
+fn queued_paths() -> Result<std::collections::HashSet<String>> {
+    let store = rekord_ripper::pending::PendingStore::open()?;
+    Ok(store
+        .all()?
+        .into_iter()
+        .filter(|e| !e.state.is_terminal())
+        .map(|e| e.acquired_path.to_string_lossy().into_owned())
+        .collect())
+}
+
+/// Walk the uncertain matches, drawing each cover in the terminal.
+fn review_covers(weak: Vec<CoverProposal>) -> Result<Vec<CoverProposal>> {
+    use owo_colors::OwoColorize;
+    use rekord_ripper::artwork;
+
+    let inline = artwork::inline_image_support();
+    if inline == artwork::InlineImages::None {
+        eprintln!(
+            "note: this terminal has no inline-image support, so the covers \
+             below can only be described. Open the URL to see one."
+        );
+    }
+
+    collect_reviews(weak, |i, total, p| {
+        println!();
+        println!(
+            "{} {}",
+            format!("[{}/{total}]", i + 1).bold(),
+            base(&p.gap.path)
+        );
+        println!(
+            "  your track   {} — {}",
+            p.gap.artist.as_deref().unwrap_or("?"),
+            p.gap.title
+        );
+        println!(
+            "  {} matched   {}  {}",
+            p.backend,
+            p.offer,
+            format!("{}% confidence", p.score).yellow()
+        );
+
+        // Fetched only to look at. The real download happens after the review,
+        // so abandoning it half way costs nothing but these previews.
+        let mut drawn = false;
+        if inline != artwork::InlineImages::None
+            && let Ok(dir) = rekord_ripper::paths::scratch_root()
+        {
+            let file = artwork::ScratchFile(dir.join(format!("preview-{}.jpg", p.gap.content_id)));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            if acquire::download_cover(&p.url, &file.0, deadline).is_ok() {
+                drawn = artwork::show_inline(&file.0, 24);
+            }
+        }
+        if !drawn {
+            println!("  {}", p.url.dimmed());
+        }
+        review_choice()
+    })
+}
+
+/// Walk the proposals, asking `ask` about each, and collect what was accepted.
+///
+/// Split from the drawing and prompting so the answer handling can be tested —
+/// "all" has to take the whole remainder, and getting that wrong silently drops
+/// covers the user said yes to.
+fn collect_reviews(
+    weak: Vec<CoverProposal>,
+    mut ask: impl FnMut(usize, usize, &CoverProposal) -> Result<Review>,
+) -> Result<Vec<CoverProposal>> {
+    let mut kept = Vec::new();
+    let total = weak.len();
+    // An explicit iterator, so answering "all" can hand the remainder straight
+    // to `kept` instead of dropping it on the way out of the loop.
+    let mut rest = weak.into_iter().enumerate();
+    while let Some((i, p)) = rest.next() {
+        match ask(i, total, &p)? {
+            Review::Yes => kept.push(p),
+            Review::No => {}
+            Review::AllRemaining => {
+                kept.push(p);
+                let n = rest.len();
+                kept.extend(rest.by_ref().map(|(_, p)| p));
+                eprintln!("note: accepting this and the remaining {n} without asking.");
+                break;
+            }
+            Review::Quit => {
+                eprintln!(
+                    "stopping the review; keeping the {} accepted so far.",
+                    kept.len()
+                );
+                return Ok(kept);
+            }
+        }
+    }
+    Ok(kept)
+}
+
+enum Review {
+    Yes,
+    No,
+    AllRemaining,
+    Quit,
+}
+
+fn review_choice() -> Result<Review> {
+    use std::io::Write;
+    loop {
+        print!("  use this cover? [y]es / [n]o / [a]ll / [q]uit: ");
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line)? == 0 {
+            return Ok(Review::Quit); // stdin closed
+        }
+        match line.trim().to_ascii_lowercase().as_str() {
+            "y" | "yes" => return Ok(Review::Yes),
+            "n" | "no" | "" => return Ok(Review::No),
+            "a" | "all" => return Ok(Review::AllRemaining),
+            "q" | "quit" => return Ok(Review::Quit),
+            _ => println!("  answer y, n, a or q."),
+        }
+    }
+}
+
+/// Fetch every accepted cover, dropping the ones that will not download.
+fn download_covers(
+    accepted: &[CoverProposal],
+    cfg: &Config,
+) -> Result<Vec<rekord_ripper::import::SourceCover>> {
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(cfg.search.timeout_secs.max(10));
+    let mut out = Vec::new();
+    for p in accepted {
+        let dest =
+            rekord_ripper::paths::scratch_root()?.join(format!("cover-{}.jpg", p.gap.content_id));
+        if let Err(e) = acquire::download_cover(&p.url, &dest, deadline) {
+            eprintln!("warning: no cover for {}: {e}", base(&p.gap.path));
+            continue;
+        }
+        out.push(rekord_ripper::import::SourceCover {
+            content_id: p.gap.content_id.clone(),
+            uuid: p.gap.uuid.clone(),
+            audio: std::path::PathBuf::from(&p.gap.path),
+            image: dest,
+        });
+    }
+    Ok(out)
+}
+
 /// Fingerprint-gate and apply an analysis transfer onto a freshly imported row.
 fn transfer_onto_import(
     db: &mut MasterDb,
@@ -918,6 +1472,7 @@ fn needs_database(cmd: &Cmd) -> bool {
         | Cmd::Auto { .. }
         | Cmd::Pending { .. }
         | Cmd::Import { .. }
+        | Cmd::Artwork { .. }
         | Cmd::Repair { .. } => true,
     }
 }
@@ -1274,4 +1829,136 @@ fn run_cp(
         eprintln!("applied: {} → {}", plan.src.id, plan.dst.id);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn proposal(name: &str) -> CoverProposal {
+        CoverProposal {
+            gap: rekord_ripper::import::ArtworkGap {
+                content_id: name.to_string(),
+                uuid: format!("aaaaaaaa-0000-0000-0000-{name:0>12}"),
+                path: format!("/music/{name}.flac"),
+                title: name.to_string(),
+                artist: Some("A".into()),
+                duration_secs: Some(200),
+                file_size: 1,
+            },
+            offer: format!("A — {name}"),
+            backend: acquire::BackendId::Bandcamp,
+            score: 60,
+            url: format!("https://example.com/{name}.jpg"),
+        }
+    }
+
+    fn ids(kept: &[CoverProposal]) -> Vec<String> {
+        kept.iter().map(|p| p.gap.content_id.clone()).collect()
+    }
+
+    #[test]
+    fn accepting_and_declining_keeps_only_what_was_accepted() {
+        let weak = vec![proposal("1"), proposal("2"), proposal("3")];
+        let answers = [Review::Yes, Review::No, Review::Yes];
+        let mut n = 0;
+        let kept = collect_reviews(weak, |_, _, _| {
+            let a = match answers[n] {
+                Review::Yes => Review::Yes,
+                Review::No => Review::No,
+                _ => unreachable!(),
+            };
+            n += 1;
+            Ok(a)
+        })
+        .unwrap();
+        assert_eq!(ids(&kept), ["1", "3"]);
+    }
+
+    #[test]
+    fn answering_all_takes_the_whole_remainder_rather_than_dropping_it() {
+        // The bug this exists for: accepting the current proposal and then
+        // leaving the loop discarded every one after it, silently.
+        let weak = vec![proposal("1"), proposal("2"), proposal("3"), proposal("4")];
+        let mut asked = 0;
+        let kept = collect_reviews(weak, |i, _, _| {
+            asked += 1;
+            Ok(if i == 1 {
+                Review::AllRemaining
+            } else {
+                Review::No
+            })
+        })
+        .unwrap();
+        assert_eq!(ids(&kept), ["2", "3", "4"], "3 and 4 must survive");
+        assert_eq!(asked, 2, "and must not be asked about");
+    }
+
+    #[test]
+    fn quitting_keeps_what_was_accepted_before_it_and_asks_no_more() {
+        let weak = vec![proposal("1"), proposal("2"), proposal("3")];
+        let mut asked = 0;
+        let kept = collect_reviews(weak, |i, _, _| {
+            asked += 1;
+            Ok(if i == 0 { Review::Yes } else { Review::Quit })
+        })
+        .unwrap();
+        assert_eq!(ids(&kept), ["1"]);
+        assert_eq!(asked, 2);
+    }
+
+    #[test]
+    fn a_review_of_nothing_asks_nothing() {
+        let kept = collect_reviews(Vec::new(), |_, _, _| unreachable!()).unwrap();
+        assert!(kept.is_empty());
+    }
+
+    /// An offer as a backend would return it, for scoring against a query.
+    fn offer(artist: &str, title: &str, duration: Option<i64>) -> acquire::Offer {
+        let mut o = acquire::Offer::new(
+            acquire::ItemRef::new(acquire::BackendId::SoundCloud, "track/1"),
+            acquire::ItemKind::Track,
+            artist,
+            title,
+            "https://example.com/t",
+        );
+        o.duration_secs = duration;
+        o
+    }
+
+    #[test]
+    fn a_title_match_alone_lands_in_review_not_in_the_bulk_apply() {
+        // The real case: the rekordbox sampler WAV called "NOISE" matched a
+        // SoundCloud track also called "NOISE". Title agrees perfectly and
+        // nothing else does, which is exactly what must not apply unattended.
+        let query = acquire::SearchQuery {
+            title: "NOISE".into(),
+            artist: None,
+            duration_secs: None,
+            limit: 10,
+            ..Default::default()
+        };
+        let score = acquire::shop::similarity(&offer("ivri", "NOISE", Some(180)), &query);
+        assert!(
+            score < STRONG_MATCH,
+            "a bare title match scored {score}, which would auto-apply"
+        );
+        assert!(score > 0, "but it is still worth offering for review");
+    }
+
+    #[test]
+    fn a_title_and_artist_match_is_strong_enough_to_apply_unattended() {
+        let query = acquire::SearchQuery {
+            title: "Archangel".into(),
+            artist: Some("Burial".into()),
+            duration_secs: Some(238),
+            limit: 10,
+            ..Default::default()
+        };
+        let score = acquire::shop::similarity(&offer("Burial", "Archangel", Some(238)), &query);
+        assert!(
+            score >= STRONG_MATCH,
+            "an exact artist+title+duration match scored only {score}"
+        );
+    }
 }
