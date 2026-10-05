@@ -404,6 +404,25 @@ enum Cmd {
         undo: Option<String>,
     },
 
+    /// Swap playlist entries from a streaming row to the downloaded copy of it.
+    ///
+    /// A download leaves the stream row in every playlist it was in, and a USB
+    /// stick cannot play a stream. A stream and a file with the same title and
+    /// artist and lengths within two seconds count as the same track; each of
+    /// the stream's playlist entries is changed to name the file, in place, so
+    /// its position is kept. Default = dry-run.
+    Relink {
+        /// Actually write to master.db. Without this, prints the pairs.
+        #[arg(long)]
+        apply: bool,
+        /// Skip the confirmation prompt.
+        #[arg(short = 'y', long)]
+        yes: bool,
+        /// Point the entries of the most recent relink back at their streams.
+        #[arg(long)]
+        undo: bool,
+    },
+
     /// Compare two audio files by fingerprint and print the raw numbers.
     ///
     /// This is the calibration tool. The accept thresholds shipped in config are
@@ -562,6 +581,13 @@ fn main() -> Result<()> {
                 }
             }
         }
+        Cmd::Relink { apply, yes, undo } => run_relink(
+            db.as_mut().expect("relink needs the db"),
+            safety,
+            apply,
+            yes,
+            undo,
+        )?,
         Cmd::Fp { a, b, secs } => {
             let cfg = Config::load(&config_path)?;
             run_fp(&a, &b, secs.unwrap_or(cfg.fingerprint.window_secs), &cfg)?
@@ -1729,6 +1755,98 @@ fn undo_compat(
     Ok(())
 }
 
+fn run_relink(
+    db: &mut MasterDb,
+    safety: SafetyOpts,
+    apply: bool,
+    yes: bool,
+    undo: bool,
+) -> Result<()> {
+    use owo_colors::OwoColorize;
+    use rekord_ripper::relink;
+
+    if undo {
+        let (note_path, note) = relink::latest_note(&paths::backup_dir()?)?;
+        println!(
+            "would point {} playlist entries back at their streams ({}).",
+            note.swaps.len(),
+            note.relinked_at
+        );
+        println!("  {}", format!("note: {}", note_path.display()).dimmed());
+        if !apply {
+            eprintln!("Dry-run; pass --apply to write.");
+            return Ok(());
+        }
+        if !yes && !confirm_stdin("undo the most recent relink?")? {
+            println!("cancelled.");
+            return Ok(());
+        }
+        db::safety_preflight(safety)?;
+        let backup = db.backup()?;
+        eprintln!("backed up to: {}", backup.display());
+        let n = relink::undo(db, &note)?;
+        eprintln!(
+            "{} {n} entries point at their streams again.",
+            "ok:".green()
+        );
+        return Ok(());
+    }
+
+    let plan = relink::plan(db)?;
+    for p in &plan.pairs {
+        println!("  {}", p.label);
+        println!(
+            "    {} → {}  {}",
+            p.stream_id,
+            p.file_id,
+            base(&p.file_path).dimmed()
+        );
+        if !p.entries.is_empty() {
+            let names: Vec<&str> = p.entries.iter().map(|e| e.playlist.as_str()).collect();
+            println!("    swaps in: {}", names.join(", "));
+        }
+        if !p.already.is_empty() {
+            println!(
+                "    {} {}",
+                "left alone, already holds the file:".yellow(),
+                p.already.join(", ")
+            );
+        }
+    }
+    for (label, n) in &plan.ambiguous {
+        eprintln!("skipped {label}: {n} files match it, so which one is meant is unclear.");
+    }
+    let total: usize = plan.pairs.iter().map(|p| p.entries.len()).sum();
+    let left: usize = plan.pairs.iter().map(|p| p.already.len()).sum();
+    eprintln!(
+        "{} stream(s) with a downloaded copy: {total} playlist entries to swap, {left} \
+         left for you to remove.",
+        plan.pairs.len()
+    );
+    if total == 0 {
+        eprintln!("{} nothing to swap.", "ok:".green());
+        return Ok(());
+    }
+    if !apply {
+        eprintln!("Dry-run; pass --apply to write.");
+        return Ok(());
+    }
+    if !yes && !confirm_stdin(&format!("swap {total} playlist entries in master.db?"))? {
+        println!("cancelled.");
+        return Ok(());
+    }
+    db::safety_preflight(safety)?;
+    let backup = db.backup()?;
+    eprintln!("backed up to: {}", backup.display());
+    relink::apply(db, &plan, &backup)?;
+    eprintln!("{} swapped {total} playlist entries.", "ok:".green());
+    eprintln!(
+        "undo with {}. rekordbox must be restarted to re-read them.",
+        "rekord-ripper relink --undo --apply".bold()
+    );
+    Ok(())
+}
+
 fn confirm_stdin(question: &str) -> Result<bool> {
     use std::io::{BufRead, Write};
     if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
@@ -1821,6 +1939,7 @@ fn needs_database(cmd: &Cmd) -> bool {
         | Cmd::Pending { .. }
         | Cmd::Import { .. }
         | Cmd::Artwork { .. }
+        | Cmd::Relink { .. }
         | Cmd::Repair { .. } => true,
     }
 }

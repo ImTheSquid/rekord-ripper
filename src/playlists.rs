@@ -15,26 +15,7 @@ const MAX_DEPTH: usize = 32;
 /// folder as easily as by one playlist. Smart playlists keep their membership as
 /// a query rekordbox evaluates and store no rows here, so they never match.
 pub fn blobs_by_track(db: &MasterDb) -> Result<HashMap<String, String>> {
-    let mut stmt = db.conn.prepare(
-        "SELECT ID, Name, ParentID FROM djmdPlaylist
-         WHERE rb_local_deleted = 0 OR rb_local_deleted IS NULL",
-    )?;
-    let nodes: HashMap<String, (String, Option<String>)> = stmt
-        .query_map([], |r| {
-            Ok((
-                r.get::<_, String>("ID")?,
-                (
-                    r.get::<_, Option<String>>("Name")?.unwrap_or_default(),
-                    r.get::<_, Option<String>>("ParentID")?,
-                ),
-            ))
-        })?
-        .collect::<rusqlite::Result<_>>()?;
-
-    let paths: HashMap<&str, String> = nodes
-        .keys()
-        .map(|id| (id.as_str(), path_of(&nodes, id)))
-        .collect();
+    let paths = paths_by_id(db)?;
 
     let mut stmt = db.conn.prepare(
         "SELECT ContentID, PlaylistID FROM djmdSongPlaylist
@@ -62,6 +43,30 @@ pub fn blobs_by_track(db: &MasterDb) -> Result<HashMap<String, String>> {
         blob.push_str(path);
     }
     Ok(blobs)
+}
+
+/// Every live playlist's folder-qualified path, lowercased, by playlist ID.
+pub(crate) fn paths_by_id(db: &MasterDb) -> Result<HashMap<String, String>> {
+    let mut stmt = db.conn.prepare(
+        "SELECT ID, Name, ParentID FROM djmdPlaylist
+         WHERE rb_local_deleted = 0 OR rb_local_deleted IS NULL",
+    )?;
+    let nodes: HashMap<String, (String, Option<String>)> = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>("ID")?,
+                (
+                    r.get::<_, Option<String>>("Name")?.unwrap_or_default(),
+                    r.get::<_, Option<String>>("ParentID")?,
+                ),
+            ))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+
+    Ok(nodes
+        .keys()
+        .map(|id| (id.clone(), path_of(&nodes, id)))
+        .collect())
 }
 
 /// `"folder/sub/name"`, lowercased. Depth-capped, so a `ParentID` cycle in a

@@ -16,6 +16,7 @@ pub mod playlists;
 pub(crate) mod presence;
 pub(crate) mod proc;
 pub mod query;
+pub mod relink;
 pub mod select;
 pub mod transfer;
 pub mod tui;
