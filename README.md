@@ -522,10 +522,11 @@ the file's size — so `FileSize` on the row is corrected in the same transactio
 and tracks with a queued analysis transfer are skipped, since rewriting the file
 would expire the pairing.
 
-**A rewritten file needs a fresh USB stick.** Rekordbox exports a changed file
-as a second copy (`name-1.m4a`) and keeps the first, so the player lists the
-track twice and the old copy still loads. After a `--from-sources` run, reformat
-the stick (or remove its rekordbox library) and export again. One real stick
+**A rewritten file has to come off the USB stick first.** Rekordbox exports a
+changed file as a second copy (`name-1.m4a`) and keeps the first, so the player
+lists the track twice and the old copy still loads. A `--from-sources` run lists
+the tracks whose files it rewrote. In rekordbox, delete every copy of those from
+the stick, then export again. Reformatting the stick works too. One real stick
 held 156 such copies from a single backfill.
 
 ## Compatibility levels
@@ -611,10 +612,11 @@ Two limits:
   `--allow-lossy` result in rekordbox and on a player before converting a crate
   that way.
 
-Restart rekordbox after a run. Then reformat any USB stick that already held
-the converted tracks (or remove its rekordbox library) and export again. An
-export on top keeps the old, unplayable copy beside the new one, the same way
-as after an artwork backfill.
+Restart rekordbox after a run. The run lists the tracks it converted. On any
+USB stick that already holds them, delete every copy of those tracks in
+rekordbox (or reformat the stick), then export again. An export on top keeps
+the old, unplayable copy beside the new one, the same way as after an artwork
+backfill.
 
 ### Cloud Library Sync rows
 

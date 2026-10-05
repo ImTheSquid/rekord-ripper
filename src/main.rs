@@ -1098,40 +1098,56 @@ fn run_artwork(
     eprintln!("backed up to: {}", backup.display());
 
     let mut n = import::apply_artwork_fixes(db, &scan.local)?;
-    let mut rewritten = 0;
+    let mut rewritten = Vec::new();
     if !accepted.is_empty() {
         // Downloaded first, so a network failure costs no database write.
         let staged = download_covers(&accepted, cfg)?;
-        rewritten = import::apply_source_covers(db, &staged)?;
-        n += rewritten;
+        let (rows, ids) = import::apply_source_covers(db, &staged)?;
+        n += rows;
+        rewritten = accepted
+            .iter()
+            .filter(|p| ids.contains(&p.gap.content_id))
+            .map(|p| {
+                format!(
+                    "{} — {}",
+                    p.gap.artist.as_deref().unwrap_or("?"),
+                    p.gap.title
+                )
+            })
+            .collect();
     }
     eprintln!("{} gave {n} row(s) their cover.", "ok:".green());
     eprintln!("rekordbox must be restarted to re-read them.");
-    if rewritten > 0 {
-        warn_stale_exports(rewritten);
-    }
+    warn_stale_exports(&rewritten);
     Ok(())
 }
 
 /// Rekordbox exports a changed file to a stick as a second copy and keeps the
 /// first, so the player lists the track twice and the old copy still loads.
-fn warn_stale_exports(files: usize) {
+fn warn_stale_exports(tracks: &[String]) {
     use owo_colors::OwoColorize;
+    if tracks.is_empty() {
+        return;
+    }
     eprintln!(
-        "{} {files} file(s) changed. A USB stick exported before this still holds the \
+        "{} {} file(s) changed. A USB stick exported before this still holds the \
          old copies, and the next export adds the new ones beside them, so players \
-         list those tracks twice. Reformat the stick (or remove its rekordbox \
-         library) and export again.",
-        "warning:".yellow().bold()
+         list those tracks twice. In rekordbox, delete every copy of these from the \
+         stick, then export again (or reformat the stick):",
+        "warning:".yellow().bold(),
+        tracks.len()
     );
+    for t in tracks {
+        eprintln!("  {t}");
+    }
 }
 
 /// The dry-run form of [`warn_stale_exports`].
 fn note_stale_exports() {
     eprintln!(
-        "note: this changes files a USB stick may already hold. Afterwards, reformat \
-         the stick (or remove its rekordbox library) and export again, or players \
-         will list those tracks twice."
+        "note: this changes files a USB stick may already hold. Afterwards, delete \
+         the listed tracks from the stick in rekordbox (or reformat it) and export \
+         again, or players will list those tracks twice."
     );
 }
 
@@ -1682,6 +1698,7 @@ fn run_compat(db: &mut MasterDb, cfg: &Config, safety: SafetyOpts, args: CompatA
 
     let total = plans.len();
     let (mut ok, mut failed) = (0usize, 0usize);
+    let mut converted_labels = Vec::new();
     let outcome = compat::convert_all(&plans, jobs, |plan, result| {
         let converted = match result {
             Ok(c) => c,
@@ -1699,6 +1716,7 @@ fn run_compat(db: &mut MasterDb, cfg: &Config, safety: SafetyOpts, args: CompatA
         match compat::repoint(db, plan, &converted, &level.name, &backup) {
             Ok(_) => {
                 ok += 1;
+                converted_labels.push(plan.label.clone());
                 eprintln!(
                     "{} [{}/{total}] {} → {}  {}  {}",
                     "ok:".green(),
@@ -1729,7 +1747,7 @@ fn run_compat(db: &mut MasterDb, cfg: &Config, safety: SafetyOpts, args: CompatA
             "rekord-ripper compat --undo <ID> --apply".bold()
         );
         eprintln!("rekordbox must be restarted to re-read them.");
-        warn_stale_exports(ok);
+        warn_stale_exports(&converted_labels);
     }
     outcome?;
     if failed > 0 {

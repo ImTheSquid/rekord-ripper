@@ -1119,7 +1119,12 @@ pub struct SourceCover {
 ///
 /// A cover that will not install or embed is warned about and skipped; the rest
 /// of the batch still lands.
-pub fn apply_source_covers(db: &mut MasterDb, covers: &[SourceCover]) -> Result<usize> {
+///
+/// Returns the rows updated, and the content ids whose audio file was rewritten.
+pub fn apply_source_covers(
+    db: &mut MasterDb,
+    covers: &[SourceCover],
+) -> Result<(usize, Vec<String>)> {
     let share = db.app_dir.join("share");
     // (content_id, ImagePath, new FileSize when the file was rewritten)
     let mut done: Vec<(&str, String, Option<i64>)> = Vec::new();
@@ -1151,7 +1156,7 @@ pub fn apply_source_covers(db: &mut MasterDb, covers: &[SourceCover]) -> Result<
         done.push((&c.content_id, rel, size));
     }
     if done.is_empty() {
-        return Ok(0);
+        return Ok((0, Vec::new()));
     }
 
     let base_usn = db.read_local_usn()?;
@@ -1174,7 +1179,12 @@ pub fn apply_source_covers(db: &mut MasterDb, covers: &[SourceCover]) -> Result<
     }
     db.write_local_usn(base_usn + done.len() as i64)?;
     tx.commit()?;
-    Ok(done.len())
+    let rewritten = done
+        .iter()
+        .filter(|(_, _, size)| size.is_some())
+        .map(|(id, _, _)| id.to_string())
+        .collect();
+    Ok((done.len(), rewritten))
 }
 
 #[cfg(test)]
