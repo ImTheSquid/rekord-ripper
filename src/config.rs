@@ -128,12 +128,6 @@ pub struct Import {
     /// on, the write is still gated by the running-rekordbox refuse and still
     /// takes a backup first.
     pub insert_content_rows: bool,
-    /// Allow row insertion even when Cloud Library Sync is active.
-    ///
-    /// Separate from the above because it is a different risk. A row with
-    /// `rb_local_synced = 0` is what the cloud agent pushes, so a bad insert
-    /// escapes the local backup and reaches your other devices.
-    pub allow_insert_when_cloud_sync: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -565,9 +559,8 @@ mod tests {
         assert_eq!(cfg.soulseek.search_window_secs, 8);
         assert_eq!(cfg.search.enrich_top_n, 5);
         assert_eq!(cfg.fingerprint.window_secs, 120);
-        // The two dangerous knobs must both be off without being asked for.
+        // The dangerous knob must be off without being asked for.
         assert!(!cfg.import.insert_content_rows);
-        assert!(!cfg.import.allow_insert_when_cloud_sync);
     }
 
     #[test]
