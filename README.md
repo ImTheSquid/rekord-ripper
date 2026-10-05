@@ -577,8 +577,9 @@ What a track becomes:
 - **Lossy** (MP3, AAC) that the level cannot play is skipped unless you pass
   `--allow-lossy`. With it, the track is re-encoded as 320k CBR MP3. That is a
   second lossy generation, so `shop` for a lossless copy where you can.
-- Streams, Cloud Library Sync rows, missing files, and files with a queued
-  analysis transfer are left alone.
+- Streams, missing files, and files with a queued analysis transfer are left
+  alone. Cloud Library Sync rows are too, unless you pass `--include-cloud`
+  (below).
 
 The converted file is written beside the original as `<name>.aiff`. If that
 name is taken, it becomes `<name> [<level>].aiff`. Before the row moves, every
@@ -606,3 +607,49 @@ Two limits:
 
 Restart rekordbox after a run, and re-export USB sticks to pick up the new
 files.
+
+### Cloud Library Sync rows
+
+A cloud row's `FolderPath` (`/contents_…/artist/album/file`) is relative to the
+sync folder. Rekordbox records only the Dropbox folder, as `DropboxSharingPath`
+in `rekordbox3.settings`, and the files sit in its `rekordbox` subfolder.
+`--include-cloud` resolves rows through it:
+
+```bash
+rekord-ripper compat --level nxs2 --include-cloud                 # dry-run
+rekord-ripper compat --level nxs2 --include-cloud --match '…' --limit 1 --apply
+```
+
+The converted file is written beside the original inside the sync folder, so
+Dropbox uploads it. The row is repointed the same way as a local one, and the
+edit syncs to every device on the library. Each row's `rb_file_id`, which sync
+keeps for the file it uploaded, is cleared because it names the old file. 347
+cloud rows in a real library already go without one. Undo puts it back.
+
+Nothing documents how rekordbox's sync treats a row whose file changes under
+it. Convert one track first and check it on this machine, on a second synced
+device, and on a player before running a whole crate. Files Dropbox holds only
+as online placeholders are skipped, since reading one would download it.
+`repair` resolves cloud rows the same way. It only edits `FileType`, so it
+writes nothing into Dropbox.
+
+## Playlists that still hold the stream
+
+Downloading a track and transferring its analysis leaves the streaming row in
+every playlist it was in. A USB stick cannot play a stream, so the export
+carries a copy that fails on the player. `relink` swaps those playlist entries
+to the downloaded copy:
+
+```bash
+rekord-ripper relink                  # dry-run: every pair, and where it swaps
+rekord-ripper relink --apply
+rekord-ripper relink --undo --apply   # reverses the most recent relink
+```
+
+A stream and a file count as the same track only when the title and artist are
+identical (brackets included, so a remix never matches its original) and their
+lengths are within two seconds. The file must be on this machine or synced
+through the cloud. A stream with two such files is skipped and reported. Each
+entry is edited in place, so its position in the playlist is kept. A playlist
+that already holds the file keeps its stream entry for you to remove, because
+swapping it would list the track twice.
