@@ -521,3 +521,88 @@ The cover is embedded in the file as well as given to rekordbox, which changes
 the file's size — so `FileSize` on the row is corrected in the same transaction,
 and tracks with a queued analysis transfer are skipped, since rewriting the file
 would expire the pairing.
+
+## Compatibility levels
+
+Rekordbox plays files the players you export to cannot: no FLAC or ALAC on a
+CDJ-2000NXS, nothing above 48 kHz on most of them, no 32-bit or float PCM on
+any. `compat` converts what a level cannot play and points the existing track
+row at the new file. The track ID stays the same, so cues, beat grid,
+playlists and play history carry over, and the next USB export copies the
+playable file.
+
+```bash
+rekord-ripper compat --levels                         # what each level allows
+rekord-ripper compat --level legacy                   # dry-run over every local track
+rekord-ripper compat --level legacy --match 'p:"jn next"' --apply
+rekord-ripper compat --level legacy --allow-lossy --apply
+rekord-ripper compat --undo 12345678 --apply          # back to the original file
+```
+
+| level | plays | players |
+| --- | --- | --- |
+| `legacy` | MP3, AAC, WAV, AIFF · 44.1/48 kHz · 16/24-bit | CDJ-2000, CDJ-2000NXS, CDJ-900, CDJ-900NXS, CDJ-850, CDJ-350, XDJ-1000, XDJ-700, XDJ-RX, XDJ-RX2 |
+| `flac48` | adds FLAC · 44.1/48 kHz · 16/24-bit | XDJ-1000MK2, XDJ-RX3, XDJ-XZ |
+| `nxs2` | adds FLAC, ALAC · 44.1–96 kHz · 16/24-bit | CDJ-2000NXS2, CDJ-3000, OPUS-QUAD |
+
+Each row comes from the playable-formats table in the players' operating
+instructions, e.g. the
+[CDJ-2000NXS](https://downloads.support.alphatheta.com/manuals/dj-players/CDJ-2000NXS/CDJ-2000NXS_DRI1052_manual.pdf),
+[XDJ-1000MK2](https://downloads.support.alphatheta.com/manuals/XDJ_1000MK2_DRI1396B_manual.pdf),
+[XDJ-XZ](https://downloads.support.alphatheta.com/manuals/XDJ_XZ_DRI1625B_manual.pdf)
+and [CDJ-3000](https://downloads.support.alphatheta.com/manuals/dj-players/CDJ-3000/CDJ-3000_DRI1586A_manual.pdf)
+manuals. Every one lists MP3 and AAC at 44.1/48 kHz only, so lossy audio above
+48 kHz does not count as playable at any level. The XDJ-1000MK2 also plays ALAC;
+the XDJ-RX3 and XDJ-XZ do not, so `flac48` leaves it out. The XDJ-XZ gained FLAC
+in firmware 1.10.
+
+Your own levels go in `config.toml`. A level with a built-in's name replaces it:
+
+```toml
+[compat]
+default_level = "legacy"
+
+[compat.levels.my-booth]
+codecs = ["mp3", "aac", "aiff", "wav"]
+sample_rates = [44100, 48000]
+bit_depths = [16, 24]
+```
+
+What a track becomes:
+
+- **Lossless** (FLAC, ALAC, WAV, AIFF) becomes **AIFF**, which carries tags
+  and cover art where WAV cannot. Rate and depth are kept where the level
+  allows them. Otherwise they come down within the same family (88.2 → 44.1,
+  96 → 48 kHz; 32-bit or float → 24), with dither only when reducing to 16-bit.
+- **Lossy** (MP3, AAC) that the level cannot play is skipped unless you pass
+  `--allow-lossy`. With it, the track is re-encoded as 320k CBR MP3. That is a
+  second lossy generation, so `shop` for a lossless copy where you can.
+- Streams, Cloud Library Sync rows, missing files, and files with a queued
+  analysis transfer are left alone.
+
+The converted file is written beside the original as `<name>.aiff`. If that
+name is taken, it becomes `<name> [<level>].aiff`. Before the row moves, every
+conversion is decoded and cross-correlated against its source. It must come
+out in the planned format, the same length to within 50 ms, and shifted by no
+more than 1 ms. The fingerprint gate could not be used for this: its 62 ms
+floor is wider than an MP3 encoder delay. Each row is committed as its file
+lands, so an interrupted run leaves every finished track consistent. The run
+stops if rekordbox is opened while it is going.
+
+Originals are never touched, so undo is cheap. Each conversion writes a note
+beside the backup, and `--undo` points the row back at the original. It refuses
+if the row has changed since or the original is gone. The converted file stays
+where it is for you to delete.
+
+Two limits:
+
+- The row's ANLZ files still name the original path inside them, as after a
+  `cp`. The grid and waveform remain correct because the audio timeline is
+  unchanged.
+- An MP3 made from a lossless track has cues that carry no MPEG frame offsets,
+  and the alignment check sees the file the way ffmpeg decodes it. Load one
+  `--allow-lossy` result in rekordbox and on a player before converting a crate
+  that way.
+
+Restart rekordbox after a run, and re-export USB sticks to pick up the new
+files.
