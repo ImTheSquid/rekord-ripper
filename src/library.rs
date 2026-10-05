@@ -38,7 +38,7 @@ pub struct TrackRow {
     pub tags: String,
 }
 
-const AUDIO_FILE_TYPES: &[i64] = &[0, 1, 4, 5, 11];
+const AUDIO_FILE_TYPES: &[i64] = &[0, 1, 4, 5, 6, 11, 12];
 
 /// The `djmdContent` columns a row is built from.
 ///

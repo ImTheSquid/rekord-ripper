@@ -1565,18 +1565,20 @@ fn run_compat(db: &mut MasterDb, cfg: &Config, safety: SafetyOpts, args: CompatA
         eprintln!("{} streaming row(s) have no file to convert.", scan.streams);
     }
 
-    let bytes: u64 = plans.iter().map(|p| p.estimated_bytes()).sum();
     eprintln!(
-        "{} local track(s) already play on {}; {} to convert, adding about {} beside the originals.",
-        scan.fits,
-        level.name,
-        plans.len(),
-        human_bytes(bytes)
+        "{} local track(s) already play on {}.",
+        scan.fits, level.name
     );
     if plans.is_empty() {
         eprintln!("{} nothing to convert.", "ok:".green());
         return Ok(());
     }
+    let bytes: u64 = plans.iter().map(|p| p.estimated_bytes()).sum();
+    eprintln!(
+        "{} to convert, adding about {} beside the originals.",
+        plans.len(),
+        human_bytes(bytes)
+    );
     if let Some(n) = args.limit
         && plans.len() > n
     {
