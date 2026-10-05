@@ -25,6 +25,26 @@ pub(crate) fn check(origin: Origin, folder_path: Option<&str>) -> Option<bool> {
     }
 }
 
+/// True for a cloud-provider placeholder whose bytes are not on this machine.
+/// Reading one makes Dropbox download it, so scans leave it alone.
+pub(crate) fn online_only(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::macos::fs::MetadataExt;
+        const SF_DATALESS: u32 = 0x4000_0000;
+        meta.st_flags() & SF_DATALESS != 0
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
+        meta.file_attributes() & FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS != 0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

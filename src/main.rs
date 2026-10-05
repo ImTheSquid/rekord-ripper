@@ -384,6 +384,11 @@ enum Cmd {
         /// lossy generation, so off unless asked for.
         #[arg(long)]
         allow_lossy: bool,
+        /// Convert Cloud Library Sync rows too. The converted file is written
+        /// into the sync folder beside the original, so Dropbox uploads it and
+        /// every synced device gets the repointed row.
+        #[arg(long)]
+        include_cloud: bool,
         /// Files probed and converted at once. Defaults to half the cores.
         #[arg(long, value_name = "N")]
         jobs: Option<usize>,
@@ -395,7 +400,7 @@ enum Cmd {
         #[arg(short = 'y', long)]
         yes: bool,
         /// Point a converted track back at its original file.
-        #[arg(long, value_name = "ID", conflicts_with_all = ["level", "match", "allow_lossy", "limit"])]
+        #[arg(long, value_name = "ID", conflicts_with_all = ["level", "match", "allow_lossy", "include_cloud", "limit"])]
         undo: Option<String>,
     },
 
@@ -526,6 +531,7 @@ fn main() -> Result<()> {
             r#match,
             limit,
             allow_lossy,
+            include_cloud,
             jobs,
             apply,
             yes,
@@ -547,6 +553,7 @@ fn main() -> Result<()> {
                             match_query: r#match,
                             limit,
                             allow_lossy,
+                            include_cloud,
                             jobs,
                             apply,
                             yes,
@@ -1464,6 +1471,7 @@ struct CompatArgs {
     match_query: Option<String>,
     limit: Option<usize>,
     allow_lossy: bool,
+    include_cloud: bool,
     jobs: Option<usize>,
     apply: bool,
     yes: bool,
@@ -1506,32 +1514,43 @@ fn run_compat(db: &mut MasterDb, cfg: &Config, safety: SafetyOpts, args: CompatA
     let queued = queued_paths().unwrap_or_default();
     let jobs = args.jobs.unwrap_or_else(compat::default_jobs).max(1);
 
-    eprintln!(
-        "checking local tracks against {} ({level}) …",
-        level.name.bold()
-    );
-    let scan = compat::scan(
-        db,
-        only.as_ref(),
-        &level,
-        args.allow_lossy,
-        &queued,
+    let cloud_root = args.include_cloud.then(paths::cloud_sync_root).flatten();
+    if let Some(root) = &cloud_root {
+        eprintln!(
+            "cloud rows convert inside {}; Dropbox uploads each new file, and every \
+             synced device gets the repointed row.",
+            root.display()
+        );
+    }
+
+    eprintln!("checking tracks against {} ({level}) …", level.name.bold());
+    let opts = compat::ScanOpts {
+        only: only.as_ref(),
+        allow_lossy: args.allow_lossy,
+        include_cloud: args.include_cloud,
+        cloud_root: cloud_root.as_deref(),
+        queued: &queued,
         jobs,
-        |done, total| {
+    };
+    // A redirected log would get one `\r` line per file.
+    let live = std::io::IsTerminal::is_terminal(&std::io::stderr());
+    let scan = compat::scan(db, &level, &opts, |done, total| {
+        if live {
             eprint!("\r  probed {done}/{total}");
             if done == total {
                 eprintln!();
             }
-        },
-    )?;
+        }
+    })?;
 
     let mut plans = scan.planned;
     for p in &plans {
         println!(
-            "  {:<14} → {:<18} {}",
+            "  {:<14} → {:<18} {}{}",
             p.source.to_string(),
             p.target.to_string(),
-            p.label
+            p.label,
+            if p.cloud { "  (cloud)" } else { "" }
         );
         println!(
             "  {:<14}   {}",
@@ -1565,10 +1584,7 @@ fn run_compat(db: &mut MasterDb, cfg: &Config, safety: SafetyOpts, args: CompatA
         eprintln!("{} streaming row(s) have no file to convert.", scan.streams);
     }
 
-    eprintln!(
-        "{} local track(s) already play on {}.",
-        scan.fits, level.name
-    );
+    eprintln!("{} track(s) already play on {}.", scan.fits, level.name);
     if plans.is_empty() {
         eprintln!("{} nothing to convert.", "ok:".green());
         return Ok(());
@@ -1689,8 +1705,8 @@ fn undo_compat(
         "track {id} was converted for {} at {}",
         note.level, note.converted_at
     );
-    println!("  now     {}", note.new.folder_path);
-    println!("  back to {}", note.old.folder_path);
+    println!("  now     {}", note.converted_path);
+    println!("  back to {}", note.original_path);
     println!("  {}", format!("note: {}", note_path.display()).dimmed());
     if !apply {
         eprintln!("Dry-run; pass --apply to write.");
@@ -1708,7 +1724,7 @@ fn undo_compat(
     eprintln!("{} track {id} points at its original again.", "ok:".green());
     eprintln!(
         "the converted file is still at {}; delete it if you no longer want it.",
-        note.new.folder_path
+        note.converted_path
     );
     Ok(())
 }

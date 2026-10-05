@@ -405,7 +405,12 @@ pub enum SkipReason {
     /// The level has nothing this source can become.
     NoTarget,
     Unreadable,
+    /// A Cloud Library Sync row, and `--include-cloud` was not given.
     Cloud,
+    /// A cloud row, but rekordbox's settings name no sync folder.
+    NoSyncFolder,
+    /// A cloud file Dropbox holds only as a placeholder.
+    OnlineOnly,
     Missing,
     /// A pending analysis transfer is waiting on this file.
     Queued,
@@ -421,7 +426,13 @@ impl SkipReason {
             }
             Self::NoTarget => "the level has no format this could be converted into",
             Self::Unreadable => "unreadable",
-            Self::Cloud => "Cloud Library Sync owns the file, so its path cannot be repointed",
+            Self::Cloud => "Cloud Library Sync rows; pass --include-cloud to convert them too",
+            Self::NoSyncFolder => {
+                "Cloud Library Sync rows, but rekordbox's settings name no sync folder"
+            }
+            Self::OnlineOnly => {
+                "only a Dropbox placeholder is on this machine; make it available offline first"
+            }
             Self::Missing => "the file is not on this machine",
             Self::Queued => "a queued analysis transfer is waiting on this file",
             Self::TargetTaken => "both filenames for the converted copy are taken",
@@ -517,12 +528,18 @@ pub struct Planned {
     pub label: String,
     /// `FolderPath` exactly as stored, so the repoint can check it has not moved.
     pub folder_path: String,
+    /// Where the source is on this machine. The same as `folder_path` unless the
+    /// row is a cloud row.
     pub source_path: PathBuf,
     pub source: SourceFormat,
     pub source_duration: f64,
     pub channels: u32,
     pub target: Target,
     pub target_path: PathBuf,
+    /// The `FolderPath` the row gets once it points at `target_path`.
+    pub target_folder_path: String,
+    /// A Cloud Library Sync row, whose converted file lands in the sync folder.
+    pub cloud: bool,
 }
 
 impl Planned {
@@ -555,23 +572,33 @@ struct Row {
     id: String,
     label: String,
     folder_path: String,
+    on_disk: PathBuf,
+    cloud: bool,
+}
+
+pub struct ScanOpts<'a> {
+    /// Restrict to these track IDs.
+    pub only: Option<&'a HashSet<String>>,
+    pub allow_lossy: bool,
+    /// Convert Cloud Library Sync rows too, inside the sync folder.
+    pub include_cloud: bool,
+    /// [`crate::paths::cloud_sync_root`], when `include_cloud` is set.
+    pub cloud_root: Option<&'a Path>,
+    /// Files with a pending analysis transfer; converting one would leave that
+    /// transfer pointing at a row that has moved on.
+    pub queued: &'a HashSet<String>,
+    pub jobs: usize,
 }
 
 /// Probe every local track (or those in `only`) and decide what each needs.
-///
-/// `queued` holds files with a pending analysis transfer; converting one would
-/// leave that transfer pointing at a row that has moved on.
 pub fn scan(
     db: &MasterDb,
-    only: Option<&HashSet<String>>,
     level: &Level,
-    allow_lossy: bool,
-    queued: &HashSet<String>,
-    jobs: usize,
+    opts: &ScanOpts,
     mut progress: impl FnMut(usize, usize),
 ) -> Result<Scan> {
     let mut stmt = db.conn.prepare(
-        "SELECT c.ID, c.Title, a.Name, c.FolderPath, c.FileType, c.ServiceID
+        "SELECT c.ID, c.Title, a.Name, c.FolderPath, c.FileType, c.ServiceID, c.OrgFolderPath
          FROM djmdContent c
          LEFT JOIN djmdArtist a ON a.ID = c.ArtistID
          WHERE c.rb_local_deleted = 0 OR c.rb_local_deleted IS NULL
@@ -584,6 +611,7 @@ pub fn scan(
         Option<String>,
         Option<i64>,
         Option<i64>,
+        Option<String>,
     );
     let raw: Vec<Raw> = stmt
         .query_map([], |r| {
@@ -594,10 +622,12 @@ pub fn scan(
                 r.get(3)?,
                 r.get(4)?,
                 r.get(5)?,
+                r.get(6)?,
             ))
         })?
         .collect::<rusqlite::Result<_>>()?;
 
+    let cloud_root = opts.cloud_root.filter(|_| opts.include_cloud);
     let mut out = Scan {
         planned: Vec::new(),
         skipped: Vec::new(),
@@ -605,8 +635,8 @@ pub fn scan(
         streams: 0,
     };
     let mut to_probe: Vec<Row> = Vec::new();
-    for (id, title, artist, path, file_type, service_id) in raw {
-        if only.is_some_and(|o| !o.contains(&id)) {
+    for (id, title, artist, path, file_type, service_id, org_path) in raw {
+        if opts.only.is_some_and(|o| !o.contains(&id)) {
             continue;
         }
         let label = format!(
@@ -619,37 +649,56 @@ pub fn scan(
             reason,
             detail: None,
         };
-        match format::origin(file_type, path.as_deref(), service_id) {
-            Origin::Stream => out.streams += 1,
-            Origin::Cloud => out.skipped.push(skip(SkipReason::Cloud)),
-            Origin::Local => {
-                let folder_path = path.expect("a local row has a path");
-                if !Path::new(&folder_path).exists() {
-                    out.skipped.push(skip(SkipReason::Missing));
-                } else if queued.contains(&folder_path) {
-                    out.skipped.push(skip(SkipReason::Queued));
-                } else {
-                    to_probe.push(Row {
-                        id,
-                        label,
-                        folder_path,
-                    });
-                }
+        let origin = format::origin(file_type, path.as_deref(), service_id);
+        let Some(folder_path) = path.filter(|_| origin != Origin::Stream) else {
+            out.streams += 1;
+            continue;
+        };
+        let cloud = origin == Origin::Cloud;
+        let on_disk = match (cloud, cloud_root) {
+            (false, _) => PathBuf::from(&folder_path),
+            (true, Some(root)) => root.join(folder_path.trim_start_matches('/')),
+            (true, None) if opts.include_cloud => {
+                out.skipped.push(skip(SkipReason::NoSyncFolder));
+                continue;
             }
+            (true, None) => {
+                out.skipped.push(skip(SkipReason::Cloud));
+                continue;
+            }
+        };
+        // A cloud row's FolderPath was rewritten on upload; a pending entry
+        // still knows it by the path it was downloaded to.
+        let is_queued = opts.queued.contains(&folder_path)
+            || org_path.as_ref().is_some_and(|p| opts.queued.contains(p));
+        if !on_disk.exists() {
+            out.skipped.push(skip(SkipReason::Missing));
+        } else if crate::presence::online_only(&on_disk) {
+            out.skipped.push(skip(SkipReason::OnlineOnly));
+        } else if is_queued {
+            out.skipped.push(skip(SkipReason::Queued));
+        } else {
+            to_probe.push(Row {
+                id,
+                label,
+                folder_path,
+                on_disk,
+                cloud,
+            });
         }
     }
 
     let probed = par_map(
         &to_probe,
-        jobs,
-        |row| audio::probe(Path::new(&row.folder_path)),
+        opts.jobs,
+        |row| audio::probe(&row.on_disk),
         &mut progress,
     );
 
     // Two sources in one folder can want the same converted name.
     let mut claimed: HashSet<String> = HashSet::new();
     for (row, info) in to_probe.into_iter().zip(probed) {
-        let path = PathBuf::from(&row.folder_path);
+        let path = row.on_disk.clone();
         let unreadable = |e: anyhow::Error| Skipped {
             label: row.label.clone(),
             reason: SkipReason::Unreadable,
@@ -669,7 +718,7 @@ pub fn scan(
                 continue;
             }
         };
-        let target = match plan_track(&source, level, allow_lossy) {
+        let target = match plan_track(&source, level, opts.allow_lossy) {
             Decision::Keep => {
                 out.fits += 1;
                 continue;
@@ -684,8 +733,14 @@ pub fn scan(
             }
             Decision::Convert(t) => t,
         };
-        let Some(target_path) =
-            choose_target_path(db, &path, target.codec, &level.name, &mut claimed)?
+        let Some((target_path, target_folder_path)) = choose_target_path(
+            db,
+            &path,
+            &row.folder_path,
+            target.codec,
+            &level.name,
+            &mut claimed,
+        )?
         else {
             out.skipped.push(Skipped {
                 label: row.label,
@@ -707,6 +762,8 @@ pub fn scan(
                 .unwrap_or(2),
             target,
             target_path,
+            target_folder_path,
+            cloud: row.cloud,
         });
     }
     Ok(out)
@@ -715,31 +772,37 @@ pub fn scan(
 /// `<stem>.<ext>` beside the source, or `<stem> [<level>].<ext>` when that is the
 /// source itself or already taken. Never a file that exists or a path a row
 /// already references.
+///
+/// Returns the path on disk and the `FolderPath` that names it, which differ for
+/// a cloud row: `folder_path` is then relative to the sync folder.
 fn choose_target_path(
     db: &MasterDb,
     source: &Path,
+    folder_path: &str,
     codec: Codec,
     level: &str,
     claimed: &mut HashSet<String>,
-) -> Result<Option<PathBuf>> {
+) -> Result<Option<(PathBuf, String)>> {
     let dir = source.parent().unwrap_or(Path::new("."));
     let stem = source
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .ok_or_else(|| anyhow!("{} has no filename", source.display()))?;
+    let row_dir = folder_path.rsplit_once('/').map_or("", |(d, _)| d);
     let ext = codec.extension();
     for name in [format!("{stem}.{ext}"), format!("{stem} [{level}].{ext}")] {
-        let p = dir.join(name);
+        let p = dir.join(&name);
+        let row_path = format!("{row_dir}/{name}");
         // Lowercased: the default macOS filesystem ignores case.
         let key = p.to_string_lossy().to_lowercase();
         if p.exists()
             || claimed.contains(&key)
-            || crate::import::existing_row_for_path(db, &p)?.is_some()
+            || crate::import::existing_row_for_path(db, Path::new(&row_path))?.is_some()
         {
             continue;
         }
         claimed.insert(key);
-        return Ok(Some(p));
+        return Ok(Some((p, row_path)));
     }
     Ok(None)
 }
@@ -1142,23 +1205,35 @@ pub struct FileColumns {
     pub sample_rate: Option<i64>,
     pub bit_depth: Option<i64>,
     pub bit_rate: Option<i64>,
+    /// Sync's ID for the file the row points at. Cleared on a repoint, since it
+    /// names the old file; 347 cloud rows already go without one.
+    pub rb_file_id: Option<String>,
 }
 
 impl FileColumns {
-    /// The values `import` would write for `path`, with the bit depth `verify`
-    /// read off the codec, since ffprobe reports none for PCM.
-    fn for_file(path: &Path, info: &AudioInfo, format: &SourceFormat) -> Result<Self> {
+    /// The values `import` would write for `on_disk`, under the row path
+    /// `folder_path`, with the bit depth `verify` read off the codec, since
+    /// ffprobe reports none for PCM.
+    fn for_file(
+        folder_path: &str,
+        on_disk: &Path,
+        info: &AudioInfo,
+        format: &SourceFormat,
+    ) -> Result<Self> {
         Ok(Self {
-            folder_path: path.to_string_lossy().into_owned(),
-            file_name: path.file_name().map(|n| n.to_string_lossy().into_owned()),
+            folder_path: folder_path.to_string(),
+            file_name: on_disk
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned()),
             file_type: Some(
-                info.rekordbox_file_type(path)
-                    .ok_or_else(|| anyhow!("no rekordbox FileType for {}", path.display()))?,
+                info.rekordbox_file_type(on_disk)
+                    .ok_or_else(|| anyhow!("no rekordbox FileType for {}", on_disk.display()))?,
             ),
             file_size: Some(info.file_size as i64),
             sample_rate: info.sample_rate,
             bit_depth: format.bit_depth.map(i64::from),
             bit_rate: info.bit_rate.map(|b| b / 1000),
+            rb_file_id: None,
         })
     }
 }
@@ -1166,7 +1241,8 @@ impl FileColumns {
 fn read_columns(db: &MasterDb, content_id: &str) -> Result<FileColumns> {
     db.conn
         .query_row(
-            "SELECT FolderPath, FileNameL, FileType, FileSize, SampleRate, BitDepth, BitRate
+            "SELECT FolderPath, FileNameL, FileType, FileSize, SampleRate, BitDepth, BitRate,
+                    rb_file_id
              FROM djmdContent WHERE ID = ?1",
             params![content_id],
             |r| {
@@ -1178,6 +1254,7 @@ fn read_columns(db: &MasterDb, content_id: &str) -> Result<FileColumns> {
                     sample_rate: r.get(4)?,
                     bit_depth: r.get(5)?,
                     bit_rate: r.get(6)?,
+                    rb_file_id: r.get(7)?,
                 })
             },
         )
@@ -1197,8 +1274,8 @@ fn write_columns(
     let n = tx.execute(
         "UPDATE djmdContent
          SET FolderPath = ?3, FileNameL = ?4, FileType = ?5, FileSize = ?6,
-             SampleRate = ?7, BitDepth = ?8, BitRate = ?9,
-             rb_local_synced = 0, rb_local_usn = ?10, updated_at = ?11
+             SampleRate = ?7, BitDepth = ?8, BitRate = ?9, rb_file_id = ?10,
+             rb_local_synced = 0, rb_local_usn = ?11, updated_at = ?12
          WHERE ID = ?1 AND FolderPath = ?2",
         params![
             content_id,
@@ -1210,6 +1287,7 @@ fn write_columns(
             cols.sample_rate,
             cols.bit_depth,
             cols.bit_rate,
+            cols.rb_file_id,
             usn,
             now_db_string(),
         ],
@@ -1229,9 +1307,14 @@ pub struct ConvertNote {
     pub level: String,
     pub old: FileColumns,
     pub new: FileColumns,
+    /// Where the original is on this machine; for a cloud row `old.folder_path`
+    /// is relative to the sync folder.
+    pub original_path: String,
     /// The original's size at conversion time. The row's `FileSize` can be stale,
     /// so it is no proof the original is unchanged.
     pub original_size: u64,
+    /// Where the converted file is on this machine.
+    pub converted_path: String,
     pub converted_at: String,
     pub backup: String,
 }
@@ -1254,13 +1337,20 @@ pub fn repoint(
     backup: &Path,
 ) -> Result<PathBuf> {
     let old = read_columns(db, &plan.content_id)?;
-    let new = FileColumns::for_file(&plan.target_path, &converted.info, &converted.format)?;
+    let new = FileColumns::for_file(
+        &plan.target_folder_path,
+        &plan.target_path,
+        &converted.info,
+        &converted.format,
+    )?;
     let note = ConvertNote {
         content_id: plan.content_id.clone(),
         level: level.to_string(),
         old,
         new,
+        original_path: plan.source_path.to_string_lossy().into_owned(),
         original_size: std::fs::metadata(&plan.source_path)?.len(),
+        converted_path: plan.target_path.to_string_lossy().into_owned(),
         converted_at: now_db_string(),
         backup: backup.to_string_lossy().into_owned(),
     };
@@ -1307,7 +1397,7 @@ pub fn undo(db: &MasterDb, note: &ConvertNote) -> Result<()> {
             current.folder_path
         );
     }
-    let original = Path::new(&note.old.folder_path);
+    let original = Path::new(&note.original_path);
     let size = std::fs::metadata(original)
         .with_context(|| format!("the original {} is gone", original.display()))?
         .len();
@@ -1650,6 +1740,7 @@ mod tests {
             "CREATE TABLE djmdContent (ID TEXT, Title TEXT, ArtistID TEXT, FolderPath TEXT,
                 OrgFolderPath TEXT, FileNameL TEXT, FileType INTEGER, FileSize INTEGER,
                 SampleRate INTEGER, BitDepth INTEGER, BitRate INTEGER, ServiceID INTEGER,
+                rb_file_id TEXT,
                 rb_local_deleted INTEGER, rb_local_synced INTEGER, rb_local_usn INTEGER,
                 updated_at TEXT);
              CREATE TABLE djmdArtist (ID TEXT, Name TEXT);
@@ -1677,11 +1768,15 @@ mod tests {
         // An AIFF that needs resampling cannot overwrite itself.
         let source = dir.join("a.aiff");
         std::fs::write(&source, b"x").unwrap();
-        let first = choose_target_path(&db, &source, Codec::Aiff, "legacy", &mut claimed).unwrap();
-        assert_eq!(first, Some(dir.join("a [legacy].aiff")));
+        let row = source.to_string_lossy().into_owned();
+        let mut pick = |src: &Path, row: &str| {
+            choose_target_path(&db, src, row, Codec::Aiff, "legacy", &mut claimed)
+                .unwrap()
+                .map(|(p, _)| p)
+        };
+        assert_eq!(pick(&source, &row), Some(dir.join("a [legacy].aiff")));
         // A second source in the same folder cannot claim the same name.
-        let second = choose_target_path(&db, &source, Codec::Aiff, "legacy", &mut claimed).unwrap();
-        assert_eq!(second, None);
+        assert_eq!(pick(&source, &row), None);
 
         // A path a row already references is as taken as a file on disk.
         let flac = dir.join("b.flac");
@@ -1691,9 +1786,41 @@ mod tests {
                 params![dir.join("b.aiff").to_string_lossy()],
             )
             .unwrap();
-        let p = choose_target_path(&db, &flac, Codec::Aiff, "legacy", &mut claimed).unwrap();
-        assert_eq!(p, Some(dir.join("b [legacy].aiff")));
+        let flac_row = flac.to_string_lossy().into_owned();
+        assert_eq!(pick(&flac, &flac_row), Some(dir.join("b [legacy].aiff")));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cloud_target_is_named_relative_to_the_sync_folder() {
+        let db = db();
+        let root = scratch();
+        let mut claimed = HashSet::new();
+        let source = root.join("contents_1/artist/a.flac");
+        // A row already holding the plain name, as rekordbox knows it.
+        db.conn
+            .execute(
+                "INSERT INTO djmdContent (ID, FolderPath) VALUES ('9', '/contents_1/artist/a.aiff')",
+                [],
+            )
+            .unwrap();
+        let picked = choose_target_path(
+            &db,
+            &source,
+            "/contents_1/artist/a.flac",
+            Codec::Aiff,
+            "legacy",
+            &mut claimed,
+        )
+        .unwrap();
+        assert_eq!(
+            picked,
+            Some((
+                root.join("contents_1/artist/a [legacy].aiff"),
+                "/contents_1/artist/a [legacy].aiff".to_string()
+            ))
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn columns(path: &str, ft: i64) -> FileColumns {
@@ -1707,6 +1834,7 @@ mod tests {
             sample_rate: Some(44100),
             bit_depth: Some(16),
             bit_rate: Some(0),
+            rb_file_id: None,
         }
     }
 
@@ -1739,8 +1867,12 @@ mod tests {
         let dir = scratch();
         let original = dir.join("a.flac");
         std::fs::write(&original, b"flac").unwrap();
-        let old = columns(&original.to_string_lossy(), 5);
-        let new = columns(&dir.join("a.aiff").to_string_lossy(), 12);
+        // A cloud row: its FolderPath is not where the file is on disk.
+        let old = FileColumns {
+            rb_file_id: Some("246205391".into()),
+            ..columns("/contents_1/a.flac", 5)
+        };
+        let new = columns("/contents_1/a.aiff", 12);
         db.conn
             .execute(
                 "INSERT INTO djmdContent (ID, FolderPath) VALUES ('1', ?1)",
@@ -1752,7 +1884,9 @@ mod tests {
             level: "legacy".into(),
             old: old.clone(),
             new,
+            original_path: original.to_string_lossy().into_owned(),
             original_size: 4,
+            converted_path: dir.join("a.aiff").to_string_lossy().into_owned(),
             converted_at: String::new(),
             backup: String::new(),
         };
@@ -1761,6 +1895,7 @@ mod tests {
         assert!(undo(&db, &note).is_err(), "a changed original is refused");
         std::fs::write(&original, b"flac").unwrap();
         undo(&db, &note).unwrap();
+        // Sync's file ID comes back with the rest.
         assert_eq!(read_columns(&db, "1").unwrap(), old);
         assert!(
             undo(&db, &note).is_err(),
@@ -1777,7 +1912,9 @@ mod tests {
             level: level.into(),
             old: columns("/a.flac", 5),
             new: columns("/a.aiff", 12),
+            original_path: "/a.flac".into(),
             original_size: 1,
+            converted_path: "/a.aiff".into(),
             converted_at: String::new(),
             backup: String::new(),
         };
@@ -1823,7 +1960,9 @@ mod tests {
             source_duration: info.duration_secs,
             channels: 2,
             target,
+            target_folder_path: target_path.to_string_lossy().into_owned(),
             target_path,
+            cloud: false,
         }
     }
 
@@ -1853,6 +1992,66 @@ mod tests {
             .count();
         assert_eq!(leftovers, 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_cloud_row_converts_inside_the_sync_folder_and_drops_its_file_id() {
+        let root = scratch();
+        let folder = root.join("contents_1/artist");
+        std::fs::create_dir_all(&folder).unwrap();
+        let Some(_) = noise_file(&folder, "a.flac", 96000, "s32") else {
+            return;
+        };
+        let db = db();
+        db.conn
+            .execute_batch(
+                "INSERT INTO djmdContent (ID, Title, FolderPath, OrgFolderPath, FileType,
+                    ServiceID, rb_file_id)
+                 VALUES ('1', 'a', '/contents_1/artist/a.flac', '/incoming/a.flac', 5, 2, '77');",
+            )
+            .unwrap();
+        let queued = HashSet::new();
+        let mut opts = ScanOpts {
+            only: None,
+            allow_lossy: false,
+            include_cloud: false,
+            cloud_root: Some(&root),
+            queued: &queued,
+            jobs: 1,
+        };
+        // Off unless asked for.
+        let skipped = scan(&db, &level("legacy"), &opts, |_, _| {}).unwrap();
+        assert!(skipped.planned.is_empty());
+        assert_eq!(skipped.skipped[0].reason, SkipReason::Cloud);
+
+        opts.include_cloud = true;
+        let found = scan(&db, &level("legacy"), &opts, |_, _| {}).unwrap();
+        let plan = &found.planned[0];
+        assert!(plan.cloud);
+        assert_eq!(plan.target_path, folder.join("a.aiff"));
+        assert_eq!(plan.target_folder_path, "/contents_1/artist/a.aiff");
+
+        let converted = convert(plan).unwrap();
+        let backup = root.join("master.db.bak");
+        repoint(&db, plan, &converted, "legacy", &backup).unwrap();
+        let now = read_columns(&db, "1").unwrap();
+        assert_eq!(now.folder_path, "/contents_1/artist/a.aiff");
+        assert_eq!(now.file_type, Some(12));
+        assert_eq!(now.rb_file_id, None);
+
+        // A transfer queued against the download path still protects the row.
+        let queued: HashSet<String> = ["/incoming/a.flac".to_string()].into();
+        db.conn
+            .execute(
+                "UPDATE djmdContent SET FolderPath = '/contents_1/artist/a.flac' WHERE ID = '1'",
+                [],
+            )
+            .unwrap();
+        let _ = std::fs::remove_file(folder.join("a.aiff"));
+        opts.queued = &queued;
+        let held = scan(&db, &level("legacy"), &opts, |_, _| {}).unwrap();
+        assert_eq!(held.skipped[0].reason, SkipReason::Queued);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
