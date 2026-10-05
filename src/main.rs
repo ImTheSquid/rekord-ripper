@@ -1061,6 +1061,9 @@ fn run_artwork(
     absent_note();
 
     if !args.apply {
+        if !strong.is_empty() || !weak.is_empty() {
+            note_stale_exports();
+        }
         eprintln!("Dry-run; pass --apply to write.");
         return Ok(());
     }
@@ -1095,14 +1098,41 @@ fn run_artwork(
     eprintln!("backed up to: {}", backup.display());
 
     let mut n = import::apply_artwork_fixes(db, &scan.local)?;
+    let mut rewritten = 0;
     if !accepted.is_empty() {
         // Downloaded first, so a network failure costs no database write.
         let staged = download_covers(&accepted, cfg)?;
-        n += import::apply_source_covers(db, &staged)?;
+        rewritten = import::apply_source_covers(db, &staged)?;
+        n += rewritten;
     }
     eprintln!("{} gave {n} row(s) their cover.", "ok:".green());
     eprintln!("rekordbox must be restarted to re-read them.");
+    if rewritten > 0 {
+        warn_stale_exports(rewritten);
+    }
     Ok(())
+}
+
+/// Rekordbox exports a changed file to a stick as a second copy and keeps the
+/// first, so the player lists the track twice and the old copy still loads.
+fn warn_stale_exports(files: usize) {
+    use owo_colors::OwoColorize;
+    eprintln!(
+        "{} {files} file(s) changed. A USB stick exported before this still holds the \
+         old copies, and the next export adds the new ones beside them, so players \
+         list those tracks twice. Reformat the stick (or remove its rekordbox \
+         library) and export again.",
+        "warning:".yellow().bold()
+    );
+}
+
+/// The dry-run form of [`warn_stale_exports`].
+fn note_stale_exports() {
+    eprintln!(
+        "note: this changes files a USB stick may already hold. Afterwards, reformat \
+         the stick (or remove its rekordbox library) and export again, or players \
+         will list those tracks twice."
+    );
 }
 
 fn base(path: &str) -> String {
@@ -1632,6 +1662,7 @@ fn run_compat(db: &mut MasterDb, cfg: &Config, safety: SafetyOpts, args: CompatA
     }
 
     if !args.apply {
+        note_stale_exports();
         eprintln!("Dry-run; pass --apply to convert and write.");
         return Ok(());
     }
@@ -1697,10 +1728,8 @@ fn run_compat(db: &mut MasterDb, cfg: &Config, safety: SafetyOpts, args: CompatA
             "the originals are still beside them. Undo one with {}.",
             "rekord-ripper compat --undo <ID> --apply".bold()
         );
-        eprintln!(
-            "rekordbox must be restarted to re-read them, and USB sticks re-exported \
-             to carry the new files."
-        );
+        eprintln!("rekordbox must be restarted to re-read them.");
+        warn_stale_exports(ok);
     }
     outcome?;
     if failed > 0 {
