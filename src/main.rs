@@ -301,8 +301,9 @@ enum Cmd {
     ///
     /// A wrong value is not cosmetic: rekordbox reads FileType 0 as "Unknown
     /// Format" and refuses to play the track, however good the file is. Every
-    /// local row is probed; anything unreadable or moved is skipped rather than
-    /// guessed at. Default = dry-run.
+    /// local row is probed, and every Cloud Library Sync row whose file is synced to this
+    /// machine; anything unreadable or moved is skipped rather than guessed at.
+    /// Default = dry-run.
     Repair {
         /// Actually write to master.db. Without this, prints what it would do.
         #[arg(long)]
@@ -834,7 +835,7 @@ fn run_repair(
     use owo_colors::OwoColorize;
     use rekord_ripper::import::{self, file_type_name};
 
-    eprintln!("probing every local track …");
+    eprintln!("probing every local and synced cloud track …");
     let mut fixes = import::scan_file_types(db)?;
     if unplayable_only {
         fixes.retain(|f| f.unplayable);

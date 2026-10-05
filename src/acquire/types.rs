@@ -160,7 +160,8 @@ impl AudioFormat {
     pub fn rekordbox_file_type(self) -> Option<i64> {
         match self {
             Self::Mp3(_) | Self::Mp3V0 => Some(1),
-            Self::Alac | Self::Aac(_) => Some(4),
+            Self::Aac(_) => Some(4),
+            Self::Alac => Some(6),
             Self::Flac => Some(5),
             Self::Wav => Some(11),
             Self::Aiff => Some(12),
@@ -709,7 +710,7 @@ mod tests {
     fn rekordbox_file_types_match_the_forward_mapping() {
         // Mirrors crate::format::file_type_name.
         assert_eq!(AudioFormat::Mp3(None).rekordbox_file_type(), Some(1));
-        assert_eq!(AudioFormat::Alac.rekordbox_file_type(), Some(4));
+        assert_eq!(AudioFormat::Alac.rekordbox_file_type(), Some(6));
         assert_eq!(AudioFormat::Aac(None).rekordbox_file_type(), Some(4));
         assert_eq!(AudioFormat::Flac.rekordbox_file_type(), Some(5));
         assert_eq!(AudioFormat::Wav.rekordbox_file_type(), Some(11));

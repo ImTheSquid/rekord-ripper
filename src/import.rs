@@ -804,31 +804,41 @@ pub struct FileTypeFix {
     pub unplayable: bool,
 }
 
-/// Find local rows whose `FileType` does not match what the file actually is.
+/// Find rows whose `FileType` does not match what the file actually is.
 ///
+/// Covers local rows and Cloud Library Sync rows whose files are synced to this
+/// machine; a cloud row exported to USB carries its `FileType` just the same.
 /// Reads every candidate off disk rather than trusting the extension, and skips
 /// anything unreadable — a file that has moved is a different problem, and
 /// guessing at its format to "fix" the row would be worse than leaving it.
 pub fn scan_file_types(db: &MasterDb) -> Result<Vec<FileTypeFix>> {
     let mut stmt = db.conn.prepare(
-        "SELECT ID, FolderPath, FileType FROM djmdContent
+        "SELECT ID, FolderPath, FileType, ServiceID FROM djmdContent
          WHERE (rb_local_deleted = 0 OR rb_local_deleted IS NULL)
            AND FolderPath LIKE '/%'",
     )?;
-    let rows: Vec<(String, String, Option<i64>)> = stmt
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+    let rows: Vec<(String, String, Option<i64>, Option<i64>)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
         .collect::<std::result::Result<_, _>>()?;
 
+    let cloud_root = crate::paths::cloud_sync_root();
     let mut fixes = Vec::new();
-    for (content_id, path, current) in rows {
-        let p = Path::new(&path);
-        if !p.exists() {
+    for (content_id, path, current, service_id) in rows {
+        let on_disk = match crate::format::origin(current, Some(&path), service_id) {
+            crate::format::Origin::Local => PathBuf::from(&path),
+            crate::format::Origin::Cloud => match &cloud_root {
+                Some(root) => root.join(path.trim_start_matches('/')),
+                None => continue,
+            },
+            crate::format::Origin::Stream => continue,
+        };
+        if !on_disk.exists() || online_only(&on_disk) {
             continue;
         }
-        let Ok(info) = crate::audio::probe(p) else {
+        let Ok(info) = crate::audio::probe(&on_disk) else {
             continue;
         };
-        let Some(correct) = info.rekordbox_file_type(p) else {
+        let Some(correct) = info.rekordbox_file_type(&on_disk) else {
             continue;
         };
         if current != Some(correct) {
@@ -842,6 +852,26 @@ pub fn scan_file_types(db: &MasterDb) -> Result<Vec<FileTypeFix>> {
         }
     }
     Ok(fixes)
+}
+
+/// True for a cloud-provider placeholder whose bytes are not on this machine.
+/// Reading one makes Dropbox download it, so a scan leaves it alone.
+fn online_only(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::macos::fs::MetadataExt;
+        const SF_DATALESS: u32 = 0x4000_0000;
+        meta.st_flags() & SF_DATALESS != 0
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
+        meta.file_attributes() & FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS != 0
+    }
 }
 
 /// Write the corrected `FileType`s, one USN per row so Cloud Library Sync sees

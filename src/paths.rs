@@ -118,6 +118,40 @@ pub fn fingerprint_cache_path() -> Result<PathBuf> {
     Ok(data_dir()?.join("fpcache.sqlite"))
 }
 
+/// The folder Cloud Library Sync keeps its files in, which a cloud row's
+/// `/contents_…` `FolderPath` is relative to. `None` when sync is not set up.
+///
+/// Rekordbox records only the Dropbox folder, as `DropboxSharingPath` in
+/// `rekordbox3.settings`; the files sit in its `rekordbox` subfolder. That
+/// settings file also holds the Dropbox tokens, so only this one key is read.
+pub fn cloud_sync_root() -> Option<PathBuf> {
+    let text = std::fs::read_to_string(rekordbox_settings_path()?).ok()?;
+    Some(PathBuf::from(dropbox_sharing_path(&text)?).join("rekordbox"))
+}
+
+fn rekordbox_settings_path() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    let base = PathBuf::from(var("HOME").ok()?).join("Library/Application Support");
+    #[cfg(target_os = "windows")]
+    let base = PathBuf::from(var("APPDATA").ok()?);
+    Some(base.join("Pioneer/rekordbox6/rekordbox3.settings"))
+}
+
+/// The `val` of `<VALUE name="DropboxSharingPath" val="…"/>`, unescaped.
+fn dropbox_sharing_path(settings: &str) -> Option<String> {
+    let line = settings
+        .lines()
+        .find(|l| l.contains(r#"name="DropboxSharingPath""#))?;
+    let val = line.split(r#"val=""#).nth(1)?.split('"').next()?;
+    let val = val
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&");
+    (!val.trim().is_empty()).then_some(val)
+}
+
 /// Expand a leading `~/` only. No shell globbing, no `$VAR` interpolation —
 /// a config value should not depend on the shell that happened to write it.
 pub fn expand_tilde(s: &str) -> Result<PathBuf> {
@@ -158,6 +192,27 @@ mod tests {
         assert_eq!(expand_tilde("rel/path").unwrap(), PathBuf::from("rel/path"));
         // A bare "~" is not the prefix we expand, and must not be mangled.
         assert_eq!(expand_tilde("~").unwrap(), PathBuf::from("~"));
+    }
+
+    #[test]
+    fn the_sync_folder_is_read_off_its_own_key_only() {
+        // Shape taken from a real rekordbox3.settings; the token lines around
+        // it must never be what is returned.
+        let settings = r#"  <VALUE name="DropboxTokenType" val="Bearer"/>
+  <VALUE name="DropboxSharingPath" val="/Users/x/Library/CloudStorage/Dropbox-Team/A &amp; B"/>
+  <VALUE name="DropboxToken" val="secret"/>"#;
+        assert_eq!(
+            dropbox_sharing_path(settings).as_deref(),
+            Some("/Users/x/Library/CloudStorage/Dropbox-Team/A & B")
+        );
+        assert_eq!(
+            dropbox_sharing_path(r#"<VALUE name="DropboxToken" val="secret"/>"#),
+            None
+        );
+        assert_eq!(
+            dropbox_sharing_path(r#"<VALUE name="DropboxSharingPath" val=""/>"#),
+            None
+        );
     }
 
     #[test]

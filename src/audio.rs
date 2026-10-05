@@ -67,7 +67,8 @@ impl AudioInfo {
                 None
             }
             Some("mp3") => Some(1),
-            Some("aac" | "alac") => Some(4),
+            Some("aac") => Some(4),
+            Some("alac") => Some(6),
             _ => None,
         };
         if from_codec.is_some() {
@@ -292,6 +293,10 @@ bit_rate=128000
         assert_eq!(mp3.rekordbox_file_type(Path::new("/x/a.mp3")), Some(1));
         let aac = parse_probe("codec_name=aac\nduration=10\n", 1).unwrap();
         assert_eq!(aac.rekordbox_file_type(Path::new("/x/a.m4a")), Some(4));
+        // Same container, different code: a real library holds 209 AAC rows
+        // at 4 and its one ALAC row, written by rekordbox, at 6.
+        let alac = parse_probe("codec_name=alac\nduration=10\n", 1).unwrap();
+        assert_eq!(alac.rekordbox_file_type(Path::new("/x/a.m4a")), Some(6));
     }
 
     #[test]
