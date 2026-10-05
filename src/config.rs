@@ -41,6 +41,8 @@ pub struct Config {
     pub soundcloud: SoundCloud,
     #[serde(default)]
     pub soulseek: Soulseek,
+    #[serde(default)]
+    pub compat: crate::compat::CompatConfig,
 
     /// Keys we don't recognise, kept so a round-trip doesn't delete them.
     #[serde(flatten, default, skip_serializing_if = "toml::Table::is_empty")]
@@ -592,6 +594,21 @@ mod tests {
         assert_eq!(back.search.limit, 11);
         assert_eq!(back.fingerprint.score_max, 6.5);
         assert_eq!(back.general.download_dir.as_deref(), Some("~/Music/rr"));
+    }
+
+    #[test]
+    fn a_compat_section_round_trips_and_stays_optional() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.compat.default_level.is_none() && cfg.compat.levels.is_empty());
+
+        let text = "[compat]\ndefault_level = \"legacy\"\n\
+                    [compat.levels.my-xdj]\ncodecs = [\"mp3\", \"aiff\"]\n\
+                    sample_rates = [44100]\nbit_depths = [16, 24]\n";
+        let cfg: Config = toml::from_str(text).unwrap();
+        let back: Config = toml::from_str(&cfg.to_toml().unwrap()).unwrap();
+        assert_eq!(back.compat.default_level.as_deref(), Some("legacy"));
+        assert_eq!(back.compat.levels["my-xdj"].bit_depths, vec![16, 24]);
+        assert!(back.unknown.is_empty());
     }
 
     #[test]

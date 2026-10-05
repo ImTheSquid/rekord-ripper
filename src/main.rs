@@ -357,6 +357,47 @@ enum Cmd {
         auto_score: u8,
     },
 
+    /// Convert local tracks a target player cannot play, and point their
+    /// rekordbox rows at the converted files.
+    ///
+    /// Lossless audio becomes AIFF at a rate and depth the player takes; lossy
+    /// audio is only re-encoded (to 320k MP3) with --allow-lossy. Each file is
+    /// checked against its source to the millisecond before the row moves, so
+    /// cues and the beat grid stay where they were. The original is kept beside
+    /// it. Default = dry-run.
+    Compat {
+        /// The level to convert for. Defaults to `default_level` under [compat].
+        #[arg(long, value_name = "NAME")]
+        level: Option<String>,
+        /// List the built-in and configured levels, then stop.
+        #[arg(long, conflicts_with_all = ["level", "undo"])]
+        levels: bool,
+        /// Only consider tracks matching this library query, in the same syntax
+        /// as `dump`.
+        #[arg(long, value_name = "QUERY")]
+        r#match: Option<String>,
+        /// Convert at most this many tracks.
+        #[arg(long, value_name = "N")]
+        limit: Option<usize>,
+        /// Re-encode lossy files the level cannot play as 320k MP3. A second
+        /// lossy generation, so off unless asked for.
+        #[arg(long)]
+        allow_lossy: bool,
+        /// Files probed and converted at once. Defaults to half the cores.
+        #[arg(long, value_name = "N")]
+        jobs: Option<usize>,
+        /// Actually convert and write to master.db. Without this, prints what it
+        /// would do.
+        #[arg(long)]
+        apply: bool,
+        /// Skip the confirmation prompt.
+        #[arg(short = 'y', long)]
+        yes: bool,
+        /// Point a converted track back at its original file.
+        #[arg(long, value_name = "ID", conflicts_with_all = ["level", "match", "allow_lossy", "limit"])]
+        undo: Option<String>,
+    },
+
     /// Compare two audio files by fingerprint and print the raw numbers.
     ///
     /// This is the calibration tool. The accept thresholds shipped in config are
@@ -477,6 +518,41 @@ fn main() -> Result<()> {
                     undo,
                 },
             )?
+        }
+        Cmd::Compat {
+            level,
+            levels,
+            r#match,
+            limit,
+            allow_lossy,
+            jobs,
+            apply,
+            yes,
+            undo,
+        } => {
+            let cfg = Config::load(&config_path)?;
+            if levels {
+                list_levels(&cfg)?;
+            } else {
+                let db = db.as_mut().expect("compat needs the db");
+                match undo {
+                    Some(id) => undo_compat(db, safety, &id, apply, yes)?,
+                    None => run_compat(
+                        db,
+                        &cfg,
+                        safety,
+                        CompatArgs {
+                            level,
+                            match_query: r#match,
+                            limit,
+                            allow_lossy,
+                            jobs,
+                            apply,
+                            yes,
+                        },
+                    )?,
+                }
+            }
         }
         Cmd::Fp { a, b, secs } => {
             let cfg = Config::load(&config_path)?;
@@ -1382,6 +1458,258 @@ fn undo_import(
     Ok(())
 }
 
+struct CompatArgs {
+    level: Option<String>,
+    match_query: Option<String>,
+    limit: Option<usize>,
+    allow_lossy: bool,
+    jobs: Option<usize>,
+    apply: bool,
+    yes: bool,
+}
+
+/// Skipped tracks listed per reason before the rest are only counted.
+const SKIPS_SHOWN: usize = 5;
+
+fn list_levels(cfg: &Config) -> Result<()> {
+    use owo_colors::OwoColorize;
+    for l in rekord_ripper::compat::levels(&cfg.compat)? {
+        let default = cfg.compat.default_level.as_deref() == Some(l.name.as_str());
+        println!(
+            "{:<10} {}{}",
+            l.name.bold(),
+            l,
+            if default { " (default)" } else { "" }
+        );
+        println!("{:<10} {}", "", l.about.dimmed());
+    }
+    Ok(())
+}
+
+fn run_compat(db: &mut MasterDb, cfg: &Config, safety: SafetyOpts, args: CompatArgs) -> Result<()> {
+    use owo_colors::OwoColorize;
+    use rekord_ripper::compat::{self, SkipReason, Skipped};
+
+    let level = compat::resolve_level(&cfg.compat, args.level.as_deref())?;
+    compat::preflight(args.allow_lossy)?;
+    let only = match &args.match_query {
+        Some(q) => Some(
+            rekord_ripper::select::hits(db, q, usize::MAX)?
+                .into_iter()
+                .map(|h| h.id)
+                .collect::<std::collections::HashSet<_>>(),
+        ),
+        None => None,
+    };
+    // A transfer queued against a file would expire once that file's row moves.
+    let queued = queued_paths().unwrap_or_default();
+    let jobs = args.jobs.unwrap_or_else(compat::default_jobs).max(1);
+
+    eprintln!(
+        "checking local tracks against {} ({level}) …",
+        level.name.bold()
+    );
+    let scan = compat::scan(
+        db,
+        only.as_ref(),
+        &level,
+        args.allow_lossy,
+        &queued,
+        jobs,
+        |done, total| {
+            eprint!("\r  probed {done}/{total}");
+            if done == total {
+                eprintln!();
+            }
+        },
+    )?;
+
+    let mut plans = scan.planned;
+    for p in &plans {
+        println!(
+            "  {:<14} → {:<18} {}",
+            p.source.to_string(),
+            p.target.to_string(),
+            p.label
+        );
+        println!(
+            "  {:<14}   {}",
+            "",
+            base(&p.target_path.to_string_lossy()).dimmed()
+        );
+    }
+    if !plans.is_empty() {
+        println!();
+    }
+
+    let mut groups: std::collections::BTreeMap<SkipReason, Vec<&Skipped>> = Default::default();
+    for s in &scan.skipped {
+        groups.entry(s.reason).or_default().push(s);
+    }
+    for (reason, items) in &groups {
+        eprintln!("{} skipped: {}", items.len(), reason.describe());
+        for s in items.iter().take(SKIPS_SHOWN) {
+            let detail = s
+                .detail
+                .as_deref()
+                .map(|d| format!(" ({d})"))
+                .unwrap_or_default();
+            eprintln!("    {}{}", s.label, detail.dimmed());
+        }
+        if items.len() > SKIPS_SHOWN {
+            eprintln!("    … and {} more", items.len() - SKIPS_SHOWN);
+        }
+    }
+    if scan.streams > 0 {
+        eprintln!("{} streaming row(s) have no file to convert.", scan.streams);
+    }
+
+    let bytes: u64 = plans.iter().map(|p| p.estimated_bytes()).sum();
+    eprintln!(
+        "{} local track(s) already play on {}; {} to convert, adding about {} beside the originals.",
+        scan.fits,
+        level.name,
+        plans.len(),
+        human_bytes(bytes)
+    );
+    if plans.is_empty() {
+        eprintln!("{} nothing to convert.", "ok:".green());
+        return Ok(());
+    }
+    if let Some(n) = args.limit
+        && plans.len() > n
+    {
+        eprintln!(
+            "converting the first {n} of {}; raise with --limit N.",
+            plans.len()
+        );
+        plans.truncate(n);
+    }
+
+    if !args.apply {
+        eprintln!("Dry-run; pass --apply to convert and write.");
+        return Ok(());
+    }
+    if !args.yes
+        && !confirm_stdin(&format!(
+            "convert {} file(s) and repoint their rows in master.db?",
+            plans.len()
+        ))?
+    {
+        println!("cancelled.");
+        return Ok(());
+    }
+
+    db::safety_preflight(safety)?;
+    let backup = db.backup()?;
+    eprintln!("backed up to: {}", backup.display());
+
+    let total = plans.len();
+    let (mut ok, mut failed) = (0usize, 0usize);
+    let outcome = compat::convert_all(&plans, jobs, |plan, result| {
+        let converted = match result {
+            Ok(c) => c,
+            Err(e) => {
+                failed += 1;
+                eprintln!("{} {}: {e:#}", "failed:".red(), plan.label);
+                return Ok(());
+            }
+        };
+        // Conversion takes a while, and rekordbox may have been opened since.
+        if let Err(e) = db::safety_preflight(safety) {
+            let _ = std::fs::remove_file(&plan.target_path);
+            return Err(e);
+        }
+        match compat::repoint(db, plan, &converted, &level.name, &backup) {
+            Ok(_) => {
+                ok += 1;
+                eprintln!(
+                    "{} [{}/{total}] {} → {}  {}  {}",
+                    "ok:".green(),
+                    ok + failed,
+                    plan.source,
+                    plan.target,
+                    plan.label,
+                    format!(
+                        "track {}, lag {:+.2} ms",
+                        plan.content_id, converted.alignment.lag_ms
+                    )
+                    .dimmed()
+                );
+            }
+            Err(e) => {
+                failed += 1;
+                let _ = std::fs::remove_file(&plan.target_path);
+                eprintln!("{} {}: {e:#}", "failed:".red(), plan.label);
+            }
+        }
+        Ok(())
+    });
+
+    eprintln!("converted {ok} of {total}; {failed} failed and were left as they were.");
+    if ok > 0 {
+        eprintln!(
+            "the originals are still beside them. Undo one with {}.",
+            "rekord-ripper compat --undo <ID> --apply".bold()
+        );
+        eprintln!(
+            "rekordbox must be restarted to re-read them, and USB sticks re-exported \
+             to carry the new files."
+        );
+    }
+    outcome?;
+    if failed > 0 {
+        anyhow::bail!("{failed} conversion(s) failed");
+    }
+    Ok(())
+}
+
+fn human_bytes(b: u64) -> String {
+    match b {
+        b if b >= 1_000_000_000 => format!("{:.1} GB", b as f64 / 1e9),
+        b => format!("{:.0} MB", b as f64 / 1e6),
+    }
+}
+
+fn undo_compat(
+    db: &mut MasterDb,
+    safety: SafetyOpts,
+    id: &str,
+    apply: bool,
+    yes: bool,
+) -> Result<()> {
+    use owo_colors::OwoColorize;
+    use rekord_ripper::compat;
+
+    let (note_path, note) = compat::find_note(&paths::backup_dir()?, id)?;
+    println!(
+        "track {id} was converted for {} at {}",
+        note.level, note.converted_at
+    );
+    println!("  now     {}", note.new.folder_path);
+    println!("  back to {}", note.old.folder_path);
+    println!("  {}", format!("note: {}", note_path.display()).dimmed());
+    if !apply {
+        eprintln!("Dry-run; pass --apply to write.");
+        return Ok(());
+    }
+    if !yes && !confirm_stdin(&format!("point track {id} back at its original?"))? {
+        println!("cancelled.");
+        return Ok(());
+    }
+
+    db::safety_preflight(safety)?;
+    let backup = db.backup()?;
+    eprintln!("backed up to: {}", backup.display());
+    compat::undo(db, &note)?;
+    eprintln!("{} track {id} points at its original again.", "ok:".green());
+    eprintln!(
+        "the converted file is still at {}; delete it if you no longer want it.",
+        note.new.folder_path
+    );
+    Ok(())
+}
+
 fn confirm_stdin(question: &str) -> Result<bool> {
     use std::io::{BufRead, Write};
     if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
@@ -1457,6 +1785,7 @@ fn run_fp(a: &std::path::Path, b: &std::path::Path, secs: u32, cfg: &Config) -> 
 fn needs_database(cmd: &Cmd) -> bool {
     match cmd {
         Cmd::Backends | Cmd::Config { .. } | Cmd::Fp { .. } => false,
+        Cmd::Compat { levels, .. } => !levels,
         // Only needed to seed the query from an existing track.
         Cmd::Shop {
             track_id,
