@@ -568,35 +568,32 @@ pub struct Scan {
     pub streams: usize,
 }
 
-struct Row {
-    id: String,
-    label: String,
-    folder_path: String,
-    on_disk: PathBuf,
-    cloud: bool,
+/// A library row whose audio is a file on this machine.
+pub struct LibraryFile {
+    pub id: String,
+    pub label: String,
+    pub folder_path: String,
+    /// The path a cloud row had before upload, which pending entries still use.
+    pub org_path: Option<String>,
+    pub on_disk: PathBuf,
+    pub cloud: bool,
 }
 
-pub struct ScanOpts<'a> {
-    /// Restrict to these track IDs.
-    pub only: Option<&'a HashSet<String>>,
-    pub allow_lossy: bool,
-    /// Convert Cloud Library Sync rows too, inside the sync folder.
-    pub include_cloud: bool,
-    /// [`crate::paths::cloud_sync_root`], when `include_cloud` is set.
-    pub cloud_root: Option<&'a Path>,
-    /// Files with a pending analysis transfer; converting one would leave that
-    /// transfer pointing at a row that has moved on.
-    pub queued: &'a HashSet<String>,
-    pub jobs: usize,
+pub struct LibraryFiles {
+    pub files: Vec<LibraryFile>,
+    pub skipped: Vec<Skipped>,
+    /// Streaming rows, which have no file.
+    pub streams: usize,
 }
 
-/// Probe every local track (or those in `only`) and decide what each needs.
-pub fn scan(
+/// Every row (or those in `only`) whose file is readable here. Cloud rows
+/// resolve through `cloud_root` when `include_cloud` is set.
+pub fn library_files(
     db: &MasterDb,
-    level: &Level,
-    opts: &ScanOpts,
-    mut progress: impl FnMut(usize, usize),
-) -> Result<Scan> {
+    only: Option<&HashSet<String>>,
+    include_cloud: bool,
+    cloud_root: Option<&Path>,
+) -> Result<LibraryFiles> {
     let mut stmt = db.conn.prepare(
         "SELECT c.ID, c.Title, a.Name, c.FolderPath, c.FileType, c.ServiceID, c.OrgFolderPath
          FROM djmdContent c
@@ -627,16 +624,14 @@ pub fn scan(
         })?
         .collect::<rusqlite::Result<_>>()?;
 
-    let cloud_root = opts.cloud_root.filter(|_| opts.include_cloud);
-    let mut out = Scan {
-        planned: Vec::new(),
+    let cloud_root = cloud_root.filter(|_| include_cloud);
+    let mut out = LibraryFiles {
+        files: Vec::new(),
         skipped: Vec::new(),
-        fits: 0,
         streams: 0,
     };
-    let mut to_probe: Vec<Row> = Vec::new();
     for (id, title, artist, path, file_type, service_id, org_path) in raw {
-        if opts.only.is_some_and(|o| !o.contains(&id)) {
+        if only.is_some_and(|o| !o.contains(&id)) {
             continue;
         }
         let label = format!(
@@ -658,7 +653,7 @@ pub fn scan(
         let on_disk = match (cloud, cloud_root) {
             (false, _) => PathBuf::from(&folder_path),
             (true, Some(root)) => root.join(folder_path.trim_start_matches('/')),
-            (true, None) if opts.include_cloud => {
+            (true, None) if include_cloud => {
                 out.skipped.push(skip(SkipReason::NoSyncFolder));
                 continue;
             }
@@ -667,24 +662,69 @@ pub fn scan(
                 continue;
             }
         };
-        // A cloud row's FolderPath was rewritten on upload; a pending entry
-        // still knows it by the path it was downloaded to.
-        let is_queued = opts.queued.contains(&folder_path)
-            || org_path.as_ref().is_some_and(|p| opts.queued.contains(p));
         if !on_disk.exists() {
             out.skipped.push(skip(SkipReason::Missing));
         } else if crate::presence::online_only(&on_disk) {
             out.skipped.push(skip(SkipReason::OnlineOnly));
-        } else if is_queued {
-            out.skipped.push(skip(SkipReason::Queued));
         } else {
-            to_probe.push(Row {
+            out.files.push(LibraryFile {
                 id,
                 label,
                 folder_path,
+                org_path,
                 on_disk,
                 cloud,
             });
+        }
+    }
+    Ok(out)
+}
+
+pub struct ScanOpts<'a> {
+    /// Restrict to these track IDs.
+    pub only: Option<&'a HashSet<String>>,
+    pub allow_lossy: bool,
+    /// Convert Cloud Library Sync rows too, inside the sync folder.
+    pub include_cloud: bool,
+    /// [`crate::paths::cloud_sync_root`], when `include_cloud` is set.
+    pub cloud_root: Option<&'a Path>,
+    /// Files with a pending analysis transfer; converting one would leave that
+    /// transfer pointing at a row that has moved on.
+    pub queued: &'a HashSet<String>,
+    pub jobs: usize,
+}
+
+/// Probe every local track (or those in `only`) and decide what each needs.
+pub fn scan(
+    db: &MasterDb,
+    level: &Level,
+    opts: &ScanOpts,
+    mut progress: impl FnMut(usize, usize),
+) -> Result<Scan> {
+    let lib = library_files(db, opts.only, opts.include_cloud, opts.cloud_root)?;
+    let mut out = Scan {
+        planned: Vec::new(),
+        skipped: lib.skipped,
+        fits: 0,
+        streams: lib.streams,
+    };
+    let mut to_probe: Vec<LibraryFile> = Vec::new();
+    for row in lib.files {
+        // A cloud row's FolderPath was rewritten on upload; a pending entry
+        // still knows it by the path it was downloaded to.
+        let is_queued = opts.queued.contains(&row.folder_path)
+            || row
+                .org_path
+                .as_ref()
+                .is_some_and(|p| opts.queued.contains(p));
+        if is_queued {
+            out.skipped.push(Skipped {
+                label: row.label,
+                reason: SkipReason::Queued,
+                detail: None,
+            });
+        } else {
+            to_probe.push(row);
         }
     }
 
@@ -808,7 +848,7 @@ fn choose_target_path(
 }
 
 /// Map `items` on `jobs` threads, keeping their order.
-fn par_map<T: Sync, R: Send>(
+pub(crate) fn par_map<T: Sync, R: Send>(
     items: &[T],
     jobs: usize,
     f: impl Fn(&T) -> R + Sync,

@@ -724,18 +724,16 @@ mod tests {
             kind: STREAMINFO,
             data: vec![0; 34],
         };
+        let one = std::slice::from_ref(&si);
         let used = 4 + 4 + 34;
-        assert_eq!(layout(&[si.clone()], used).unwrap().unwrap().len(), used);
-        assert_eq!(
-            layout(&[si.clone()], used + 100).unwrap().unwrap().len(),
-            used + 100
-        );
+        assert_eq!(layout(one, used).unwrap().unwrap().len(), used);
+        assert_eq!(layout(one, used + 100).unwrap().unwrap().len(), used + 100);
         // Too little left over for a padding header.
-        assert!(layout(&[si.clone()], used + 2).unwrap().is_none());
-        assert!(layout(&[si.clone()], used - 1).unwrap().is_none());
+        assert!(layout(one, used + 2).unwrap().is_none());
+        assert!(layout(one, used - 1).unwrap().is_none());
         // More padding than one block can describe.
         let big = used + MAX_BLOCK + 6;
-        let out = layout(&[si], big).unwrap().unwrap();
+        let out = layout(one, big).unwrap().unwrap();
         assert_eq!(out.len(), big);
         let meta = read_from(&mut out.as_slice()).unwrap();
         assert_eq!(meta.audio_offset as usize, big);

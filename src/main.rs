@@ -404,6 +404,43 @@ enum Cmd {
         undo: Option<String>,
     },
 
+    /// Find what will fail on a player: damaged audio, files a level cannot
+    /// play, and FLACs with no seek table.
+    ///
+    /// Every file is read in full. FLAC frames are checked against their CRCs;
+    /// anything else is decoded by ffmpeg. A player reaching damage drops into
+    /// an emergency loop or stops, so damaged files need replacing. A FLAC with
+    /// no seek table makes the player scan to reach a cue; --apply adds one in
+    /// place, keeping the file's size, timestamp and audio offsets, so the
+    /// rekordbox row and any USB copy stay valid. Run it with --path on an
+    /// exported stick to fix the copies there the same way. Default = dry-run.
+    Check {
+        /// The level to check playability against. Defaults to `default_level`
+        /// under [compat]; with neither, playability is not checked.
+        #[arg(long, value_name = "NAME")]
+        level: Option<String>,
+        /// Only check tracks matching this library query, in the same syntax
+        /// as `dump`.
+        #[arg(long, value_name = "QUERY", conflicts_with = "path")]
+        r#match: Option<String>,
+        /// Check Cloud Library Sync rows too, through the sync folder.
+        #[arg(long, conflicts_with = "path")]
+        include_cloud: bool,
+        /// Check every audio file under this folder instead of the library,
+        /// e.g. a USB stick's Contents. Repeatable.
+        #[arg(long, value_name = "DIR")]
+        path: Vec<PathBuf>,
+        /// Files checked at once. Defaults to half the cores.
+        #[arg(long, value_name = "N")]
+        jobs: Option<usize>,
+        /// Add the missing seek tables. Without this, only reports.
+        #[arg(long)]
+        apply: bool,
+        /// Skip the confirmation prompt.
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+
     /// Swap playlist entries from a streaming row to the downloaded copy of it.
     ///
     /// A download leaves the stream row in every playlist it was in, and a USB
@@ -580,6 +617,30 @@ fn main() -> Result<()> {
                     )?,
                 }
             }
+        }
+        Cmd::Check {
+            level,
+            r#match,
+            include_cloud,
+            path,
+            jobs,
+            apply,
+            yes,
+        } => {
+            let cfg = Config::load(&config_path)?;
+            run_check(
+                db.as_ref(),
+                &cfg,
+                CheckArgs {
+                    level,
+                    match_query: r#match,
+                    include_cloud,
+                    paths: path,
+                    jobs,
+                    apply,
+                    yes,
+                },
+            )?
         }
         Cmd::Relink { apply, yes, undo } => run_relink(
             db.as_mut().expect("relink needs the db"),
@@ -1538,6 +1599,254 @@ fn undo_import(
     Ok(())
 }
 
+struct CheckArgs {
+    level: Option<String>,
+    match_query: Option<String>,
+    include_cloud: bool,
+    paths: Vec<PathBuf>,
+    jobs: Option<usize>,
+    apply: bool,
+    yes: bool,
+}
+
+fn run_check(db: Option<&MasterDb>, cfg: &Config, args: CheckArgs) -> Result<()> {
+    use owo_colors::OwoColorize;
+    use rekord_ripper::check::{self, Target};
+    use rekord_ripper::compat::{self, SkipReason};
+    use rekord_ripper::flac::{self, SeekPlan};
+
+    let level = match args
+        .level
+        .as_deref()
+        .or(cfg.compat.default_level.as_deref())
+    {
+        Some(name) => Some(compat::resolve_level(&cfg.compat, Some(name))?),
+        None => None,
+    };
+    let jobs = args.jobs.unwrap_or_else(compat::default_jobs).max(1);
+    let from_library = args.paths.is_empty();
+
+    let targets: Vec<Target> = if from_library {
+        let db = db.expect("check needs the db");
+        let only = match &args.match_query {
+            Some(q) => Some(
+                rekord_ripper::select::hits(db, q, usize::MAX)?
+                    .into_iter()
+                    .map(|h| h.id)
+                    .collect::<std::collections::HashSet<_>>(),
+            ),
+            None => None,
+        };
+        let cloud_root = args.include_cloud.then(paths::cloud_sync_root).flatten();
+        let lib =
+            compat::library_files(db, only.as_ref(), args.include_cloud, cloud_root.as_deref())?;
+        let mut groups: std::collections::BTreeMap<SkipReason, usize> = Default::default();
+        for s in &lib.skipped {
+            *groups.entry(s.reason).or_default() += 1;
+        }
+        for (reason, n) in groups {
+            let why = match reason {
+                SkipReason::Cloud => {
+                    "Cloud Library Sync rows; pass --include-cloud to check them too"
+                }
+                r => r.describe(),
+            };
+            eprintln!("{n} skipped: {why}");
+        }
+        if lib.streams > 0 {
+            eprintln!("{} streaming row(s) have no file to check.", lib.streams);
+        }
+        lib.files
+            .into_iter()
+            .map(|f| Target {
+                label: f.label,
+                path: f.on_disk,
+                track_id: Some(f.id),
+            })
+            .collect()
+    } else {
+        check::files_under(&args.paths)?
+    };
+
+    match &level {
+        Some(l) => eprintln!(
+            "reading {} file(s) in full, and against {} ({l}) …",
+            targets.len(),
+            l.name.bold()
+        ),
+        None => eprintln!(
+            "reading {} file(s) in full; pass --level to check playability too …",
+            targets.len()
+        ),
+    }
+    let live = std::io::IsTerminal::is_terminal(&std::io::stderr());
+    let findings = check::inspect_all(&targets, level.as_ref(), jobs, |done, total| {
+        if live {
+            eprint!("\r  checked {done}/{total}");
+            if done == total {
+                eprintln!();
+            }
+        }
+    });
+
+    let name = |t: &Target| match &t.track_id {
+        Some(id) => format!("{}  [{id}]", t.label),
+        None => t.label.clone(),
+    };
+    let pairs: Vec<(&Target, &check::Finding)> = targets.iter().zip(&findings).collect();
+    let damaged: Vec<_> = pairs.iter().filter(|(_, f)| f.damage.is_some()).collect();
+    let unplayable: Vec<_> = pairs
+        .iter()
+        .filter(|(_, f)| f.unplayable.is_some())
+        .collect();
+    let errors: Vec<_> = pairs.iter().filter(|(_, f)| f.error.is_some()).collect();
+    let fixes: Vec<(&Target, &flac::Block, &flac::Stamp)> = pairs
+        .iter()
+        .filter_map(|(t, f)| match &f.seek {
+            Some(SeekPlan::Add(b, s)) => Some((*t, b, s)),
+            _ => None,
+        })
+        .collect();
+    let no_room: Vec<_> = pairs
+        .iter()
+        .filter_map(|(t, f)| match f.seek {
+            Some(SeekPlan::NoRoom { needed, spare }) => Some((*t, needed, spare)),
+            _ => None,
+        })
+        .collect();
+
+    if !damaged.is_empty() {
+        println!(
+            "{} {} damaged. A player drops into an emergency loop or stops at the damage; replace {}:",
+            "error:".red(),
+            damaged.len(),
+            if from_library {
+                "them, e.g. with `shop --track-id ID`"
+            } else {
+                "them in the library and export again"
+            }
+        );
+        for (t, f) in &damaged {
+            println!(
+                "  {}  {}",
+                name(t),
+                f.damage.as_deref().unwrap_or_default().dimmed()
+            );
+        }
+        println!();
+    }
+    if let Some(l) = &level
+        && !unplayable.is_empty()
+    {
+        println!(
+            "{} {} not playable on {}; `compat --level {}` converts them:",
+            "error:".red(),
+            unplayable.len(),
+            l.name,
+            l.name
+        );
+        for (t, f) in &unplayable {
+            let fmt = f.unplayable.map(|s| s.to_string()).unwrap_or_default();
+            println!("  {:<14} {}", fmt, name(t));
+        }
+        println!();
+    }
+    if !fixes.is_empty() {
+        println!(
+            "{} {} FLAC(s) have no seek table, so a player scans the file to reach a cue:",
+            "warning:".yellow(),
+            fixes.len()
+        );
+        for (t, _, _) in fixes.iter().take(SKIPS_SHOWN * 2) {
+            println!("  {}", name(t));
+        }
+        if fixes.len() > SKIPS_SHOWN * 2 {
+            println!("  … and {} more", fixes.len() - SKIPS_SHOWN * 2);
+        }
+        println!();
+    }
+    if !no_room.is_empty() {
+        println!(
+            "{} {} FLAC(s) have no seek table and too little padding to add one without changing the file's size; left alone:",
+            "warning:".yellow(),
+            no_room.len()
+        );
+        for (t, needed, spare) in &no_room {
+            println!(
+                "  {}  {}",
+                name(t),
+                format!("needs {needed} bytes, has {spare}").dimmed()
+            );
+        }
+        println!();
+    }
+    if !errors.is_empty() {
+        eprintln!("{} could not be fully checked:", errors.len());
+        for (t, f) in &errors {
+            eprintln!(
+                "  {}  {}",
+                name(t),
+                f.error.as_deref().unwrap_or_default().dimmed()
+            );
+        }
+    }
+    let flagged = pairs
+        .iter()
+        .filter(|(_, f)| {
+            f.damage.is_some()
+                || f.unplayable.is_some()
+                || f.error.is_some()
+                || matches!(f.seek, Some(SeekPlan::Add(..) | SeekPlan::NoRoom { .. }))
+        })
+        .count();
+    eprintln!(
+        "{} of {} file(s) have nothing wrong.",
+        targets.len() - flagged,
+        targets.len()
+    );
+
+    if fixes.is_empty() {
+        return Ok(());
+    }
+    if !args.apply {
+        eprintln!(
+            "Dry-run; pass --apply to add the {} seek table(s).",
+            fixes.len()
+        );
+        return Ok(());
+    }
+    if !args.yes
+        && !confirm_stdin(&format!(
+            "add seek tables to {} file(s), in place?",
+            fixes.len()
+        ))?
+    {
+        println!("cancelled.");
+        return Ok(());
+    }
+    let (mut ok, mut failed) = (0usize, 0usize);
+    for (t, table, stamp) in &fixes {
+        match flac::add_seek_table(&t.path, table, stamp) {
+            Ok(()) => ok += 1,
+            Err(e) => {
+                failed += 1;
+                eprintln!("{} {}: {e:#}", "failed:".red(), name(t));
+            }
+        }
+    }
+    eprintln!(
+        "{} added {ok} seek table(s); {failed} failed.",
+        "ok:".green()
+    );
+    if from_library && ok > 0 {
+        eprintln!(
+            "A USB stick exported before this still holds the old copies. They are the same \
+             files, so `check --path <stick>/Contents --apply` fixes them there without an export."
+        );
+    }
+    Ok(())
+}
+
 struct CompatArgs {
     level: Option<String>,
     match_query: Option<String>,
@@ -1970,6 +2279,7 @@ fn needs_database(cmd: &Cmd) -> bool {
     match cmd {
         Cmd::Backends | Cmd::Config { .. } | Cmd::Fp { .. } => false,
         Cmd::Compat { levels, .. } => !levels,
+        Cmd::Check { path, .. } => path.is_empty(),
         // Only needed to seed the query from an existing track.
         Cmd::Shop {
             track_id,

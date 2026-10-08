@@ -2,6 +2,7 @@ pub mod acquire;
 pub mod analysis;
 pub mod artwork;
 pub mod audio;
+pub mod check;
 pub mod compat;
 pub mod config;
 pub mod db;
