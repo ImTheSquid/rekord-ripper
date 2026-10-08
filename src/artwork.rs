@@ -6,8 +6,9 @@
 //! row's own UUID. So a hand-created row can compute where its art belongs
 //! before it is inserted, and nothing else has to be reconciled.
 //!
-//! Embedding into the audio file is separate and additive: it uses `-c:a copy`,
-//! which leaves the audio stream bit-identical, so a fingerprint taken either
+//! Embedding into the audio file is separate and additive: FLAC metadata is
+//! edited directly and other containers are remuxed with `-c:a copy`. Both
+//! leave the audio stream bit-identical, so a fingerprint taken either
 //! side of an embed still matches. It does change the file's size, which is what
 //! [`crate::import::existing_row_for_content`] dedups on and what
 //! [`crate::pending`] guards its entries with — so embed before either records
@@ -144,6 +145,10 @@ pub fn embed(audio: &Path, image: &Path) -> Result<()> {
         .and_then(|e| e.to_str())
         .ok_or_else(|| anyhow!("{} has no extension", audio.display()))?
         .to_ascii_lowercase();
+    // ffmpeg's FLAC muxer drops the seek table, so FLAC is edited directly.
+    if ext == "flac" {
+        return embed_flac(audio, image);
+    }
 
     // ffmpeg needs the output extension to pick a muxer, so the temporary keeps
     // the real one and hides behind a dotted prefix instead.
@@ -178,7 +183,7 @@ pub fn embed(audio: &Path, image: &Path) -> Result<()> {
             "-metadata:s:v",
             "comment=Cover (front)",
         ]),
-        // FLAC and MP4 want a stream flagged as the attached picture.
+        // MP4 wants a stream flagged as the attached picture.
         _ => cmd.args(["-c:v", "mjpeg", "-disposition:v", "attached_pic"]),
     };
     cmd.arg(&staged);
@@ -198,6 +203,51 @@ pub fn embed(audio: &Path, image: &Path) -> Result<()> {
         let _ = std::fs::remove_file(&staged);
     })?;
     Ok(())
+}
+
+/// The cover as a FLAC PICTURE block, JPEG because that is all players show.
+fn embed_flac(audio: &Path, image: &Path) -> Result<()> {
+    let mut jpeg = std::fs::read(image)?;
+    if !jpeg.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        let staged = staged_sibling(audio, "jpg")?;
+        let converted = convert(image, &staged, "null").and_then(|()| Ok(std::fs::read(&staged)?));
+        let _ = std::fs::remove_file(&staged);
+        jpeg = converted?;
+    }
+    let (width, height) = jpeg_size(&jpeg).unwrap_or((0, 0));
+    crate::flac::set_cover(audio, &jpeg, width, height)
+        .with_context(|| format!("embedding art into {}", audio.display()))?;
+    Ok(())
+}
+
+/// Width and height from a JPEG's start-of-frame marker.
+fn jpeg_size(d: &[u8]) -> Option<(u32, u32)> {
+    let mut i = 2;
+    while i + 4 <= d.len() {
+        if d[i] != 0xFF {
+            return None;
+        }
+        let m = d[i + 1];
+        // Fill bytes, and markers with no length.
+        if m == 0xFF {
+            i += 1;
+            continue;
+        }
+        if m == 0x01 || (0xD0..=0xD9).contains(&m) {
+            i += 2;
+            continue;
+        }
+        let len = usize::from(u16::from_be_bytes([d[i + 2], d[i + 3]]));
+        // SOF0 to SOF15, less DHT, JPG and DAC, which share the range.
+        if (0xC0..=0xCF).contains(&m) && ![0xC4, 0xC8, 0xCC].contains(&m) {
+            let s = d.get(i + 5..i + 9)?;
+            let h = u32::from(u16::from_be_bytes([s[0], s[1]]));
+            let w = u32::from(u16::from_be_bytes([s[2], s[3]]));
+            return Some((w, h));
+        }
+        i += 2 + len;
+    }
+    None
 }
 
 /// Where a cover sits when the audio file itself cannot hold one.
@@ -680,7 +730,7 @@ mod tests {
         );
         assert_eq!(before, audio_stream_md5(&audio), "audio must not change");
         assert!(
-            !dir.join(".rr-art-track.flac").exists(),
+            !dir.join(".rr-flac-track.flac").exists(),
             "the staged sibling should be gone"
         );
 
@@ -689,6 +739,49 @@ mod tests {
         assert!(extract(&audio, &out).unwrap());
         assert_eq!(dimensions(&out), Some((500, 500)));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_png_cover_goes_into_a_flac_as_jpeg_and_the_seek_table_survives() {
+        let dir = tmp();
+        let Some(jpg) = test_image(&dir, 320) else {
+            return;
+        };
+        let png = dir.join("cover.png");
+        convert(&jpg, &png, "null").unwrap();
+        let audio = dir.join("seekable.flac");
+        let mut cmd = proc::capture("ffmpeg");
+        cmd.args(["-v", "error", "-y", "-f", "lavfi", "-i", "sine=duration=25"])
+            .arg(&audio);
+        if !proc::run_with_deadline(cmd, Instant::now() + TIMEOUT).is_ok_and(|o| o.status.success())
+        {
+            return;
+        }
+        let ins = crate::flac::inspect(&audio).unwrap();
+        let crate::flac::SeekPlan::Add(table, stamp) = ins.seek else {
+            panic!("ffmpeg writes no seek table");
+        };
+        crate::flac::add_seek_table(&audio, &table, &stamp).unwrap();
+
+        embed(&audio, &png).unwrap();
+        let meta = crate::flac::read(&audio).unwrap();
+        assert!(meta.has_seek_points());
+        let pic = meta.blocks.iter().find(|b| b.kind == 6).unwrap();
+        assert!(pic.data.windows(10).any(|w| w == b"image/jpeg"));
+        // Width and height follow the type, the MIME string and an empty description.
+        let dims = &pic.data[4 + 4 + 10 + 4..][..8];
+        assert_eq!(dims, [0, 0, 1, 64, 0, 0, 1, 64]);
+        assert!(!dir.join(".rr-art-seekable.jpg").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn jpeg_dimensions_come_from_the_frame_header() {
+        // SOI, an APP0 to skip, then SOF0 for 640 wide by 480 high.
+        let mut d = vec![0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x04, 0x00, 0x00];
+        d.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x11, 0x08, 0x01, 0xE0, 0x02, 0x80]);
+        assert_eq!(jpeg_size(&d), Some((640, 480)));
+        assert_eq!(jpeg_size(&[0xFF, 0xD8, 0x00]), None);
     }
 
     fn audio_stream_md5(p: &Path) -> String {
