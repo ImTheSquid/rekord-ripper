@@ -205,15 +205,13 @@ pub fn embed(audio: &Path, image: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The cover as a FLAC PICTURE block, JPEG because that is all players show.
+/// The cover as a FLAC PICTURE block. Always re-encoded, which refuses an
+/// image ffmpeg cannot decode and gives players the baseline JPEG they show.
 fn embed_flac(audio: &Path, image: &Path) -> Result<()> {
-    let mut jpeg = std::fs::read(image)?;
-    if !jpeg.starts_with(&[0xFF, 0xD8, 0xFF]) {
-        let staged = staged_sibling(audio, "jpg")?;
-        let converted = convert(image, &staged, "null").and_then(|()| Ok(std::fs::read(&staged)?));
-        let _ = std::fs::remove_file(&staged);
-        jpeg = converted?;
-    }
+    let staged = staged_sibling(audio, "jpg")?;
+    let converted = convert(image, &staged, "null").and_then(|()| Ok(std::fs::read(&staged)?));
+    let _ = std::fs::remove_file(&staged);
+    let jpeg = converted.with_context(|| format!("embedding art into {}", audio.display()))?;
     let (width, height) = jpeg_size(&jpeg).unwrap_or((0, 0));
     crate::flac::set_cover(audio, &jpeg, width, height)
         .with_context(|| format!("embedding art into {}", audio.display()))?;
