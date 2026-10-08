@@ -520,7 +520,9 @@ so quitting half way leaves the database untouched.
 The cover is embedded in the file as well as given to rekordbox, which changes
 the file's size — so `FileSize` on the row is corrected in the same transaction,
 and tracks with a queued analysis transfer are skipped, since rewriting the file
-would expire the pairing.
+would expire the pairing. A FLAC keeps every other metadata block, its seek
+table included. Versions before 1.2.0 embedded through ffmpeg, which drops the
+seek table; `check` (below) puts it back.
 
 **A rewritten file has to come off the USB stick first.** Rekordbox exports a
 changed file as a second copy (`name-1.m4a`) and keeps the first, so the player
@@ -642,6 +644,34 @@ device, and on a player before running a whole crate. Files Dropbox holds only
 as online placeholders are skipped, since reading one would download it.
 `repair` resolves cloud rows the same way. It only edits `FileType`, so it
 writes nothing into Dropbox.
+
+## Checking files before a gig
+
+`check` reads every file in full and reports what will go wrong on a player:
+
+```bash
+rekord-ripper check --level nxs2 --include-cloud        # the library
+rekord-ripper check --level nxs2 --path /Volumes/STICK/Contents
+rekord-ripper check --include-cloud --apply             # add missing seek tables
+```
+
+- **Damaged audio.** FLAC frames are checked against their CRCs, which names
+  the second the damage starts. Every other format is decoded by ffmpeg. A
+  player that reaches damage drops into an emergency loop or stops, and nothing
+  short of a clean copy fixes it, so `shop --track-id` for one.
+- **Unplayable at the level**, the same test `compat` applies. `compat`
+  converts them.
+- **FLACs with no seek table.** Without one the player scans the file to reach
+  a cue. ffmpeg writes none, so remuxed or tagged files often lack one.
+  `--apply` adds a point every ten seconds, the same table
+  `metaflac --add-seekpoint=10s` writes. The table goes into the file's padding,
+  so its size, timestamp and every audio offset stay the same, and the
+  rekordbox row and any exported copy still describe it. A file with too little
+  padding is reported and left alone.
+
+An exported stick holds byte-identical copies, so `--path <stick>/Contents
+--apply` fixes them there too and no export is needed. Files starting with `.`,
+such as macOS's `._` resource forks, are skipped.
 
 ## Playlists that still hold the stream
 
