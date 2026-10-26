@@ -9,7 +9,7 @@ pub mod db;
 pub mod dump;
 pub mod fingerprint;
 pub mod flac;
-pub(crate) mod format;
+pub mod format;
 pub mod import;
 pub mod library;
 pub mod paths;

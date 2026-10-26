@@ -10,6 +10,7 @@ pub mod filter;
 pub mod queue;
 pub mod shop;
 pub mod transfer;
+pub mod view;
 pub mod worker;
 
 use std::collections::HashSet;
@@ -75,6 +76,9 @@ pub struct Session {
     pub safety: SafetyOpts,
 
     pub rows: Vec<TrackRow>,
+    /// Bumped whenever `rows` is replaced, so a frontend holding a copy knows
+    /// to fetch it again.
+    pub rows_revision: u64,
     pub rb_running: bool,
     rb_last_polled: Instant,
 
@@ -132,6 +136,7 @@ impl Session {
             db,
             safety,
             rows,
+            rows_revision: 0,
             rb_running: rekordbox_running(),
             rb_last_polled: Instant::now(),
             copy_opts: CopyOpts::default(),
@@ -159,6 +164,7 @@ impl Session {
 
     pub fn reload_rows(&mut self) -> anyhow::Result<()> {
         self.rows = load_rows(&self.db)?;
+        self.rows_revision += 1;
         Ok(())
     }
 

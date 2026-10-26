@@ -18,8 +18,8 @@ struct SpikeView: View {
             .padding()
             .task {
                 do {
-                    let session = try Session.open()
-                    text = "\(session.row_count()) tracks"
+                    let session = try CoreSession.open()
+                    text = "\(session.rows().len()) tracks"
                 } catch let e as RustString {
                     text = e.toString()
                 } catch {

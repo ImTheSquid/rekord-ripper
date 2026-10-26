@@ -816,42 +816,24 @@ fn pending_state_span(app: &App, entry: &crate::pending::Entry) -> Span<'static>
         return Span::styled(text, Style::new().fg(colour));
     }
 
-    let (text, colour) = stored_state_label(
+    let (text, tone) = crate::session::view::stored_state_label(
         entry.state,
         entry.verdict.as_deref(),
         app.session.queue.has_row(entry.id),
     );
-    Span::styled(text, Style::new().fg(colour))
+    Span::styled(text, Style::new().fg(tone_colour(tone)))
 }
 
-/// How a stored state reads on the row, kept free of `App` so it can be tested.
-///
-/// `has_row` is why this takes three arguments: the store keeps an entry at
-/// `AwaitingImport` right up until the transfer lands, so a row created seconds
-/// ago still claimed to be waiting for one — which read as the import having
-/// silently done nothing.
-fn stored_state_label(
-    state: crate::pending::State,
-    verdict: Option<&str>,
-    has_row: bool,
-) -> (String, Color) {
-    use crate::pending::State;
-    let (label, colour) = match state {
-        State::AwaitingImport if has_row => ("imported — press 'a' to check", Color::Cyan),
-        State::AwaitingImport => ("awaiting import — press 'i'", Color::Yellow),
-        State::Matched => ("ready to apply", Color::Green),
-        State::Applied => ("applied", Color::Green),
-        State::Rejected => ("rejected", Color::Red),
-        State::Expired => ("expired", Color::DarkGray),
-        State::Cancelled => ("cancelled", Color::DarkGray),
-    };
-    // The verdict is why an entry is rejected or ready; hiding it would leave
-    // the user guessing at the one thing that decided the outcome.
-    let verdict = verdict
-        .filter(|v| !v.is_empty())
-        .map(|v| format!(" — {v}"))
-        .unwrap_or_default();
-    (format!("{label}{verdict}"), colour)
+fn tone_colour(tone: crate::session::view::Tone) -> Color {
+    use crate::session::view::Tone;
+    match tone {
+        Tone::Plain | Tone::Strong => Color::Reset,
+        Tone::Active => Color::Cyan,
+        Tone::Warn => Color::Yellow,
+        Tone::Good => Color::Green,
+        Tone::Bad => Color::Red,
+        Tone::Muted => Color::DarkGray,
+    }
 }
 
 fn draw_shop_top_bar(f: &mut Frame, area: Rect, app: &App) {
@@ -2162,46 +2144,6 @@ mod tests {
             "help would be clipped horizontally"
         );
         assert!(r.height >= rows + 2, "help would be clipped vertically");
-    }
-
-    #[test]
-    fn every_queue_state_reads_as_something() {
-        use crate::pending::State;
-        // All six, so a state added later cannot render as a blank row.
-        for state in [
-            State::AwaitingImport,
-            State::Matched,
-            State::Applied,
-            State::Rejected,
-            State::Expired,
-            State::Cancelled,
-        ] {
-            let (text, _) = stored_state_label(state, None, false);
-            assert!(!text.is_empty(), "{state:?} renders as nothing");
-        }
-        // The verdict is appended when there is one, and never as a bare dash.
-        let (with, _) = stored_state_label(State::Rejected, Some("duration differs by 9s"), false);
-        assert!(with.contains("rejected") && with.contains("9s"));
-        let (without, _) = stored_state_label(State::Rejected, Some(""), false);
-        assert_eq!(without, "rejected");
-    }
-
-    #[test]
-    fn an_imported_row_stops_claiming_to_be_awaiting_import() {
-        use crate::pending::State;
-        // The bug: the store holds an entry at AwaitingImport until the transfer
-        // lands, so a row created seconds ago still read "awaiting import" and
-        // the import looked like it had done nothing.
-        let (waiting, _) = stored_state_label(State::AwaitingImport, None, false);
-        let (imported, _) = stored_state_label(State::AwaitingImport, None, true);
-        assert_ne!(waiting, imported);
-        assert!(waiting.contains("awaiting"));
-        assert!(
-            !imported.contains("awaiting"),
-            "still says awaiting: {imported}"
-        );
-        // Both say which key moves them along.
-        assert!(waiting.contains('i') && imported.contains('a'));
     }
 
     #[test]
