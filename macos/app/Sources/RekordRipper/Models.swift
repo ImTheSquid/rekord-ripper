@@ -113,13 +113,15 @@ extension StatusMessage.Level {
 /// The step a notice or queue entry points at.
 enum Step: UInt8 {
     case none, openBuyPage, research, fillBasket, nextBasketBatch, importDownloads, checkDownloads, force,
-         forget, review
+         forget, review, allowWrites
 
-    /// A button title, or nil where the app has nothing to offer: the basket
-    /// steps belong to the TUI.
+    /// A button title, or nil where the app has nothing to offer: it never
+    /// searches an empty selection, so an empty basket cannot come up.
     var title: String? {
         switch self {
-        case .none, .fillBasket, .nextBasketBatch: nil
+        case .none, .fillBasket: nil
+        case .nextBasketBatch: "Search Next Batch"
+        case .allowWrites: "Allow Writes…"
         case .openBuyPage: "Open Buy Page"
         case .research: "Search Again"
         case .importDownloads: "Import"

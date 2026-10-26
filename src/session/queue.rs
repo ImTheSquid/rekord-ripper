@@ -41,6 +41,8 @@ pub enum EntryWork {
         verdict: crate::fingerprint::Verdict,
     },
     Failed(String),
+    /// Its import confirmation was cancelled. Left alone until imported by hand.
+    Declined,
 }
 
 impl EntryWork {
@@ -65,6 +67,7 @@ impl EntryWork {
             Self::Fingerprinting { .. } => "fingerprinting",
             Self::Ready { .. } => "ready to apply",
             Self::Failed(_) => "failed",
+            Self::Declined => "import cancelled",
         }
     }
 }
@@ -287,6 +290,12 @@ impl Session {
     /// takes real time, and spending it only to refuse with "edit your config
     /// file" is not an instruction anyone can act on from inside an app.
     pub fn start_import(&mut self) {
+        self.import(true);
+    }
+
+    /// `declined`: probe entries whose import was cancelled too. Only asking
+    /// by hand does; the pipeline would otherwise re-ask what was just refused.
+    pub(super) fn import(&mut self, declined: bool) {
         if !self.cfg.import.insert_content_rows {
             self.status.err(
                 "creating rekordbox rows is off — set insert_content_rows = true under [import] \
@@ -305,6 +314,7 @@ impl Session {
             .entries
             .iter()
             .filter(|e| e.state == crate::pending::State::AwaitingImport)
+            .filter(|e| declined || !matches!(self.queue.work_for(e.id), Some(EntryWork::Declined)))
             .filter(|e| {
                 crate::pending::find_imported_row(&self.db, &e.acquired_path)
                     .ok()
@@ -421,14 +431,21 @@ impl Session {
             .open(Batch::ImportRows(ImportBatch { rows, entry_ids }));
     }
 
+    /// The import confirmation was cancelled: its entries stop asking.
+    pub(super) fn decline_import(&mut self, batch: ImportBatch) {
+        for id in batch.entry_ids {
+            self.queue.set_work(id, EntryWork::Declined);
+        }
+    }
+
     /// Gates 2 and 3 are behind us: write the rows.
     pub fn apply_import_batch(&mut self) -> bool {
         let Some(Batch::ImportRows(batch)) = self.confirmations.take(ConfirmKind::ImportRows) else {
             return false;
         };
 
-        if let Err(e) = crate::db::safety_preflight(self.safety) {
-            self.status.err(format!("{e}"));
+        if !self.preflight() {
+            self.confirmations.open(Batch::ImportRows(batch));
             return false;
         }
         let backup = match self.db.backup() {
@@ -669,8 +686,7 @@ impl Session {
             self.status.warn("nothing passed the fingerprint check.");
             return;
         }
-        if let Err(e) = crate::db::safety_preflight(self.safety) {
-            self.status.err(format!("{e}"));
+        if !self.preflight() {
             return;
         }
 
@@ -828,8 +844,8 @@ impl Session {
             });
             return false;
         }
-        if let Err(e) = crate::db::safety_preflight(self.safety) {
-            self.status.err(format!("{e}"));
+        if !self.preflight() {
+            self.confirmations.open(Batch::ForceApply(batch));
             return false;
         }
         match crate::analysis::apply_plan(&mut self.db, &batch.plan) {

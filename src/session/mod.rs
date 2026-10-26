@@ -62,6 +62,8 @@ pub enum NoticeAction {
         entry_id: i64,
     },
     Review(ConfirmKind),
+    /// Writing was refused because rekordbox is running.
+    AllowWritesWhileRunning,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -196,6 +198,19 @@ fn suggested_destinations(db: &MasterDb) -> anyhow::Result<HashSet<String>> {
 }
 
 impl Session {
+    /// The rekordbox-running gate before a write, refused in words that suit
+    /// any frontend: the CLI's own message names a flag.
+    pub(super) fn preflight(&mut self) -> bool {
+        if crate::db::safety_preflight(self.safety).is_ok() {
+            return true;
+        }
+        self.rb_running = true;
+        self.status
+            .err("rekordbox is running — close it before writing to master.db.");
+        self.status.act(NoticeAction::AllowWritesWhileRunning);
+        false
+    }
+
     /// Opens the session on rekordbox's own `master.db`.
     pub fn open(safety: SafetyOpts) -> anyhow::Result<Self> {
         Self::new(MasterDb::open()?, safety)
@@ -265,7 +280,9 @@ impl Session {
 
     /// Close one confirmation without writing anything.
     pub fn cancel(&mut self, kind: ConfirmKind) {
-        self.confirmations.take(kind);
+        if let Some(confirm::Batch::ImportRows(batch)) = self.confirmations.take(kind) {
+            self.decline_import(batch);
+        }
     }
 
     /// Say yes to one confirmation. True when its writes were attempted, rather

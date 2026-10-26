@@ -293,6 +293,9 @@ fn status_hint(action: &NoticeAction, screen: Screen) -> String {
         NoticeAction::ForgetEntry { .. } => "'c' forgets this entry.".into(),
         // A confirmation is modal here, so it is already on screen.
         NoticeAction::Review(_) => String::new(),
+        NoticeAction::AllowWritesWhileRunning => {
+            "Close it, or restart with --i-know-rekordbox-is-open-and-may-corrupt-my-data.".into()
+        }
     }
 }
 

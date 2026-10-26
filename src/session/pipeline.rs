@@ -75,7 +75,7 @@ impl Session {
         );
         match step {
             Step::Idle => {}
-            Step::Import => self.start_import(),
+            Step::Import => self.import(false),
             Step::Check => {
                 self.queue.next_generation();
                 // `has_row` is as of the last reload. When it was stale there is
@@ -202,6 +202,13 @@ mod tests {
         // Retrying it every tick would hammer whatever failed.
         let mut q = queue(vec![entry(1, State::AwaitingImport)], &[1]);
         q.set_work(1, EntryWork::Failed("no".into()));
+        assert_eq!(next_step(&q, true, false), Step::Idle);
+    }
+
+    #[test]
+    fn a_cancelled_import_is_not_asked_again() {
+        let mut q = queue(vec![entry(1, State::AwaitingImport)], &[]);
+        q.set_work(1, EntryWork::Declined);
         assert_eq!(next_step(&q, true, false), Step::Idle);
     }
 

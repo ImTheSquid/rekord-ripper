@@ -58,6 +58,11 @@ pub fn entry_state(session: &Session, entry: &Entry) -> (String, Tone, Option<No
     if let Some(work) = session.queue.work_for(entry.id) {
         return match work {
             EntryWork::Failed(why) => (format!("failed — {why}"), Tone::Bad, None),
+            EntryWork::Declined => (
+                work.tag().to_string(),
+                Tone::Muted,
+                Some(NoticeAction::ImportDownloads),
+            ),
             EntryWork::Ready { .. } | EntryWork::Planned(_) => {
                 (work.tag().to_string(), Tone::Good, None)
             }

@@ -29,29 +29,13 @@ struct AppCommands: Commands {
                 get: { model.copyLock }, set: { model.setCopyOptions(replace: model.copyReplace, lock: $0) }))
             Divider()
             Toggle("Allow Writes While Rekordbox Is Running", isOn: Binding(
-                get: { model.bypassRekordboxCheck }, set: { setBypass($0) }))
+                get: { model.bypassRekordboxCheck },
+                set: { $0 ? confirmBypassRekordboxCheck(model) : model.setBypassRekordboxCheck(false) }))
         }
 
         CommandGroup(replacing: .help) {
             Button("Search Syntax") { showSearchHelp() }
                 .keyboardShortcut("?", modifiers: .command)
-        }
-    }
-
-    /// Off by default and never remembered: the GUI equivalent of the CLI's
-    /// deliberately unwieldy override flag.
-    @MainActor
-    private func setBypass(_ on: Bool) {
-        guard on else { return model.setBypassRekordboxCheck(false) }
-        let alert = NSAlert()
-        alert.alertStyle = .critical
-        alert.messageText = "Write to master.db while rekordbox is open?"
-        alert.informativeText = "Rekordbox keeps its own copy of the database in memory and may overwrite "
-            + "or corrupt these changes. This lasts until you quit Rekord Ripper."
-        alert.addButton(withTitle: "Cancel")
-        alert.addButton(withTitle: "Allow Writes")
-        if alert.runModal() == .alertSecondButtonReturn {
-            model.setBypassRekordboxCheck(true)
         }
     }
 
@@ -73,5 +57,21 @@ struct AppCommands: Commands {
         Every term matches as a substring. A numeric query is an exact track ID.
         """
         alert.runModal()
+    }
+}
+
+/// Off by default and never remembered: the GUI equivalent of the CLI's
+/// deliberately unwieldy override flag.
+@MainActor
+func confirmBypassRekordboxCheck(_ model: SessionModel) {
+    let alert = NSAlert()
+    alert.alertStyle = .critical
+    alert.messageText = "Write to master.db while rekordbox is open?"
+    alert.informativeText = "Rekordbox keeps its own copy of the database in memory and may overwrite "
+        + "or corrupt these changes. This lasts until you quit Rekord Ripper."
+    alert.addButton(withTitle: "Cancel")
+    alert.addButton(withTitle: "Allow Writes")
+    if alert.runModal() == .alertSecondButtonReturn {
+        model.setBypassRekordboxCheck(true)
     }
 }

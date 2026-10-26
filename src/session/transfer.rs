@@ -1,7 +1,6 @@
 //! The transfer screen's batch: one source's analysis onto chosen destinations.
 
 use crate::analysis::{self, Plan};
-use crate::db::safety_preflight;
 
 use super::Session;
 use super::confirm::{Batch, ConfirmKind};
@@ -40,10 +39,9 @@ impl Session {
             return false;
         };
 
-        if let Err(e) = safety_preflight(self.safety) {
+        if !self.preflight() {
             // Put the batch back so the user can read the confirmation again.
             self.confirmations.open(Batch::Transfer(batch));
-            self.status.err(format!("{e}"));
             return false;
         }
 

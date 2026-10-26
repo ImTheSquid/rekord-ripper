@@ -37,6 +37,8 @@ final class SessionModel {
     @ObservationIgnored private var offersBySrc: [String: [Offer]] = [:]
     private(set) var shopStates: [String: Int64] = [:]
     @ObservationIgnored private var searched = Set<String>()
+    /// The last multi-track search, which the session works through in batches.
+    @ObservationIgnored private var lastBasket = Set<String>()
     private(set) var fetch = FetchStatus()
     private(set) var fetchQueue: [String] = []
     private(set) var entries: [QueueEntry] = []
@@ -282,6 +284,7 @@ final class SessionModel {
 
     func findBetterCopies(_ ids: Set<Track.ID>) {
         searched.formUnion(ids)
+        if ids.count > 1 { lastBasket = ids }
         let csv = ids.sorted().joined(separator: ",")
         let one = ids.count == 1 ? ids.first : nil
         send { core in
@@ -338,6 +341,11 @@ final class SessionModel {
     }
 
     func perform(_ notice: Notice) {
+        switch notice.step {
+        case .nextBasketBatch: return findBetterCopies(lastBasket)
+        case .allowWrites: return confirmBypassRekordboxCheck(self)
+        default: break
+        }
         guard let core else { return }
         let id = notice.id
         if notice.step == .importDownloads { ask(.importRows) }

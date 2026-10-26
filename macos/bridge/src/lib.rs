@@ -252,7 +252,8 @@ mod ffi {
         fn level(&self) -> u8;
         fn text(&self) -> String;
         // 0 none, 1 open buy page, 2 search again, 3 fill basket, 4 next basket
-        // batch, 5 import, 6 check, 7 force, 8 forget, 9 review.
+        // batch, 5 import, 6 check, 7 force, 8 forget, 9 review, 10 allow
+        // writes while rekordbox runs.
         fn action(&self) -> u8;
     }
 
@@ -385,6 +386,7 @@ fn action_code(action: Option<&NoticeAction>) -> u8 {
         Some(NoticeAction::ForceEntry { .. }) => 7,
         Some(NoticeAction::ForgetEntry { .. }) => 8,
         Some(NoticeAction::Review(_)) => 9,
+        Some(NoticeAction::AllowWritesWhileRunning) => 10,
     }
 }
 
@@ -860,8 +862,11 @@ impl CoreSession {
             NoticeAction::ForceEntry { entry_id } => self.0.start_force(entry_id),
             NoticeAction::ForgetEntry { entry_id } => self.0.forget_entry(entry_id),
             NoticeAction::Review(kind) => return confirm_code(kind),
-            // The basket is the TUI's; the app searches its selection instead.
-            NoticeAction::FillBasket | NoticeAction::NextBasketBatch { .. } => {}
+            // The app takes these itself: it searches its selection rather
+            // than a basket, and asks before allowing writes.
+            NoticeAction::FillBasket
+            | NoticeAction::NextBasketBatch { .. }
+            | NoticeAction::AllowWritesWhileRunning => {}
         }
         0
     }
