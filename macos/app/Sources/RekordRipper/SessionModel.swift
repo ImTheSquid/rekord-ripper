@@ -49,6 +49,7 @@ final class SessionModel {
     private(set) var toast: Notice?
     @ObservationIgnored private var toastTimer: Task<Void, Never>?
     @ObservationIgnored private var polledOnce = false
+    @ObservationIgnored private var localNotices: UInt64 = 0
 
     // Confirmations.
     private(set) var confirmations: [Confirmation] = []
@@ -60,6 +61,9 @@ final class SessionModel {
 
     var activityShown = false
     var inspectorShown = true
+    private(set) var autoAdvance = true
+    private(set) var importEnabled = true
+    private(set) var configPath = ""
 
     init() {
         do {
@@ -71,9 +75,22 @@ final class SessionModel {
             openError = "\(error)"
             return
         }
-        let auto = UserDefaults.standard.object(forKey: "autoAdvance") as? Bool ?? true
-        setAutoAdvance(auto)
-        loop = Task { [weak self] in await self?.pollLoop() }
+        let defaults = UserDefaults.standard
+        setAutoAdvance(defaults.object(forKey: "autoAdvance") as? Bool ?? true)
+        if defaults.object(forKey: "replaceCues") != nil {
+            setCopyOptions(replace: defaults.bool(forKey: "replaceCues"), lock: defaults.bool(forKey: "lockAfterCopy"))
+        }
+        Notifier.shared.onOpen = { [weak self] kind in
+            if let kind { self?.present(kind) }
+        }
+        Notifier.shared.start()
+        loop = Task { [weak self] in
+            guard let core = self?.core else { return }
+            let (enabled, path) = await core.run { ($0.import_enabled(), $0.config_path().toString()) }
+            self?.importEnabled = enabled
+            self?.configPath = path
+            await self?.pollLoop()
+        }
     }
 
     // MARK: Polling
@@ -127,9 +144,15 @@ final class SessionModel {
             offersBySrc = Dictionary(grouping: s.offers, by: \.srcId)
         }
         assign(\.shopStates, s.shopStates)
+        if fetch.kind == .running, s.fetch.kind == .done {
+            Notifier.shared.post("Download finished", s.fetch.text)
+        } else if fetch.kind == .running, s.fetch.kind == .failed {
+            Notifier.shared.post("Download failed", s.fetch.text)
+        }
         assign(\.fetch, s.fetch)
         assign(\.fetchQueue, s.fetchQueue)
         if s.entries != entries {
+            notifySettled(old: entries, new: s.entries)
             entries = s.entries
             entriesBySrc = Dictionary(grouping: s.entries, by: \.srcId)
         }
@@ -168,8 +191,32 @@ final class SessionModel {
             let asked = requested.removeValue(forKey: c.kind).map { -$0.timeIntervalSinceNow < 120 } ?? false
             if asked, presented == nil {
                 presented = c.kind
+            } else if !asked {
+                Notifier.shared.post(c.waitingLabel, c.title, review: c.kind)
             }
         }
+    }
+
+    /// Entries the pipeline just applied or rejected.
+    private func notifySettled(old: [QueueEntry], new: [QueueEntry]) {
+        let before = Dictionary(uniqueKeysWithValues: old.map { ($0.id, $0.state) })
+        for e in new where before[e.id] != nil && before[e.id] != e.state {
+            // The core's stored-state labels lead with the state's name.
+            let name = e.title.isEmpty ? e.fileName : e.title
+            if e.state.hasPrefix("applied") {
+                Notifier.shared.post("Better copy applied", name)
+            } else if e.state.hasPrefix("rejected") {
+                Notifier.shared.post("Better copy rejected", "\(name): \(e.state)")
+            }
+        }
+    }
+
+    /// A notice from the app itself rather than the session.
+    private func say(_ text: String, _ level: StatusMessage.Level) {
+        localNotices += 1
+        let notice = Notice(id: .max - localNotices, level: level, text: text, step: .none)
+        notices = Array((notices + [notice]).suffix(50))
+        toast = notice
     }
 
     // MARK: Reading
@@ -314,6 +361,8 @@ final class SessionModel {
     }
 
     func setCopyOptions(replace: Bool, lock: Bool) {
+        UserDefaults.standard.set(replace, forKey: "replaceCues")
+        UserDefaults.standard.set(lock, forKey: "lockAfterCopy")
         send { $0.set_copy_opts(replace, lock) }
     }
 
@@ -322,8 +371,25 @@ final class SessionModel {
     }
 
     func setAutoAdvance(_ on: Bool) {
+        autoAdvance = on
         UserDefaults.standard.set(on, forKey: "autoAdvance")
         send { $0.set_auto_advance(on) }
+    }
+
+    /// Something dropped on `target`: another track means copy its analysis
+    /// here; an audio file means it is a better copy of this one.
+    func drop(_ items: [TrackDrop], on target: Track.ID) {
+        let tracks = items.compactMap { if case let .track(id) = $0 { id } else { nil } }
+        let files = items.compactMap { if case let .file(url) = $0 { url } else { nil } }
+        if let file = files.first {
+            guard files.count == 1 else { return say("Drop one file at a time.", .warn) }
+            let path = file.path
+            send { _ = $0.queue_file(target, path) }
+        } else if let src = tracks.first {
+            guard tracks.count == 1 else { return say("Drop one track at a time onto the track to copy it to.", .warn) }
+            guard src != target else { return }
+            reviewTransfer(from: src, to: [target])
+        }
     }
 
     // MARK: Quitting

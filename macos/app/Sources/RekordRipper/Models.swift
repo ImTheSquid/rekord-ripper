@@ -137,6 +137,13 @@ struct Notice: Identifiable, Equatable {
     let text: String
     let step: Step
 
+    init(id: UInt64, level: StatusMessage.Level, text: String, step: Step) {
+        self.id = id
+        self.level = level
+        self.text = text
+        self.step = step
+    }
+
     init(_ v: NoticeViewRef) {
         id = v.id()
         level = StatusMessage.Level(rawValue: v.level()) ?? .info
@@ -444,5 +451,24 @@ enum Upgrade: Equatable {
         case let .found(offer, _): offer.requiresPurchase ? .plain : .good
         case let .entry(e): e.tone
         }
+    }
+}
+
+/// What can be dropped on a track row.
+enum TrackDrop: Transferable {
+    case track(Track.ID)
+    case file(URL)
+
+    /// Marks a dragged track id, so dropped text is not taken for one.
+    static let prefix = "rekord-ripper-track:"
+
+    struct NotATrack: Error {}
+
+    static var transferRepresentation: some TransferRepresentation {
+        ProxyRepresentation(importing: { (url: URL) in TrackDrop.file(url) })
+        ProxyRepresentation(importing: { (text: String) in
+            guard text.hasPrefix(prefix) else { throw NotATrack() }
+            return TrackDrop.track(String(text.dropFirst(prefix.count)))
+        })
     }
 }

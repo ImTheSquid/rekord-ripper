@@ -52,10 +52,7 @@ struct TrackHeader: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
-            RoundedRectangle(cornerRadius: 6)
-                .fill(.quaternary)
-                .frame(width: 72, height: 72)
-                .overlay { Image(systemName: "music.note").font(.title).foregroundStyle(.secondary) }
+            ArtworkView(path: track.artworkPath, size: 72)
             VStack(alignment: .leading, spacing: 3) {
                 Text(track.displayTitle).font(.headline).lineLimit(2)
                 Text(track.artist).foregroundStyle(.secondary).lineLimit(1)

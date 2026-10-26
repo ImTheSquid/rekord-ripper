@@ -14,6 +14,10 @@ struct RekordRipperApp: App {
         }
         .defaultSize(width: 1380, height: 820)
         .commands { AppCommands(model: model) }
+
+        Settings {
+            SettingsView().environment(model)
+        }
     }
 }
 

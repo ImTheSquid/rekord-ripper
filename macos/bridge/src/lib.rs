@@ -159,6 +159,9 @@ mod ffi {
         // The new entry's id, or -1.
         fn queue_file(&mut self, src_id: &str, path: &str) -> i64;
         fn set_auto_advance(&mut self, on: bool);
+        // Whether the config lets downloads become rekordbox rows.
+        fn import_enabled(&self) -> bool;
+        fn config_path(&self) -> String;
     }
 
     extern "Rust" {
@@ -892,6 +895,16 @@ impl CoreSession {
 
     fn set_auto_advance(&mut self, on: bool) {
         self.0.set_auto_advance(on);
+    }
+
+    fn import_enabled(&self) -> bool {
+        self.0.cfg.import.insert_content_rows
+    }
+
+    fn config_path(&self) -> String {
+        rekord_ripper::paths::config_path(None)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default()
     }
 }
 

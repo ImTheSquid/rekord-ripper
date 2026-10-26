@@ -6,7 +6,11 @@ struct LibraryTable: View {
 
     var body: some View {
         @Bindable var model = model
-        Table(rows, selection: $model.selection, sortOrder: $sortOrder) {
+        Table(of: Track.self, selection: $model.selection, sortOrder: $sortOrder) {
+            TableColumn("") { t in
+                ArtworkView(path: t.artworkPath, size: 20)
+            }
+            .width(24)
             TableColumn("Title", value: \.title) { t in
                 HStack(spacing: 4) {
                     if t.missing {
@@ -48,6 +52,12 @@ struct LibraryTable: View {
                 UpgradeCell(upgrade: model.upgrade(for: t.id))
             }
             .width(min: 120, ideal: 220)
+        } rows: {
+            ForEach(rows) { t in
+                TableRow(t)
+                    .draggable(TrackDrop.prefix + t.id)
+                    .dropDestination(for: TrackDrop.self) { model.drop($0, on: t.id) }
+            }
         }
         .contextMenu(forSelectionType: Track.ID.self) { ids in
             if !ids.isEmpty {
