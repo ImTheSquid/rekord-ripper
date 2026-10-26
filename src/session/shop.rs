@@ -556,6 +556,9 @@ impl Session {
                     self.fetched.insert(q.item.clone());
                 }
                 let queued = self.queue_transfer_for(done.and_then(|q| q.src), &paths);
+                if queued.is_some() {
+                    self.after_queueing();
+                }
                 match (queued, lossy) {
                     (Some(id), _) => {
                         self.status
@@ -733,7 +736,7 @@ impl Session {
     ///
     /// Returns the queued entry id. `None` when there was no source track,
     /// which is a legitimate "just download it" case.
-    fn queue_transfer_for(&mut self, src_id: Option<String>, paths: &[std::path::PathBuf]) -> Option<i64> {
+    pub(super) fn queue_transfer_for(&mut self, src_id: Option<String>, paths: &[std::path::PathBuf]) -> Option<i64> {
         let src_id = src_id?;
         let src = crate::analysis::load_track(&self.db, &src_id).ok()?;
         let store = crate::pending::PendingStore::open().ok()?;

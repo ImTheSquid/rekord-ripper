@@ -8,6 +8,7 @@
 pub mod confirm;
 pub mod diff;
 pub mod filter;
+pub mod pipeline;
 pub mod queue;
 pub mod shop;
 pub mod transfer;
@@ -176,6 +177,8 @@ pub struct Session {
 
     /// Confirmations waiting on a yes, each with the batch it would write.
     pub confirmations: Confirmations,
+    /// Move downloads through import and the fingerprint gate unasked.
+    auto_advance: bool,
 }
 
 impl Session {
@@ -213,6 +216,7 @@ impl Session {
             queue: QueueState::default(),
             store: crate::pending::PendingStore::open().ok(),
             confirmations: Confirmations::default(),
+            auto_advance: false,
         };
         session
             .status
@@ -319,6 +323,7 @@ impl Session {
                 }
             }
         }
+        self.advance();
     }
 
     /// Searches outstanding — not every job. Frontends phrase this count as

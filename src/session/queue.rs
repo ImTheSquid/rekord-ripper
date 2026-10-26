@@ -502,7 +502,7 @@ impl Session {
     }
 
     /// Submit the next entry needing a verdict. False when there are none left.
-    fn submit_next_gate(&mut self) -> bool {
+    pub(super) fn submit_next_gate(&mut self) -> bool {
         let generation = self.queue.current_generation();
         let candidates: Vec<Entry> = self
             .queue
