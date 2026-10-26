@@ -55,6 +55,7 @@ actor CoreActor {
     private let core: CoreSession
     private var revision: UInt64 = .max
     private var lastNotice: UInt64 = 0
+    private var latestNotice: Notice?
     private var visibleKey: VisibleKey?
     private var visible: [Int]?
     private var inspectionKey: InspectionKey?
@@ -118,6 +119,11 @@ actor CoreActor {
 
         s.notices = core.notices(lastNotice).map(Notice.init)
         lastNotice = s.notices.last?.id ?? lastNotice
+        // A notice can be reworded in place, which keeps its id.
+        if let latest = core.latest_notice().map(Notice.init).first, latest != latestNotice {
+            latestNotice = latest
+            if s.notices.last?.id != latest.id { s.notices.append(latest) }
+        }
         s.status = StatusMessage(core.status())
         s.rekordboxRunning = core.rekordbox_running()
         s.bypassRekordboxCheck = core.bypass_rekordbox_check()

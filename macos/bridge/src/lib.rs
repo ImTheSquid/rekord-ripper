@@ -143,6 +143,8 @@ mod ffi {
 
         // Notices after `after`, oldest first.
         fn notices(&self, after: u64) -> Vec<NoticeView>;
+        // The newest notice, which may have been reworded since it was read.
+        fn latest_notice(&self) -> Vec<NoticeView>;
         // Takes the notice's step. A review step is the frontend's to show:
         // this returns its confirm kind (as `confirm`), otherwise 0.
         fn perform_notice(&mut self, id: u64) -> u8;
@@ -814,6 +816,17 @@ impl CoreSession {
             .since(after)
             .cloned()
             .map(NoticeView)
+            .collect()
+    }
+
+    fn latest_notice(&self) -> Vec<NoticeView> {
+        self.0
+            .status
+            .since(0)
+            .last()
+            .cloned()
+            .map(NoticeView)
+            .into_iter()
             .collect()
     }
 

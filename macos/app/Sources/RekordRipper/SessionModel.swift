@@ -171,7 +171,11 @@ final class SessionModel {
 
     private func receive(_ new: [Notice]) {
         guard !new.isEmpty else { return }
-        notices = Array((notices + new).suffix(50))
+        var merged = notices
+        for n in new {
+            if let i = merged.firstIndex(where: { $0.id == n.id }) { merged[i] = n } else { merged.append(n) }
+        }
+        notices = Array(merged.suffix(50))
         // What was said before the window opened is history, not news.
         guard polledOnce, let latest = new.last else { return }
         toast = latest

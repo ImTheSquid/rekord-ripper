@@ -81,10 +81,8 @@ struct MainView: View {
         .navigationSubtitle("\(model.visibleTracks.count) tracks")
         .searchable(text: $model.query, placement: .toolbar, prompt: "Search")
         .searchSuggestions {
-            if model.query.isEmpty {
-                ForEach(SearchHint.all, id: \.self) { hint in
-                    Text(hint).searchCompletion(hint + " ")
-                }
+            ForEach(SearchHint.completing(model.query), id: \.self) { hint in
+                Text(hint.term).searchCompletion(hint.query)
             }
         }
         .toolbar {
@@ -113,8 +111,27 @@ struct MainView: View {
     }
 }
 
-enum SearchHint {
-    static let all = ["is:lossless", "is:lossy", "is:stream", "is:missing", "has:cues", "-is:locked", "bpm:120-130", "p:"]
+struct SearchHint: Hashable {
+    let term: String
+    /// The whole query with the term completed.
+    let query: String
+
+    private static let terms = [
+        "is:lossless", "is:lossy", "is:stream", "is:cloud", "is:local", "is:missing", "is:locked",
+        "has:cues", "type:flac", "type:mp3", "bpm:120-130", "len:>6m", "p:",
+    ]
+
+    /// Terms the word being typed could become; none until it is typed.
+    static func completing(_ query: String) -> [SearchHint] {
+        let word = query.split(separator: " ", omittingEmptySubsequences: false).last.map(String.init) ?? ""
+        let bare = word.hasPrefix("-") ? String(word.dropFirst()) : word
+        guard !bare.isEmpty else { return [] }
+        let head = query.dropLast(word.count)
+        let sign = word.hasPrefix("-") ? "-" : ""
+        return terms
+            .filter { $0.hasPrefix(bare.lowercased()) && $0 != bare.lowercased() }
+            .map { SearchHint(term: sign + $0, query: head + sign + $0 + ($0.hasSuffix(":") ? "" : " ")) }
+    }
 }
 
 extension PlaylistNode {
