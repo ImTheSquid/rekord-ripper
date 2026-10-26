@@ -30,6 +30,33 @@ awake: a Soulseek queue position can take hours, and a sleeping laptop loses it.
 `rekord-ripper auto` copies automatically, and `rekord-ripper dump` prints the
 database. See the help pages for the full options.
 
+### The macOS app
+
+The same three screens — transfer, shop and the download queue — as a native
+SwiftUI app. It is built separately from `cargo install`, and needs Xcode or the
+Command Line Tools:
+
+```bash
+scripts/build-macos-app.sh
+open target/macos/RekordRipper.app
+```
+
+Every write goes through the same gates as the TUI: a confirmation listing what
+will change, the rekordbox-running refusal, and the fingerprint check on queued
+downloads. Writing while rekordbox is open is under **Library**, asks first, and
+resets when the app quits. The app is signed ad hoc, so on another Mac Gatekeeper
+asks before the first launch.
+
+`REKORDBOX_DIR` points it at a copy of your library, for trying it out:
+
+```bash
+REKORDBOX_DIR=/path/to/copy target/macos/RekordRipper.app/Contents/MacOS/RekordRipper
+```
+
+The app is a thin layer over `rekord_ripper::session`, which holds everything the
+TUI and the app share. `macos/bridge` exposes it to Swift through swift-bridge;
+another platform would add its own binding over the same module.
+
 ### Searching your library
 
 Every `/` box in the TUI and `rekord-ripper dump` accept the same query syntax,
