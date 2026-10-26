@@ -349,6 +349,49 @@ struct QueueEntry: Identifiable, Hashable {
     }
 }
 
+/// One track's change under a transfer, as before and after.
+struct PlanReview: Identifiable, Equatable {
+    struct Change: Identifiable, Equatable {
+        let label: String
+        let before: String
+        let after: String
+
+        var id: String { label }
+        var changed: Bool { before != after }
+    }
+
+    let srcId: String
+    let srcTitle: String
+    let srcArtist: String
+    let dstId: String
+    let dstTitle: String
+    let dstArtist: String
+    let changes: [Change]
+    let warnings: [String]
+    let lengthMs: Int64?
+    let cuesBefore: [CueMark]
+    let cuesAfter: [CueMark]
+
+    var id: String { dstId }
+
+    init(_ v: PlanReviewViewRef) {
+        srcId = v.src_id().toString()
+        srcTitle = v.src_title().toString()
+        srcArtist = v.src_artist().toString()
+        dstId = v.dst_id().toString()
+        dstTitle = v.dst_title().toString()
+        dstArtist = v.dst_artist().toString()
+        changes = v.changes().map {
+            Change(label: $0.label().toString(), before: $0.before().toString(), after: $0.after().toString())
+        }
+        warnings = v.warnings().map { $0.as_str().toString() }
+        let len = v.length_ms()
+        lengthMs = len > 0 ? len : nil
+        cuesBefore = v.cues_before().map(CueMark.init)
+        cuesAfter = v.cues_after().map(CueMark.init)
+    }
+}
+
 struct Confirmation: Equatable, Identifiable {
     enum Kind: UInt8 { case transfer = 1, importRows, forceApply, clearQueue }
     struct Line: Equatable, Hashable {
@@ -360,6 +403,8 @@ struct Confirmation: Equatable, Identifiable {
     let title: String
     let accept: String
     let lines: [Line]
+    /// For a transfer or force-apply: what each track would become.
+    var plans: [PlanReview] = []
 
     var id: Kind { kind }
     var isDestructive: Bool { kind == .forceApply || kind == .clearQueue }

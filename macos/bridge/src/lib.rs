@@ -18,6 +18,7 @@ use rekord_ripper::pending::Entry;
 use rekord_ripper::playlists::PlaylistNode;
 use rekord_ripper::session::collections::{Collection, Direction, Scope, Suggestion};
 use rekord_ripper::session::filter::{dst_visible, src_visible};
+use rekord_ripper::session::review::{Change, PlanReview};
 use rekord_ripper::session::shop::{FetchState, OfferFetch, ShopState, ShopTrackState};
 use rekord_ripper::session::view::{self, Tone};
 use rekord_ripper::session::{ConfirmKind, Notice, NoticeAction, Session, StatusLevel};
@@ -150,6 +151,8 @@ mod ffi {
         fn open_confirms(&self) -> Vec<u8>;
         fn confirm_for(&self, kind: u8) -> ConfirmFfi;
         fn confirm_lines_for(&self, kind: u8) -> Vec<ToneLine>;
+        // What a transfer or force-apply confirmation would write, per track.
+        fn plan_reviews(&self, kind: u8) -> Vec<PlanReviewView>;
         fn accept(&mut self, kind: u8) -> bool;
         fn cancel(&mut self, kind: u8);
 
@@ -212,6 +215,29 @@ mod ffi {
         fn end_ms(&self) -> i64;
         // 0 memory cue, otherwise a hot cue slot.
         fn kind(&self) -> i64;
+    }
+
+    extern "Rust" {
+        type PlanReviewView;
+        fn src_id(&self) -> String;
+        fn src_title(&self) -> String;
+        fn src_artist(&self) -> String;
+        fn dst_id(&self) -> String;
+        fn dst_title(&self) -> String;
+        fn dst_artist(&self) -> String;
+        fn changes(&self) -> Vec<ChangeView>;
+        fn warnings(&self) -> Vec<String>;
+        // The length once written, or -1.
+        fn length_ms(&self) -> i64;
+        fn cues_before(&self) -> Vec<CueMarkView>;
+        fn cues_after(&self) -> Vec<CueMarkView>;
+    }
+
+    extern "Rust" {
+        type ChangeView;
+        fn label(&self) -> String;
+        fn before(&self) -> String;
+        fn after(&self) -> String;
     }
 
     extern "Rust" {
@@ -304,6 +330,10 @@ pub struct SuggestionView(Suggestion);
 pub struct CueMarkView(CueMark);
 
 pub struct NoticeView(Notice);
+
+pub struct PlanReviewView(PlanReview);
+
+pub struct ChangeView(Change);
 
 /// Codes in the order of `Collection::ALL`.
 fn collection_code(code: u8) -> Option<Collection> {
@@ -835,6 +865,15 @@ impl CoreSession {
             .unwrap_or_default()
     }
 
+    fn plan_reviews(&self, kind: u8) -> Vec<PlanReviewView> {
+        confirm_kind(kind)
+            .map(|k| self.0.plan_reviews(k))
+            .unwrap_or_default()
+            .into_iter()
+            .map(PlanReviewView)
+            .collect()
+    }
+
     fn accept(&mut self, kind: u8) -> bool {
         confirm_kind(kind).is_some_and(|k| self.0.accept(k))
     }
@@ -967,6 +1006,59 @@ impl CueMarkView {
     }
     fn kind(&self) -> i64 {
         self.0.kind
+    }
+}
+
+impl PlanReviewView {
+    fn src_id(&self) -> String {
+        self.0.src_id.clone()
+    }
+    fn src_title(&self) -> String {
+        self.0.src_title.clone()
+    }
+    fn src_artist(&self) -> String {
+        self.0.src_artist.clone()
+    }
+    fn dst_id(&self) -> String {
+        self.0.dst_id.clone()
+    }
+    fn dst_title(&self) -> String {
+        self.0.dst_title.clone()
+    }
+    fn dst_artist(&self) -> String {
+        self.0.dst_artist.clone()
+    }
+    fn changes(&self) -> Vec<ChangeView> {
+        self.0.changes.iter().cloned().map(ChangeView).collect()
+    }
+    fn warnings(&self) -> Vec<String> {
+        self.0.warnings.clone()
+    }
+    fn length_ms(&self) -> i64 {
+        self.0.length_ms.unwrap_or(-1)
+    }
+    fn cues_before(&self) -> Vec<CueMarkView> {
+        self.0
+            .cues_before
+            .iter()
+            .copied()
+            .map(CueMarkView)
+            .collect()
+    }
+    fn cues_after(&self) -> Vec<CueMarkView> {
+        self.0.cues_after.iter().copied().map(CueMarkView).collect()
+    }
+}
+
+impl ChangeView {
+    fn label(&self) -> String {
+        self.0.label.to_string()
+    }
+    fn before(&self) -> String {
+        self.0.before.clone()
+    }
+    fn after(&self) -> String {
+        self.0.after.clone()
     }
 }
 

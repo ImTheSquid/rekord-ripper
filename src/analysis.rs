@@ -836,6 +836,62 @@ fn format_header_line(h: &TrackHeader) -> String {
     )
 }
 
+#[cfg(test)]
+impl Plan {
+    /// A plan that writes `cues` (in, out, kind) and the given fields, for
+    /// tests outside this module.
+    pub(crate) fn stub(
+        src: TrackHeader,
+        dst: TrackHeader,
+        cues: &[(i64, i64, i64)],
+        delete_existing_cues: bool,
+    ) -> Self {
+        let new_cues = cues
+            .iter()
+            .map(|&(in_msec, out_msec, kind)| NewCue {
+                id: random_numeric_id(),
+                uuid: Uuid::new_v4().to_string(),
+                in_msec: Some(in_msec),
+                in_frame: None,
+                in_mpeg_frame: None,
+                in_mpeg_abs: None,
+                out_msec: Some(out_msec),
+                out_frame: None,
+                out_mpeg_frame: None,
+                out_mpeg_abs: None,
+                kind: Some(kind),
+                color: None,
+                color_table_index: None,
+                active_loop: None,
+                comment: None,
+                beat_loop_size: None,
+                cue_microsec: None,
+                in_point_seek_info: None,
+                out_point_seek_info: None,
+            })
+            .collect();
+        Plan {
+            set_bpm: src.bpm,
+            set_length: src.length,
+            src,
+            dst,
+            opts: CopyOpts::default(),
+            file_copies: Vec::new(),
+            new_analysis_data_path: String::new(),
+            delete_existing_cues,
+            delete_existing_censors: false,
+            new_cues,
+            new_censors: Vec::new(),
+            new_mixer_param: None,
+            new_content_cue: None,
+            new_content_active_censor: None,
+            set_key_id: None,
+            set_analysed: 0,
+            warnings: Vec::new(),
+        }
+    }
+}
+
 impl Plan {
     /// The cues this plan writes. The destination keeps its own as well unless
     /// `delete_existing_cues`.

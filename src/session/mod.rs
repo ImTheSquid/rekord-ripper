@@ -11,6 +11,7 @@ pub mod diff;
 pub mod filter;
 pub mod pipeline;
 pub mod queue;
+pub mod review;
 pub mod shop;
 pub mod transfer;
 pub mod view;

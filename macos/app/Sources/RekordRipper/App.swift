@@ -95,7 +95,7 @@ struct MainView: View {
             }
         }
         .sheet(item: Binding(get: { model.presentedConfirmation }, set: { if $0 == nil { model.presented = nil } })) {
-            ConfirmSheet(confirmation: $0)
+            ReviewSheet(confirmation: $0)
         }
     }
 
@@ -162,48 +162,5 @@ struct RekordboxBanner: View {
         .padding(.vertical, 6)
         .foregroundStyle(.white)
         .background(model.bypassRekordboxCheck ? Color.red : Color.orange)
-    }
-}
-
-struct ConfirmSheet: View {
-    @Environment(SessionModel.self) private var model
-    let confirmation: Confirmation
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Label(confirmation.title, systemImage: confirmation.isDestructive ? "exclamationmark.octagon" : "checkmark.shield")
-                .font(.headline)
-                .foregroundStyle(confirmation.isDestructive ? .red : .primary)
-            ScrollView {
-                VStack(alignment: .leading, spacing: 2) {
-                    ForEach(Array(confirmation.lines.enumerated()), id: \.offset) { _, line in
-                        Text(line.text)
-                            .font(.system(.body, design: .monospaced))
-                            .fontWeight(line.tone == .strong ? .semibold : .regular)
-                            .foregroundStyle(line.tone.color)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                }
-                .textSelection(.enabled)
-                .padding(8)
-            }
-            .background(.background.secondary, in: .rect(cornerRadius: 6))
-            if model.status.level == .error {
-                Text(model.status.text).foregroundStyle(.red).font(.callout)
-            }
-            HStack {
-                Button("Later") { model.presented = nil }
-                    .help("Keep this waiting in Activity")
-                Spacer()
-                Button("Cancel", role: .cancel) { model.cancel(confirmation.kind) }
-                    .keyboardShortcut(.cancelAction)
-                Button(confirmation.accept, role: confirmation.isDestructive ? .destructive : nil) {
-                    model.accept(confirmation.kind)
-                }
-                .keyboardShortcut(confirmation.isDestructive ? nil : .defaultAction)
-            }
-        }
-        .padding()
-        .frame(minWidth: 620, idealWidth: 720, minHeight: 360, idealHeight: 520)
     }
 }

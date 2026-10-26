@@ -58,6 +58,7 @@ actor CoreActor {
     private var visibleKey: VisibleKey?
     private var visible: [Int]?
     private var inspectionKey: InspectionKey?
+    private var reviews: [UInt8: (lines: [Confirmation.Line], plans: [PlanReview])] = [:]
 
     private struct VisibleKey: Equatable {
         let revision: UInt64
@@ -150,6 +151,16 @@ actor CoreActor {
         let lines = core.confirm_lines_for(code).map {
             Confirmation.Line(tone: Tone(rawValue: $0.tone()) ?? .plain, text: $0.text().toString())
         }
-        return Confirmation(kind: kind, title: c.title.toString(), accept: c.accept.toString(), lines: lines)
+        // The lines name every track and warning, so equal lines mean the same
+        // batch, and its cues need not be read again.
+        let plans: [PlanReview]
+        if let cached = reviews[code], cached.lines == lines {
+            plans = cached.plans
+        } else {
+            plans = core.plan_reviews(code).map(PlanReview.init)
+            reviews[code] = (lines, plans)
+        }
+        return Confirmation(kind: kind, title: c.title.toString(), accept: c.accept.toString(), lines: lines,
+                            plans: plans)
     }
 }
