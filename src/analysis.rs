@@ -394,6 +394,49 @@ fn load_new_cues_from_src(db: &MasterDb, src_id: &str, _dst_uuid: &str) -> Resul
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// A cue as a timeline draws it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CueMark {
+    pub ms: i64,
+    /// Where a loop ends; `None` for a plain cue.
+    pub end_ms: Option<i64>,
+    /// `djmdCue.Kind`: 0 for a memory cue, otherwise a hot cue slot.
+    pub kind: i64,
+}
+
+impl CueMark {
+    fn new(in_msec: Option<i64>, out_msec: Option<i64>, kind: Option<i64>) -> Option<Self> {
+        let ms = in_msec?;
+        Some(Self {
+            ms,
+            // rekordbox writes -1 when there is no loop.
+            end_ms: out_msec.filter(|&end| end > ms),
+            kind: kind.unwrap_or(0),
+        })
+    }
+
+    pub fn hot(&self) -> bool {
+        self.kind != 0
+    }
+}
+
+/// A track's current cues, in time order.
+pub fn cue_marks(db: &MasterDb, content_id: &str) -> Result<Vec<CueMark>> {
+    let mut stmt = db.conn.prepare(
+        "SELECT InMsec, OutMsec, Kind FROM djmdCue
+         WHERE ContentID = ?1 AND (rb_local_deleted = 0 OR rb_local_deleted IS NULL)
+         ORDER BY InMsec",
+    )?;
+    let rows = stmt.query_map(params![content_id], |r| {
+        Ok(CueMark::new(r.get(0)?, r.get(1)?, r.get(2)?))
+    })?;
+    Ok(rows
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect())
+}
+
 fn load_new_censors_from_src(
     db: &MasterDb,
     src_id: &str,
@@ -794,6 +837,15 @@ fn format_header_line(h: &TrackHeader) -> String {
 }
 
 impl Plan {
+    /// The cues this plan writes. The destination keeps its own as well unless
+    /// `delete_existing_cues`.
+    pub fn cue_marks(&self) -> Vec<CueMark> {
+        self.new_cues
+            .iter()
+            .filter_map(|c| CueMark::new(c.in_msec, c.out_msec, c.kind))
+            .collect()
+    }
+
     pub fn render(&self) -> String {
         use std::fmt::Write;
         let mut s = String::new();
@@ -1092,6 +1144,32 @@ fn _path_marker(_: &Path) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cue_marks_keep_loops_and_drop_deleted_cues() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE djmdCue (ContentID TEXT, InMsec INTEGER, OutMsec INTEGER,
+                Kind INTEGER, rb_local_deleted INTEGER);
+             INSERT INTO djmdCue VALUES
+                ('1', 9000, 13000, 2, 0), ('1', 500, -1, 0, NULL),
+                ('1', 700, -1, 1, 1), ('2', 1, -1, 1, 0), ('1', NULL, -1, 3, 0);",
+        )
+        .unwrap();
+        let db = MasterDb {
+            conn,
+            app_dir: PathBuf::from("."),
+        };
+        let marks = cue_marks(&db, "1").unwrap();
+        assert_eq!(
+            marks,
+            [
+                CueMark { ms: 500, end_ms: None, kind: 0 },
+                CueMark { ms: 9000, end_ms: Some(13000), kind: 2 },
+            ]
+        );
+        assert!(!marks[0].hot() && marks[1].hot());
+    }
 
     #[test]
     fn usn_allocator_assigns_sequential_values_and_returns_max() {

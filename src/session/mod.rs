@@ -5,6 +5,7 @@
 //! they mean by id. A gate that guards a write lives here, so no frontend can
 //! reach the write without it.
 
+pub mod collections;
 pub mod confirm;
 pub mod diff;
 pub mod filter;
@@ -179,6 +180,18 @@ pub struct Session {
     pub confirmations: Confirmations,
     /// Move downloads through import and the fingerprint gate unasked.
     auto_advance: bool,
+    /// Destination ids `copy --auto` would fill, as of the current `rows`.
+    suggested: HashSet<String>,
+}
+
+fn suggested_destinations(db: &MasterDb) -> anyhow::Result<HashSet<String>> {
+    let filter = crate::analysis::AutoFilter {
+        duration_tol_secs: collections::DURATION_TOL_SECS,
+        include_cued: false,
+        limit: None,
+    };
+    let matches = crate::analysis::find_auto_matches(db, filter)?;
+    Ok(matches.into_iter().map(|m| m.dst_id).collect())
 }
 
 impl Session {
@@ -196,6 +209,7 @@ impl Session {
         let worker = worker::Worker::spawn(&cfg, &creds).ok();
 
         let rows = load_rows(&db)?;
+        let suggested = suggested_destinations(&db)?;
         let mut session = Session {
             db,
             safety,
@@ -217,6 +231,7 @@ impl Session {
             store: crate::pending::PendingStore::open().ok(),
             confirmations: Confirmations::default(),
             auto_advance: false,
+            suggested,
         };
         session
             .status
@@ -226,6 +241,7 @@ impl Session {
 
     pub fn reload_rows(&mut self) -> anyhow::Result<()> {
         self.rows = load_rows(&self.db)?;
+        self.suggested = suggested_destinations(&self.db)?;
         self.rows_revision += 1;
         Ok(())
     }

@@ -42,9 +42,10 @@ pub(crate) struct TrackFacts {
 }
 
 /// Where a row's audio actually lives.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Origin {
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Origin {
     /// A file on this machine.
+    #[default]
     Local,
     /// A real file, but one Cloud Library Sync owns — its `FolderPath` is a
     /// `/contents_…` cloud path, so it may or may not be downloaded here.
@@ -79,15 +80,17 @@ pub(crate) fn track_tags(f: TrackFacts) -> String {
     // have a lossy file", which is the question worth asking before shopping.
     // FileType 0 gets none either: rekordbox cannot open it, so it is neither a
     // lossy file you have nor a lossless one.
-    match f.file_type {
-        Some(1) => tags.extend(["mp3", "lossy"]),
-        Some(4) => tags.extend(["m4a", "lossy"]),
-        // ALAC, as rekordbox itself writes it.
-        Some(6) => tags.extend(["m4a", "lossless"]),
-        Some(5) => tags.extend(["flac", "lossless"]),
-        Some(11) => tags.extend(["wav", "lossless"]),
-        Some(12) => tags.extend(["aiff", "lossless"]),
-        _ => {}
+    let format = match f.file_type {
+        Some(1) => Some("mp3"),
+        // AAC and ALAC alike, as rekordbox itself writes them.
+        Some(4 | 6) => Some("m4a"),
+        Some(5) => Some("flac"),
+        Some(11) => Some("wav"),
+        Some(12) => Some("aiff"),
+        _ => None,
+    };
+    if let (Some(format), Some(lossless)) = (format, lossless(f.file_type)) {
+        tags.extend([format, if lossless { "lossless" } else { "lossy" }]);
     }
     if f.cue_count > 0 {
         tags.push("cues");
@@ -96,6 +99,17 @@ pub(crate) fn track_tags(f: TrackFacts) -> String {
         tags.push("locked");
     }
     format!(" {} ", tags.join(" "))
+}
+
+/// Whether a file of this type is lossless. `None` for anything that is not
+/// an audio file rekordbox can open: a stream, or FileType 0.
+pub fn lossless(file_type: Option<i64>) -> Option<bool> {
+    match file_type {
+        Some(1 | 4) => Some(false),
+        // ALAC, as rekordbox itself writes it.
+        Some(5 | 6 | 11 | 12) => Some(true),
+        _ => None,
+    }
 }
 
 /// A streaming entry keeps a service URI (`soundcloud:tracks:123`) where a real
