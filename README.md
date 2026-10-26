@@ -32,20 +32,43 @@ database. See the help pages for the full options.
 
 ### The macOS app
 
-The same three screens — transfer, shop and the download queue — as a native
-SwiftUI app. It is built separately from `cargo install`, and needs Xcode or the
-Command Line Tools:
+A native SwiftUI app laid out like Music: your library and rekordbox playlists in
+the sidebar, one table of tracks, and an inspector for the selected track. It is
+built separately from `cargo install`, and needs Xcode or the Command Line Tools:
 
 ```bash
 scripts/build-macos-app.sh
 open target/macos/RekordRipper.app
 ```
 
-Every write goes through the same gates as the TUI: a confirmation listing what
-will change, the rekordbox-running refusal, and the fingerprint check on queued
-downloads. Writing while rekordbox is open is under **Library**, asks first, and
-resets when the app quits. The app is signed ad hoc, so on another Mac Gatekeeper
-asks before the first launch.
+- **Sidebar.** Your whole library, plus smart collections: Needs Upgrade
+  (streams and lossy files), Unanalysed, Missing (local files not on disk) and
+  Suggested Transfers (what `auto` would fill). Below them, your rekordbox
+  playlists and folders.
+- **Table.** The search field takes the same query language as the TUI, and
+  narrows whichever collection or playlist is selected. The Upgrade column
+  shows how far each track has got: searching, the best offer found, downloading,
+  then the fingerprint verdict.
+- **Inspector.** Cover art, cues on a timeline, better copies with Download or
+  Buy, and twins it can copy analysis to or from. With several tracks selected,
+  it searches all of them, or copies one track's analysis to the rest.
+- **Drag and drop.** Drop a track on another to copy its analysis there. Drop an
+  audio file on a track to queue it as a better copy of that track.
+- **Activity** (toolbar, ⌘0). Searches, downloads, the queue, and recent
+  messages, each with a button for its next step.
+
+Downloads move along on their own: the app imports each one and checks its
+fingerprint without a click. **Settings** turns that off, and says so when
+`insert_content_rows` is off in the config, since nothing can be imported until
+it is on.
+
+Every write still goes through the same gates as the TUI. A review sheet shows
+each track before and after, with its cues. Confirmations the pipeline opens
+wait in Activity rather than interrupting you, and post a notification when the
+app is in the background. The app refuses to write while rekordbox is running.
+**Library** has an override for that, which asks first and resets when the app
+quits. The app is signed ad hoc, so on another Mac Gatekeeper asks before the
+first launch.
 
 `REKORDBOX_DIR` points it at a copy of your library, for trying it out:
 
@@ -54,8 +77,10 @@ REKORDBOX_DIR=/path/to/copy target/macos/RekordRipper.app/Contents/MacOS/RekordR
 ```
 
 The app is a thin layer over `rekord_ripper::session`, which holds everything the
-TUI and the app share. `macos/bridge` exposes it to Swift through swift-bridge;
-another platform would add its own binding over the same module.
+TUI and the app share. `macos/bridge` exposes it to Swift through swift-bridge.
+The Swift side keeps the session on a serial queue of its own, so a write never
+blocks the window. Another platform would add its own binding over the same
+module.
 
 ### Searching your library
 
