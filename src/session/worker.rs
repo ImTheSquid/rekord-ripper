@@ -1,12 +1,11 @@
-//! A background worker for the TUI.
+//! A background worker for the session.
 //!
 //! # Why this has to exist
 //!
-//! `event_loop` is a single-threaded blocking poll and `handle_key` is
-//! synchronous, so calling a backend search from a key handler freezes rendering
-//! for as long as the network takes — no spinner, no feedback, a dead terminal
-//! for seconds. This moves that work off the event thread and drains results from
-//! the existing tick.
+//! Every frontend drives the session from one thread, so calling a backend search
+//! from an input handler freezes the UI for as long as the network takes — no
+//! spinner, no feedback, a dead window for seconds. This moves that work off the
+//! UI thread and drains results from the frontend's tick.
 //!
 //! # Why a detached thread is safe *here*
 //!
@@ -194,8 +193,8 @@ impl Worker {
         std::thread::Builder::new()
             .name("rr-shop".into())
             .spawn(move || {
-                // Backend chatter belongs on screen, not on the stderr the TUI
-                // is drawing over. Best-effort: a closed channel just drops it.
+                // Backend chatter belongs on screen, not on a stderr the TUI
+                // may be drawing over. Best-effort: a closed channel just drops it.
                 let notes = up_tx.clone();
                 crate::acquire::route_progress(Box::new(move |line| {
                     let _ = notes.send(Update::Note(line.to_string()));

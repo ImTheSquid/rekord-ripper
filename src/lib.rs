@@ -20,5 +20,6 @@ pub(crate) mod proc;
 pub mod query;
 pub mod relink;
 pub mod select;
+pub mod session;
 pub mod transfer;
 pub mod tui;

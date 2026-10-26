@@ -1,9 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::analysis;
-use crate::db::safety_preflight;
-
-use super::app::{App, ConfirmKind, Focus, InputMode, PendingBatch, Screen, ShopFocus};
+use super::app::{App, ConfirmKind, Focus, InputMode, Screen, ShopFocus};
 
 pub fn handle_key(app: &mut App, key: KeyEvent) {
     // Ignore key-release / repeat events from crossterm's KittyKeyboard-style
@@ -21,6 +18,13 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         app.quit_pending = false;
     }
 
+    // An open confirmation takes the keys whatever the mode, the way its modal
+    // covers whatever was on screen.
+    if let Some(kind) = app.session.confirm {
+        handle_confirm(app, kind, key);
+        return;
+    }
+
     let mode = app.mode.clone();
     match mode {
         InputMode::Normal => match app.screen {
@@ -30,7 +34,6 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         },
         InputMode::Search(focus) => handle_search(app, key, focus),
         InputMode::ShopSearch => handle_shop_search(app, key),
-        InputMode::Confirm(kind) => handle_confirm(app, kind, key),
         InputMode::Help => handle_help(app, key),
     }
 }
@@ -44,19 +47,19 @@ fn handle_pending(app: &mut App, key: KeyEvent) {
             app.close_queue();
         }
         (KeyCode::Char('?'), _) => app.mode = InputMode::Help,
-        (KeyCode::Up, _) | (KeyCode::Char('k'), _) => app.queue.move_by(-1),
-        (KeyCode::Down, _) | (KeyCode::Char('j'), _) => app.queue.move_by(1),
-        (KeyCode::PageUp, _) => app.queue.move_by(-10),
-        (KeyCode::PageDown, _) => app.queue.move_by(10),
-        (KeyCode::Char('g'), _) => app.queue.jump_top(),
-        (KeyCode::Char('G'), _) => app.queue.jump_bottom(),
-        (KeyCode::Char('R'), _) => app.reload_queue(),
-        (KeyCode::Char('i'), _) => app.start_import(),
-        (KeyCode::Char('a'), _) => app.start_apply(),
+        (KeyCode::Up, _) | (KeyCode::Char('k'), _) => app.session.queue.move_by(-1),
+        (KeyCode::Down, _) | (KeyCode::Char('j'), _) => app.session.queue.move_by(1),
+        (KeyCode::PageUp, _) => app.session.queue.move_by(-10),
+        (KeyCode::PageDown, _) => app.session.queue.move_by(10),
+        (KeyCode::Char('g'), _) => app.session.queue.jump_top(),
+        (KeyCode::Char('G'), _) => app.session.queue.jump_bottom(),
+        (KeyCode::Char('R'), _) => app.session.reload_queue(),
+        (KeyCode::Char('i'), _) => app.session.start_import(),
+        (KeyCode::Char('a'), _) => app.session.start_apply(),
         (KeyCode::Char('r'), _) => app.retry_selected(),
         (KeyCode::Char('c'), _) => app.forget_selected(),
         (KeyCode::Char('F'), _) => app.start_force(),
-        (KeyCode::Char('C'), _) => app.start_clear_queue(),
+        (KeyCode::Char('C'), _) => app.session.start_clear_queue(),
         _ => {}
     }
 }
@@ -92,7 +95,7 @@ fn handle_help(app: &mut App, key: KeyEvent) {
 fn has_pending_work(app: &App) -> bool {
     // Any kind of job, not just searches: quitting mid-fingerprint throws away
     // minutes of decoding with nothing to show for it.
-    !app.dst.selected.is_empty() || app.unresolved_errors || !app.work_in_flight().is_empty()
+    !app.dst.selected.is_empty() || app.session.unresolved_errors || !app.session.work_in_flight().is_empty()
 }
 
 fn try_quit(app: &mut App) {
@@ -108,15 +111,15 @@ fn try_quit(app: &mut App) {
             app.dst.selected.len()
         ));
     }
-    if app.unresolved_errors {
+    if app.session.unresolved_errors {
         bits.push("unresolved apply errors".into());
     }
     // Named per kind: a fingerprint reported as a search is a lie, and this is
     // the one message standing between the user and losing minutes of work.
-    for (kind, n) in app.work_in_flight() {
+    for (kind, n) in app.session.work_in_flight() {
         bits.push(format!("{n} {}(s) still running", kind.label()));
     }
-    app.status.warn(format!(
+    app.session.status.warn(format!(
         "{}. Press 'q' again to confirm quit.",
         bits.join(", ")
     ));
@@ -169,7 +172,7 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
         // always the highlighted row, so there is nothing to select on that side.
         (KeyCode::Char(' '), _) => {
             if !matches!(app.focus, Focus::Dst) {
-                app.status.info(
+                app.session.status.info(
                     "the source is the highlighted row — 's' shops for it, Tab picks destinations.",
                 );
                 return;
@@ -178,7 +181,7 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
                 .dst
                 .visible
                 .get(app.dst.cursor)
-                .and_then(|&i| app.rows.get(i))
+                .and_then(|&i| app.session.rows.get(i))
                 .map(|r| r.id.clone());
             if let Some(id) = id
                 && !app.dst.selected.remove(&id)
@@ -198,24 +201,24 @@ fn handle_normal(app: &mut App, key: KeyEvent) {
             app.recompute_visible();
         }
         (KeyCode::Char('r'), _) => {
-            app.copy_opts.replace = !app.copy_opts.replace;
-            app.status.info(format!(
+            app.session.copy_opts.replace = !app.session.copy_opts.replace;
+            app.session.status.info(format!(
                 "replace = {}",
-                if app.copy_opts.replace { "ON" } else { "off" }
+                if app.session.copy_opts.replace { "ON" } else { "off" }
             ));
         }
         (KeyCode::Char('l'), _) => {
-            app.copy_opts.lock = !app.copy_opts.lock;
-            app.status.info(format!(
+            app.session.copy_opts.lock = !app.session.copy_opts.lock;
+            app.session.status.info(format!(
                 "lock = {}",
-                if app.copy_opts.lock { "ON" } else { "off" }
+                if app.session.copy_opts.lock { "ON" } else { "off" }
             ));
         }
         (KeyCode::Char('R'), _) => match app.reload_db() {
-            Ok(()) => app.status.ok(format!("Reloaded {} rows.", app.rows.len())),
-            Err(e) => app.status.err(format!("reload failed: {e}")),
+            Ok(()) => app.session.status.ok(format!("Reloaded {} rows.", app.session.rows.len())),
+            Err(e) => app.session.status.err(format!("reload failed: {e}")),
         },
-        (KeyCode::Enter, _) => build_pending(app),
+        (KeyCode::Enter, _) => app.build_pending(),
         _ => {}
     }
 }
@@ -274,17 +277,16 @@ fn handle_search(app: &mut App, key: KeyEvent, focus: Focus) {
 
 fn handle_confirm(app: &mut App, kind: ConfirmKind, key: KeyEvent) {
     match (key.code, key.modifiers) {
-        (KeyCode::Char('y'), _) | (KeyCode::Enter, _) => match kind {
-            ConfirmKind::Transfer => apply_pending(app),
-            ConfirmKind::ImportRows => app.apply_import_batch(),
-            ConfirmKind::ForceApply => app.apply_force_batch(),
-            ConfirmKind::ClearQueue => app.clear_queue(),
-        },
+        (KeyCode::Char('y'), _) | (KeyCode::Enter, _) => {
+            match kind {
+                ConfirmKind::Transfer => app.apply_pending(),
+                _ => app.session.accept_confirm(),
+            }
+            close_confirm_if_done(app);
+        }
         (KeyCode::Char('n'), _) | (KeyCode::Esc, _) | (KeyCode::Char('q'), _) => {
-            app.pending = None;
-            app.import_batch = None;
-            app.force_batch = None;
-            app.mode = InputMode::Normal;
+            app.session.cancel_confirm();
+            close_confirm_if_done(app);
         }
         // The row detail runs to about 24 lines each, so the modal scrolls.
         (KeyCode::Up, _) | (KeyCode::Char('k'), _) => app.scroll_confirm(-1),
@@ -295,113 +297,15 @@ fn handle_confirm(app: &mut App, kind: ConfirmKind, key: KeyEvent) {
     }
 }
 
-fn build_pending(app: &mut App) {
-    let src_id = match app.current_src() {
-        Some(r) => r.id.clone(),
-        None => {
-            app.status.err("no source selected");
-            return;
-        }
-    };
-
-    // Destinations: explicit multi-selection, or cursor row if selection empty.
-    let mut dst_ids: Vec<String> = app.dst.selected.iter().cloned().collect();
-    if dst_ids.is_empty()
-        && let Some(r) = app.current_dst()
-        && r.id != src_id
-    {
-        dst_ids.push(r.id.clone());
-    }
-    if dst_ids.is_empty() {
-        app.status.err("no destinations selected");
-        return;
-    }
-    dst_ids.sort();
-
-    let mut plans = Vec::new();
-    let mut failures = Vec::new();
-    for dst_id in dst_ids {
-        match analysis::build_plan(&app.db, &src_id, &dst_id, &app.copy_opts) {
-            Ok(plan) => plans.push(plan),
-            Err(e) => failures.push((dst_id, e.to_string())),
-        }
-    }
-
-    app.pending = Some(PendingBatch {
-        plans,
-        failures,
-        scroll: 0,
-    });
-    app.mode = InputMode::Confirm(ConfirmKind::Transfer);
-}
-
-fn apply_pending(app: &mut App) {
-    let Some(batch) = app.pending.take() else {
+/// Back to normal keys once the confirmation is gone. A refused yes leaves it
+/// open, so the user can read it again.
+fn close_confirm_if_done(app: &mut App) {
+    if app.session.confirm.is_none() {
         app.mode = InputMode::Normal;
-        return;
-    };
-
-    if let Err(e) = safety_preflight(app.safety) {
-        // Put the batch back so the user can read the modal again if they want.
-        app.pending = Some(batch);
-        app.status.err(format!("{e}"));
-        return;
-    }
-
-    let total = batch.plans.len();
-    let mut errs: Vec<String> = Vec::new();
-    let mut backup_path = None;
-    for plan in &batch.plans {
-        match analysis::apply_plan(&mut app.db, plan) {
-            Ok(path) => {
-                backup_path.get_or_insert(path);
-            }
-            Err(e) => {
-                let dst_label = plan
-                    .dst
-                    .title
-                    .as_deref()
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(&plan.dst.id);
-                errs.push(format!("\"{dst_label}\": {e}"));
-            }
-        }
-    }
-    let ok = total - errs.len();
-
-    app.dst.selected.clear();
-    app.mode = InputMode::Normal;
-
-    match app.reload_db() {
-        Ok(()) => {}
-        Err(e) => app.status.warn(format!("reload after apply failed: {e}")),
-    }
-
-    let backup_hint = backup_path
-        .map(|p| format!(" Backup: {}", p.display()))
-        .unwrap_or_default();
-    if errs.is_empty() {
-        app.status.ok(format!("Applied {ok}/{total}.{backup_hint}"));
-    } else {
-        app.unresolved_errors = true;
-        let extra = if errs.len() > 1 {
-            format!(" (+{} more)", errs.len() - 1)
-        } else {
-            String::new()
-        };
-        app.status.err(format!(
-            "Applied {ok}/{total}. Failed → {first}{extra}{backup_hint}",
-            first = errs[0],
-        ));
+        app.confirm_scroll = 0;
     }
 }
 
-/// The shop screen: a track list on the left, offers on the right.
-///
-/// Only downloading writes anything, and it writes a file rather than the
-/// database — browsing offers and opening a buy page cannot touch `master.db`,
-/// so nothing here needs the safety preflight. The transfer it queues is applied
-/// later, through the same gated path as everything else.
 fn handle_shop(app: &mut App, key: KeyEvent) {
     match (key.code, key.modifiers) {
         // Esc leaves the screen rather than quitting: quitting is the transfer
@@ -426,7 +330,7 @@ fn handle_shop(app: &mut App, key: KeyEvent) {
         (KeyCode::Char(' '), _) => app.toggle_basket(),
         (KeyCode::Char('c'), _) => {
             app.shop_list.selected.clear();
-            app.status.info("basket emptied.");
+            app.session.status.info("basket emptied.");
         }
         // Add to the shopping list, or show what it already found.
         (KeyCode::Char('s'), _) => {
@@ -488,25 +392,20 @@ fn handle_shop_search(app: &mut App, key: KeyEvent) {
 
 /// Open the highlighted offer's page in a browser.
 fn open_selected_offer(app: &mut App) {
-    let Some(offer) = app.shop.selected().map(|r| r.offer.clone()) else {
-        app.status.warn("no offer selected.");
+    let Some(offer) = app.session.shop.selected().map(|r| r.offer.clone()) else {
+        app.session.status.warn("no offer selected.");
         return;
     };
-    match crate::proc::open_url(&offer.url) {
-        Ok(()) => app
-            .status
-            .ok(format!("opened {} in your browser.", offer.title)),
-        Err(e) => app.status.err(format!("could not open a browser: {e}")),
-    }
+    app.session.open_offer(&offer);
 }
 
 /// Show the stable item ref, for scripting or a follow-up CLI run.
 fn show_selected_ref(app: &mut App) {
-    match app.shop.selected() {
+    match app.session.shop.selected() {
         Some(r) => {
             let r = r.offer.item_ref.to_string();
-            app.status.info(r);
+            app.session.status.info(r);
         }
-        None => app.status.warn("no offer selected."),
+        None => app.session.status.warn("no offer selected."),
     }
 }
