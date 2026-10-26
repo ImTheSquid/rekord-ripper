@@ -22,7 +22,7 @@ use rekord_ripper::session::review::{Change, PlanReview};
 use rekord_ripper::session::shop::{FetchState, OfferFetch, ShopState, ShopTrackState};
 use rekord_ripper::session::view::{self, Tone};
 use rekord_ripper::session::{ConfirmKind, Notice, NoticeAction, Session, StatusLevel};
-use rekord_ripper::settings::{Field, Kind};
+use rekord_ripper::settings::{Credential, CredentialState, Field, Kind};
 
 /// Matches the TUI's tolerance for the fuzzy-from-source filter.
 const DURATION_TOL_SECS: i64 = 1;
@@ -168,6 +168,9 @@ mod ffi {
         fn settings(&self) -> Vec<SettingView>;
         // Empty when written, otherwise why not.
         fn set_setting(&mut self, key: &str, value: &str) -> String;
+        fn credentials(&self) -> Vec<CredentialView>;
+        // Empty value removes it. Empty when written, otherwise why not.
+        fn set_credential(&mut self, key: &str, value: &str) -> String;
     }
 
     extern "Rust" {
@@ -222,6 +225,20 @@ mod ffi {
         // Bounds of a number; 0 otherwise.
         fn min(&self) -> f64;
         fn max(&self) -> f64;
+        fn value(&self) -> String;
+    }
+
+    extern "Rust" {
+        type CredentialView;
+        fn key(&self) -> String;
+        fn group(&self) -> String;
+        fn label(&self) -> String;
+        fn secret(&self) -> bool;
+        fn set(&self) -> bool;
+        // An env var or file is used instead of what is saved.
+        fn overridden(&self) -> bool;
+        fn note(&self) -> String;
+        // Empty for a secret.
         fn value(&self) -> String;
     }
 
@@ -351,6 +368,8 @@ pub struct PlaylistView(PlaylistNode);
 pub struct CollectionView(Collection, usize);
 
 pub struct SettingView(&'static Field, String);
+
+pub struct CredentialView(&'static Credential, CredentialState);
 
 pub struct SuggestionView(Suggestion);
 
@@ -954,6 +973,20 @@ impl CoreSession {
             Err(e) => format!("{e:#}"),
         }
     }
+
+    fn credentials(&self) -> Vec<CredentialView> {
+        self.0
+            .credentials()
+            .map(|(c, state)| CredentialView(c, state))
+            .collect()
+    }
+
+    fn set_credential(&mut self, key: &str, value: &str) -> String {
+        match self.0.set_credential(key, value) {
+            Ok(()) => String::new(),
+            Err(e) => format!("{e:#}"),
+        }
+    }
 }
 
 impl TrackRowView {
@@ -1088,6 +1121,33 @@ impl SettingView {
     }
     fn value(&self) -> String {
         self.1.clone()
+    }
+}
+
+impl CredentialView {
+    fn key(&self) -> String {
+        self.0.key.into()
+    }
+    fn group(&self) -> String {
+        self.0.group.into()
+    }
+    fn label(&self) -> String {
+        self.0.label.into()
+    }
+    fn secret(&self) -> bool {
+        self.0.secret
+    }
+    fn set(&self) -> bool {
+        self.1.set
+    }
+    fn overridden(&self) -> bool {
+        self.1.overridden
+    }
+    fn note(&self) -> String {
+        self.1.note.clone()
+    }
+    fn value(&self) -> String {
+        self.1.value.clone()
     }
 }
 

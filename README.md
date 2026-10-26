@@ -61,8 +61,9 @@ Downloads move along on their own: the app imports each one and checks its
 fingerprint without a click. **Settings** (⌘,) turns that off, and edits
 `config.toml`: downloads, search, sources and the fingerprint gate. Each change
 is saved as you make it, keeping the file's comments. Nothing is imported until
-**Import downloads into rekordbox** is on. Compat levels and `credentials.toml`
-are edited in the files.
+**Import downloads into rekordbox** is on. The Sources tab also saves keys,
+passwords and cookies to `credentials.toml`, readable only by you; a saved one is
+never shown again. Compat levels are edited in the file.
 
 The app and the TUI both pick up edits to `config.toml` and `credentials.toml`
 within a second. A file that no longer loads leaves the previous settings in

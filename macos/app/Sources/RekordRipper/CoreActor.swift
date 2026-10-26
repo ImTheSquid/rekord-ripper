@@ -25,6 +25,7 @@ struct Snapshot {
     var collections: [CollectionCount]?
     /// Set when the settings changed.
     var settings: [Setting]?
+    var credentials: [CredentialSetting]?
     /// Indices into the newest `tracks`; set when they changed.
     var visible: [Int]?
     /// Set when the inspected track or its data changed.
@@ -104,6 +105,7 @@ actor CoreActor {
         if crev != configRevision {
             configRevision = crev
             s.settings = core.settings().map(Setting.init)
+            s.credentials = core.credentials().map(CredentialSetting.init)
         }
 
         let vkey = VisibleKey(revision: rev, scope: req.scope, query: req.query)

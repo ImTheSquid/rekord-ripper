@@ -65,6 +65,7 @@ final class SessionModel {
     var inspectorShown = true
     private(set) var autoAdvance = true
     private(set) var settings: [Setting] = []
+    private(set) var credentials: [CredentialSetting] = []
     /// Why the last edit to a setting was refused, by key.
     private(set) var settingError: (key: String, message: String)?
     private(set) var configPath = ""
@@ -131,6 +132,7 @@ final class SessionModel {
         if let p = s.playlists, p != playlists { playlists = p }
         if let c = s.collections, c != collections { collections = c }
         if let st = s.settings { settings = st }
+        if let c = s.credentials { credentials = c }
         if let v = s.visible { visibleIndices = v }
         if s.tracks != nil || s.visible != nil {
             visibleTracks = visibleIndices.compactMap { $0 < tracks.count ? tracks[$0] : nil }
@@ -388,6 +390,16 @@ final class SessionModel {
         guard let core else { return }
         Task {
             let refused = await core.run { $0.set_setting(key, value).toString() }
+            settingError = refused.isEmpty ? nil : (key, refused)
+            kick()
+        }
+    }
+
+    /// Empty removes it. Shares `settingError` with the settings.
+    func setCredential(_ key: String, _ value: String) {
+        guard let core else { return }
+        Task {
+            let refused = await core.run { $0.set_credential(key, value).toString() }
             settingError = refused.isEmpty ? nil : (key, refused)
             kick()
         }

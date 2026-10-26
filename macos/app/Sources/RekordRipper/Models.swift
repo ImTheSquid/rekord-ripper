@@ -239,6 +239,30 @@ struct Setting: Identifiable, Equatable {
     }
 }
 
+/// One `credentials.toml` key. A secret's value never leaves the core.
+struct CredentialSetting: Identifiable, Equatable {
+    let id: String
+    let group: String
+    let label: String
+    let secret: Bool
+    let set: Bool
+    /// An environment variable or a file is used instead of what is saved.
+    let overridden: Bool
+    let note: String
+    let value: String
+
+    init(_ v: CredentialViewRef) {
+        id = v.key().toString()
+        group = v.group().toString()
+        label = v.label().toString()
+        secret = v.secret()
+        set = v.set()
+        overridden = v.overridden()
+        note = v.note().toString()
+        value = v.value().toString()
+    }
+}
+
 struct Suggestion: Identifiable, Equatable {
     let id: String
     /// Analysis would go from the inspected track to this one.

@@ -11,7 +11,8 @@ struct SettingsView: View {
             SettingsPage(groups: ["Search"])
                 .tabItem { Label("Search", systemImage: "magnifyingglass") }
             SettingsPage(groups: ["Bandcamp", "SoundCloud", "Soulseek"],
-                         footer: "Passwords, API keys and cookies stay in credentials.toml.")
+                         footer: "Keys, passwords and cookies are saved to credentials.toml, readable only by you, "
+                             + "and are never shown again once saved.")
                 .tabItem { Label("Sources", systemImage: "network") }
             SettingsPage(groups: ["Fingerprint Gate"],
                          footer: "These decide whether a download is the same recording as your track. "
@@ -74,6 +75,7 @@ private struct SettingsPage: View {
             ForEach(groups, id: \.self) { group in
                 Section {
                     ForEach(model.settings.filter { $0.group == group }) { SettingRow(setting: $0) }
+                    ForEach(model.credentials.filter { $0.group == group }) { CredentialRow(credential: $0) }
                 } header: {
                     Text(group)
                 } footer: {
@@ -135,6 +137,64 @@ private struct SettingRow: View {
         panel.canCreateDirectories = folder
         if panel.runModal() == .OK, let url = panel.url {
             model.setSetting(setting.id, url.path)
+        }
+    }
+}
+
+/// Write-only for a secret: the field starts empty, and what is typed is sent
+/// once and dropped.
+private struct CredentialRow: View {
+    @Environment(SessionModel.self) private var model
+    let credential: CredentialSetting
+    @State private var draft = ""
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            LabeledContent(credential.label) {
+                HStack {
+                    field
+                        .labelsHidden()
+                        .focused($focused)
+                        .onSubmit(save)
+                    if credential.secret, credential.set, !credential.overridden {
+                        Button("Clear") { model.setCredential(credential.id, "") }
+                    }
+                }
+            }
+            if let error = model.settingError, error.key == credential.id {
+                Text(error.message).font(.caption).foregroundStyle(.red)
+            } else if !credential.note.isEmpty {
+                Text(credential.note).font(.caption)
+                    .foregroundStyle(credential.overridden ? AnyShapeStyle(.orange) : AnyShapeStyle(.secondary))
+            }
+        }
+        .onAppear { if !credential.secret { draft = credential.value } }
+        .onChange(of: credential.value) { _, value in
+            if !credential.secret, !focused { draft = value }
+        }
+        .onChange(of: focused) { _, now in
+            if !now, !credential.secret { save() }
+        }
+    }
+
+    @ViewBuilder private var field: some View {
+        if credential.secret {
+            SecureField(credential.label, text: $draft,
+                        prompt: Text(credential.set ? "saved — type to replace" : "not set"))
+        } else {
+            TextField(credential.label, text: $draft, prompt: Text("not set"))
+        }
+    }
+
+    private func save() {
+        if credential.secret {
+            // Empty means nothing typed here; Clear removes a saved one.
+            guard !draft.isEmpty else { return }
+            model.setCredential(credential.id, draft)
+            draft = ""
+        } else if draft != credential.value {
+            model.setCredential(credential.id, draft)
         }
     }
 }
