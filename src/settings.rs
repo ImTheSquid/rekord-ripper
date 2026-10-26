@@ -1,4 +1,5 @@
-//! The `config.toml` keys a settings screen edits, shared by every frontend.
+//! The `config.toml` and `credentials.toml` keys a settings screen edits,
+//! shared by every frontend.
 //!
 //! Edits go through `toml_edit`, so the file's comments and layout survive.
 //! Compat levels and unknown keys are left to the file itself.
@@ -9,7 +10,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use toml_edit::{Array, DocumentMut, Item, Value};
 
 use crate::acquire::AudioFormat;
-use crate::config::Config;
+use crate::config::{Config, CredentialSource, Credentials};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Kind {
@@ -156,14 +157,21 @@ pub fn current(cfg: &Config, field: &Field) -> String {
 /// Empty text, list or path removes the key, leaving its default.
 pub fn edit(text: &str, key: &str, raw: &str) -> Result<String> {
     let field = field_for(key).ok_or_else(|| anyhow!("{key} is not a setting"))?;
-    let value = parse(field, raw)?;
-    let mut doc: DocumentMut = text.parse().context("config.toml does not parse")?;
+    let out = set_key(text, key, parse(field, raw)?)?;
+    let cfg: Config = toml::from_str(&out).context("the edited config.toml does not load")?;
+    check(&cfg)?;
+    Ok(out)
+}
+
+/// `text` with `key` set to `value`, or removed for `None`.
+fn set_key(text: &str, key: &str, value: Option<Value>) -> Result<String> {
+    let mut doc: DocumentMut = text.parse().context("the file does not parse")?;
     let (section, name) = split(key);
     let table = doc
         .entry(section)
         .or_insert(toml_edit::table())
         .as_table_like_mut()
-        .ok_or_else(|| anyhow!("[{section}] in config.toml is not a table"))?;
+        .ok_or_else(|| anyhow!("[{section}] is not a table"))?;
     match value {
         None => {
             table.remove(name);
@@ -179,10 +187,7 @@ pub fn edit(text: &str, key: &str, raw: &str) -> Result<String> {
             }
         },
     }
-    let out = doc.to_string();
-    let cfg: Config = toml::from_str(&out).context("the edited config.toml does not load")?;
-    check(&cfg)?;
-    Ok(out)
+    Ok(doc.to_string())
 }
 
 fn parse(field: &Field, raw: &str) -> Result<Option<Value>> {
@@ -245,16 +250,110 @@ fn check(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
+/// A `credentials.toml` key. A secret is written but never read back out.
+#[derive(Debug)]
+pub struct Credential {
+    pub key: &'static str,
+    pub group: &'static str,
+    pub label: &'static str,
+    pub secret: bool,
+}
+
+#[rustfmt::skip]
+pub const CREDENTIALS: &[Credential] = &[
+    Credential { key: "bandcamp.identity_cookie", group: BANDCAMP, label: "Identity cookie", secret: true },
+    Credential { key: "soulseek.api_key", group: SOULSEEK, label: "slskd API key", secret: true },
+    Credential { key: "soulseek.files_user", group: SOULSEEK, label: "Downloads URL user", secret: false },
+    Credential { key: "soulseek.files_password", group: SOULSEEK, label: "Downloads URL password", secret: true },
+];
+
+/// What a settings screen may show about a credential.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialState {
+    /// A value is in use, from wherever.
+    pub set: bool,
+    /// An environment variable or a file is used instead of what is saved.
+    pub overridden: bool,
+    pub note: String,
+    /// The value itself, for a credential that is not a secret.
+    pub value: String,
+}
+
+pub fn credential_state(creds: &Credentials, c: &Credential) -> CredentialState {
+    let resolved = match c.key {
+        "bandcamp.identity_cookie" => creds.bandcamp_identity(),
+        "soulseek.api_key" => creds.soulseek_api_key(),
+        "soulseek.files_password" => creds.soulseek_files_password(),
+        _ => {
+            let user = &creds.soulseek.files_user;
+            return CredentialState {
+                set: !user.is_empty(),
+                overridden: false,
+                note: String::new(),
+                value: user.clone(),
+            };
+        }
+    };
+    let (set, overridden, note) = match resolved {
+        Ok(None) => (false, false, "Not set.".to_string()),
+        Ok(Some((_, CredentialSource::Config))) => {
+            (true, false, "Saved in credentials.toml.".to_string())
+        }
+        Ok(Some((_, CredentialSource::Env(var)))) => (
+            true,
+            true,
+            format!("Set by the {var} environment variable, which overrides what is saved here."),
+        ),
+        Ok(Some((_, CredentialSource::File(key)))) => (
+            true,
+            true,
+            format!("Read from the file in {key}, which overrides what is saved here."),
+        ),
+        Err(e) => (false, true, format!("{e:#}")),
+    };
+    CredentialState {
+        set,
+        overridden,
+        note,
+        value: String::new(),
+    }
+}
+
+/// `text` with credential `key` set to `raw`. Empty removes it.
+pub fn edit_credential(text: &str, key: &str, raw: &str) -> Result<String> {
+    if !CREDENTIALS.iter().any(|c| c.key == key) {
+        bail!("{key} is not a credential");
+    }
+    let raw = raw.trim();
+    let out = set_key(text, key, (!raw.is_empty()).then(|| raw.into()))?;
+    toml::from_str::<Credentials>(&out).context("the edited credentials.toml does not load")?;
+    Ok(out)
+}
+
 /// Replaces the file in one step, through a symlink to wherever it points.
-pub fn write(path: &Path, text: &str) -> Result<()> {
+/// A private file is readable only by its owner from the moment it exists.
+pub fn write(path: &Path, text: &str, private: bool) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
     let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let dir = target
         .parent()
         .ok_or_else(|| anyhow!("{} has no folder", target.display()))?;
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    let tmp = dir.join(".config.toml.tmp");
-    std::fs::write(&tmp, text).with_context(|| format!("writing {}", tmp.display()))?;
-    if let Ok(meta) = std::fs::metadata(&target) {
+    let name = target.file_name().unwrap_or_default().to_string_lossy();
+    let tmp = dir.join(format!(".{name}.tmp"));
+    let _ = std::fs::remove_file(&tmp);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(if private { 0o600 } else { 0o644 })
+        .open(&tmp)
+        .with_context(|| format!("creating {}", tmp.display()))?;
+    file.write_all(text.as_bytes())
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    drop(file);
+    if !private && let Ok(meta) = std::fs::metadata(&target) {
         let _ = std::fs::set_permissions(&tmp, meta.permissions());
     }
     std::fs::rename(&tmp, &target).with_context(|| format!("replacing {}", target.display()))
@@ -354,6 +453,55 @@ mod tests {
     }
 
     #[test]
+    fn a_credential_edit_keeps_the_rest_and_empty_clears_it() {
+        let text = "# keys\n[soulseek]\napi_key = \"old\"\nfiles_user = \"me\"\n";
+        let out = edit_credential(text, "soulseek.api_key", " new\n").unwrap();
+        assert_eq!(
+            out,
+            "# keys\n[soulseek]\napi_key = \"new\"\nfiles_user = \"me\"\n"
+        );
+        let out = edit_credential(&out, "soulseek.api_key", "").unwrap();
+        assert_eq!(out, "# keys\n[soulseek]\nfiles_user = \"me\"\n");
+        assert!(
+            edit_credential("", "soulseek.url", "x").is_err(),
+            "not a credential"
+        );
+    }
+
+    #[test]
+    fn a_secret_is_never_handed_back() {
+        let text = edit_credential("", "soulseek.files_password", "hunter2").unwrap();
+        let creds: Credentials = toml::from_str(&text).unwrap();
+        for c in CREDENTIALS {
+            let state = credential_state(&creds, c);
+            assert!(
+                !format!("{state:?}").contains("hunter2"),
+                "{}: {state:?}",
+                c.key
+            );
+        }
+        if std::env::var("SLSKD_FILES_PASSWORD").is_err() {
+            let pw = CREDENTIALS
+                .iter()
+                .find(|c| c.key == "soulseek.files_password")
+                .unwrap();
+            let state = credential_state(&creds, pw);
+            assert!(state.set && !state.overridden, "{state:?}");
+        }
+    }
+
+    #[test]
+    fn a_private_file_is_created_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("rr-creds-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("credentials.toml");
+        write(&path, "", true).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn write_replaces_through_a_symlink() {
         let dir = std::env::temp_dir().join(format!("rr-settings-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -361,7 +509,7 @@ mod tests {
         std::fs::write(&real, "").unwrap();
         let link = dir.join("config.toml");
         std::os::unix::fs::symlink(&real, &link).unwrap();
-        write(&link, "[search]\nlimit = 3\n").unwrap();
+        write(&link, "[search]\nlimit = 3\n", false).unwrap();
         assert!(
             std::fs::symlink_metadata(&link)
                 .unwrap()

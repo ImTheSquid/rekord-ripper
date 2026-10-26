@@ -170,7 +170,8 @@ pub struct Session {
     /// searching the same track twice does not search it twice.
     shop_queued: Vec<String>,
     pub cfg: crate::config::Config,
-    /// Bumped whenever `cfg` is replaced.
+    creds: crate::config::Credentials,
+    /// Bumped whenever `cfg` or `creds` is replaced.
     pub config_revision: u64,
     config_watch: config::ConfigWatch,
     pub unresolved_errors: bool,
@@ -247,6 +248,7 @@ impl Session {
             fetched: HashSet::new(),
             shop_queued: Vec::new(),
             cfg,
+            creds,
             config_revision: 0,
             config_watch,
             unresolved_errors: false,

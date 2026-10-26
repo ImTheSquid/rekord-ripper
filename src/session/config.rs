@@ -7,7 +7,7 @@ use serde::de::DeserializeOwned;
 
 use super::Session;
 use crate::config::{Config, Credentials};
-use crate::settings::{self, Field};
+use crate::settings::{self, Credential, CredentialState, Field};
 
 /// When a file was last written and how long it was, or `None` if absent.
 type Stamp = Option<(SystemTime, u64)>;
@@ -106,16 +106,17 @@ impl Session {
             }
         };
         if let Some(worker) = &self.worker {
-            worker.reconfigure(cfg.clone(), creds);
+            worker.reconfigure(cfg.clone(), creds.clone());
         }
+        self.creds = creds;
         let unknown: Vec<_> = cfg.unknown.keys().cloned().collect();
         self.cfg = cfg;
         self.config_revision += 1;
         if announce && unknown.is_empty() {
-            self.status.info("Reloaded config.toml.");
+            self.status.info("Reloaded settings.");
         } else if announce {
             self.status.warn(format!(
-                "Reloaded config.toml, ignoring unrecognised {}.",
+                "Reloaded settings, ignoring unrecognised {}.",
                 unknown.join(", ")
             ));
         }
@@ -141,7 +142,34 @@ impl Session {
         };
         let edited = settings::edit(&text, key, raw)?;
         if edited != text {
-            settings::write(&path, &edited)?;
+            settings::write(&path, &edited, false)?;
+            self.reload_config(false);
+        }
+        Ok(())
+    }
+
+    /// Every editable credential, described without its value if secret.
+    pub fn credentials(&self) -> impl Iterator<Item = (&'static Credential, CredentialState)> + '_ {
+        settings::CREDENTIALS
+            .iter()
+            .map(|c| (c, settings::credential_state(&self.creds, c)))
+    }
+
+    /// Writes one credential to `credentials.toml` and applies it. Empty
+    /// removes it.
+    pub fn set_credential(&mut self, key: &str, raw: &str) -> anyhow::Result<()> {
+        let path = self
+            .config_watch
+            .credentials
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("there is no credentials.toml"))?;
+        let text = match std::fs::read_to_string(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            read => read?,
+        };
+        let edited = settings::edit_credential(&text, key, raw)?;
+        if edited != text {
+            settings::write(&path, &edited, true)?;
             self.reload_config(false);
         }
         Ok(())
