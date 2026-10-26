@@ -6,6 +6,7 @@ license = "MIT OR Apache-2.0"
 authors = ["Jack Hogan <jackhogan11@gmail.com>"]
 description = "Rekordbox analysis utilities"
 repository = "https://github.com/ImTheSquid/rekord-ripper"
+exclude = ["macos", "scripts"]
 
 [dependencies]
 anyhow = "1.0.102"
@@ -34,3 +35,6 @@ ureq = { version = "3.4", features = ["cookies", "json"] }
 # v5 as well as v4: a download batch id derived from the offer is stable across
 # runs, which is what makes re-fetching attach instead of duplicating.
 uuid = { version = "1", features = ["v4", "v5"] }
+
+[workspace]
+members = ["macos/bridge"]

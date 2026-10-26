@@ -1,0 +1,28 @@
+// swift-tools-version:6.0
+import Foundation
+import PackageDescription
+
+// scripts/build-macos-app.sh copies the Rust staticlib here.
+let rustLib = URL(fileURLWithPath: #filePath).deletingLastPathComponent().appendingPathComponent(".rust").path
+
+let package = Package(
+    name: "RekordRipper",
+    platforms: [.macOS(.v14)],
+    targets: [
+        .systemLibrary(name: "RekordRipperFFI"),
+        .target(
+            name: "RekordRipperBridge",
+            dependencies: ["RekordRipperFFI"],
+            swiftSettings: [.swiftLanguageMode(.v5)],
+            linkerSettings: [
+                .unsafeFlags(["-L", rustLib]),
+                .linkedFramework("CoreFoundation"),
+                .linkedLibrary("iconv"),
+            ]
+        ),
+        .executableTarget(
+            name: "RekordRipper",
+            dependencies: ["RekordRipperBridge"]
+        ),
+    ]
+)

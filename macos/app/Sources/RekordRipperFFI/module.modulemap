@@ -1,0 +1,6 @@
+module RekordRipperFFI {
+    header "SwiftBridgeCore.h"
+    header "Bridge.h"
+    link "rekord_ripper_macos"
+    export *
+}
