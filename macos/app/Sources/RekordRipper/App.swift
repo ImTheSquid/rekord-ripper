@@ -12,7 +12,7 @@ struct RekordRipperApp: App {
                 .environment(model)
                 .onAppear { delegate.model = model }
         }
-        .defaultSize(width: 1280, height: 800)
+        .defaultSize(width: 1380, height: 820)
         .commands { AppCommands(model: model) }
     }
 }
@@ -58,37 +58,91 @@ struct MainView: View {
     var body: some View {
         @Bindable var model = model
         NavigationSplitView {
-            List(Screen.allCases, selection: $model.screen) { screen in
-                Label(screen.rawValue, systemImage: screen.symbol)
-                    .badge(badge(for: screen))
-                    .tag(screen)
-            }
-            .navigationSplitViewColumnWidth(min: 150, ideal: 170)
+            SidebarView()
+                .navigationSplitViewColumnWidth(min: 180, ideal: 220)
         } detail: {
             VStack(spacing: 0) {
                 if model.rekordboxRunning {
                     RekordboxBanner()
                 }
-                switch model.screen {
-                case .transfer: TransferView()
-                case .shop: ShopView()
-                case .queue: QueueView()
-                }
-                Divider()
-                StatusBar()
+                LibraryTable()
+            }
+            .overlay(alignment: .bottom) { ToastView() }
+            .inspector(isPresented: $model.inspectorShown) {
+                InspectorView()
+                    .inspectorColumnWidth(min: 300, ideal: 360, max: 520)
             }
         }
-        .sheet(item: Binding(get: { model.confirmation }, set: { if $0 == nil { model.cancelConfirmation() } })) {
+        .navigationTitle(title)
+        .navigationSubtitle("\(model.visibleTracks.count) tracks")
+        .searchable(text: $model.query, placement: .toolbar, prompt: "Search")
+        .searchSuggestions {
+            if model.query.isEmpty {
+                ForEach(SearchHint.all, id: \.self) { hint in
+                    Text(hint).searchCompletion(hint + " ")
+                }
+            }
+        }
+        .toolbar {
+            ToolbarItem {
+                ActivityButton()
+            }
+            ToolbarItem {
+                Button { model.inspectorShown.toggle() } label: {
+                    Label("Inspector", systemImage: "sidebar.trailing")
+                }
+                .help("Show or hide the inspector")
+            }
+        }
+        .sheet(item: Binding(get: { model.presentedConfirmation }, set: { if $0 == nil { model.presented = nil } })) {
             ConfirmSheet(confirmation: $0)
         }
     }
 
-    private func badge(for screen: Screen) -> Int {
-        switch screen {
-        case .transfer: 0
-        case .shop: Int(model.shopStatus.searchesOutstanding) + model.fetchQueue.count
-        case .queue: model.queueEntries.count
+    private var title: String {
+        switch model.scope {
+        case let .collection(code):
+            model.collections.first { $0.code == code }?.title ?? "Library"
+        case let .playlist(id):
+            PlaylistNode.find(id, in: model.playlists)?.name ?? "Playlist"
         }
+    }
+}
+
+enum SearchHint {
+    static let all = ["is:lossless", "is:lossy", "is:stream", "is:missing", "has:cues", "-is:locked", "bpm:120-130", "p:"]
+}
+
+extension PlaylistNode {
+    static func find(_ id: String, in nodes: [PlaylistNode]) -> PlaylistNode? {
+        for n in nodes {
+            if n.id == id { return n }
+            if let hit = find(id, in: n.children ?? []) { return hit }
+        }
+        return nil
+    }
+}
+
+struct SidebarView: View {
+    @Environment(SessionModel.self) private var model
+
+    var body: some View {
+        List(selection: Binding(get: { model.scope }, set: { if let s = $0 { model.scope = s } })) {
+            Section("Library") {
+                ForEach(model.collections) { c in
+                    Label(c.title, systemImage: c.symbol)
+                        .badge(Int(c.count))
+                        .tag(Scope.collection(c.code))
+                }
+            }
+            Section("Playlists") {
+                OutlineGroup(model.playlists, children: \.children) { node in
+                    Label(node.name, systemImage: node.folder ? "folder" : node.smart ? "gearshape" : "music.note.list")
+                        .tag(Scope.playlist(node.id))
+                }
+            }
+        }
+        .listStyle(.sidebar)
     }
 }
 
@@ -108,28 +162,6 @@ struct RekordboxBanner: View {
         .padding(.vertical, 6)
         .foregroundStyle(.white)
         .background(model.bypassRekordboxCheck ? Color.red : Color.orange)
-    }
-}
-
-struct StatusBar: View {
-    @Environment(SessionModel.self) private var model
-
-    var body: some View {
-        HStack(spacing: 8) {
-            if model.shopStatus.searchesOutstanding > 0 || model.fetchStatus.kind == .running {
-                ProgressView().controlSize(.small)
-            }
-            Text(model.status.text)
-                .foregroundStyle(model.status.tone.color)
-                .lineLimit(2)
-                .textSelection(.enabled)
-            Spacer()
-            Text("\(model.tracks.count) tracks")
-                .foregroundStyle(.secondary)
-        }
-        .font(.callout)
-        .padding(.horizontal, 12)
-        .padding(.vertical, 6)
     }
 }
 
@@ -160,11 +192,13 @@ struct ConfirmSheet: View {
                 Text(model.status.text).foregroundStyle(.red).font(.callout)
             }
             HStack {
+                Button("Later") { model.presented = nil }
+                    .help("Keep this waiting in Activity")
                 Spacer()
-                Button("Cancel", role: .cancel) { model.cancelConfirmation() }
+                Button("Cancel", role: .cancel) { model.cancel(confirmation.kind) }
                     .keyboardShortcut(.cancelAction)
                 Button(confirmation.accept, role: confirmation.isDestructive ? .destructive : nil) {
-                    model.accept()
+                    model.accept(confirmation.kind)
                 }
                 .keyboardShortcut(confirmation.isDestructive ? nil : .defaultAction)
             }

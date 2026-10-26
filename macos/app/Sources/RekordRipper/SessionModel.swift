@@ -2,132 +2,143 @@ import Foundation
 import Observation
 import RekordRipperBridge
 
-enum Screen: String, CaseIterable, Identifiable {
-    case transfer = "Transfer"
-    case shop = "Shop"
-    case queue = "Queue"
-
-    var id: String { rawValue }
-
-    var symbol: String {
-        switch self {
-        case .transfer: "arrow.left.arrow.right"
-        case .shop: "cart"
-        case .queue: "tray.full"
-        }
-    }
-}
-
-/// The one owner of the Rust session.
+/// The window's state, fed by `CoreActor` snapshots.
 ///
-/// Main-actor only: the session holds a database connection that must stay on
-/// one thread, the same way the TUI drives it from its single loop. A timer
-/// polls it, and only what changed is written back, so views redraw on news
-/// rather than on every tick.
+/// Main-actor only, and never touches Rust: every read arrives in a snapshot
+/// and every action is sent to the actor, so a slow write cannot stall the UI.
 @MainActor
 @Observable
 final class SessionModel {
     private(set) var openError: String?
-    @ObservationIgnored private var core: CoreSession?
-    @ObservationIgnored private var timer: Timer?
+    @ObservationIgnored private var core: CoreActor?
+    @ObservationIgnored private var loop: Task<Void, Never>?
+    @ObservationIgnored private var sleeper: Task<Void, Never>?
 
-    var screen = Screen.transfer
-
+    // Library.
     private(set) var tracks: [Track] = []
-    @ObservationIgnored private var rowsRevision: UInt64 = .max
+    @ObservationIgnored private var trackIndex: [Track.ID: Int] = [:]
+    @ObservationIgnored private var visibleIndices: [Int] = []
+    private(set) var visibleTracks: [Track] = []
+    private(set) var playlists: [PlaylistNode] = []
+    private(set) var collections: [CollectionCount] = []
+    var scope = Scope.library { didSet { if scope != oldValue { kick() } } }
+    var query = "" { didSet { if query != oldValue { kick() } } }
+    var selection = Set<Track.ID>() { didSet { if selection != oldValue { kick() } } }
+    private(set) var inspection: Inspection?
+
+    // Session state.
     private(set) var status = StatusMessage()
     private(set) var rekordboxRunning = false
     private(set) var bypassRekordboxCheck = false
-    private(set) var confirmation: Confirmation?
-
-    // Transfer screen.
-    var srcQuery = "" { didSet { refilterTransfer() } }
-    var dstQuery = "" { didSet { refilterDst() } }
-    var autoFilter = false { didSet { refilterDst() } }
-    var fuzzyFromSrc = false { didSet { refilterDst() } }
-    var srcSelection: Track.ID? { didSet { refilterDst() } }
-    var dstSelection = Set<Track.ID>()
-    private(set) var srcRows: [Track] = []
-    private(set) var dstRows: [Track] = []
     private(set) var copyReplace = false
     private(set) var copyLock = false
-
-    // Shop screen.
-    var shopQuery = "" { didSet { refilterShop() } }
-    var shopSelection = Set<Track.ID>()
-    var offerSelection: Offer.ID?
-    private(set) var shopRows: [Track] = []
-    private(set) var shopStatus = ShopStatus()
+    private(set) var shop = ShopStatus()
     private(set) var offers: [Offer] = []
-    private(set) var offerGroups: [OfferGroup] = []
-    private(set) var trackStates: [Track.ID: Int64] = [:]
-    private(set) var fetchStatus = FetchStatus()
+    @ObservationIgnored private var offersBySrc: [String: [Offer]] = [:]
+    private(set) var shopStates: [String: Int64] = [:]
+    @ObservationIgnored private var searched = Set<String>()
+    private(set) var fetch = FetchStatus()
     private(set) var fetchQueue: [String] = []
+    private(set) var entries: [QueueEntry] = []
+    @ObservationIgnored private var entriesBySrc: [String: [QueueEntry]] = [:]
+    @ObservationIgnored private var unresolvedErrors = false
+    @ObservationIgnored private var workInFlight = ""
 
-    // Queue screen.
-    var queueSelection: QueueEntry.ID?
-    private(set) var queueEntries: [QueueEntry] = []
+    // Notices.
+    private(set) var notices: [Notice] = []
+    private(set) var toast: Notice?
+    @ObservationIgnored private var toastTimer: Task<Void, Never>?
+    @ObservationIgnored private var polledOnce = false
+
+    // Confirmations.
+    private(set) var confirmations: [Confirmation] = []
+    /// The one shown as a sheet. Others wait in the activity popover.
+    var presented: Confirmation.Kind?
+    /// Kinds the user just asked for, so theirs open as a sheet while one the
+    /// pipeline opened waits to be looked at.
+    @ObservationIgnored private var requested: [Confirmation.Kind: Date] = [:]
+
+    var activityShown = false
+    var inspectorShown = true
 
     init() {
         do {
-            core = try CoreSession.open()
-        } catch let e as RustString {
-            openError = e.toString()
+            core = try CoreActor()
+        } catch let e as OpenError {
+            openError = e.message
             return
         } catch {
             openError = "\(error)"
             return
         }
-        refresh()
-        let timer = Timer(timeInterval: 0.2, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.refresh() }
-        }
-        RunLoop.main.add(timer, forMode: .common)
-        self.timer = timer
+        let auto = UserDefaults.standard.object(forKey: "autoAdvance") as? Bool ?? true
+        setAutoAdvance(auto)
+        loop = Task { [weak self] in await self?.pollLoop() }
     }
 
     // MARK: Polling
 
-    func refresh() {
-        guard let core else { return }
-        core.poll()
-
-        let revision = core.rows_revision()
-        if revision != rowsRevision {
-            rowsRevision = revision
-            tracks = core.rows().map(Track.init)
-            let ids = Set(tracks.map(\.id))
-            dstSelection.formIntersection(ids)
-            shopSelection.formIntersection(ids)
-            if let src = srcSelection, !ids.contains(src) { srcSelection = nil }
-            refilterTransfer()
-            refilterShop()
+    private func pollLoop() async {
+        while !Task.isCancelled, let core {
+            apply(await core.poll(request))
+            let nap = Task { _ = try? await Task.sleep(for: .milliseconds(200)) }
+            sleeper = nap
+            await nap.value
         }
+    }
 
-        assign(\.status, StatusMessage(core.status()))
-        assign(\.rekordboxRunning, core.rekordbox_running())
-        assign(\.bypassRekordboxCheck, core.bypass_rekordbox_check())
-        assign(\.copyReplace, core.copy_replace())
-        assign(\.copyLock, core.copy_lock())
-        assign(\.confirmation, readConfirmation(core))
+    /// Polls now rather than at the next tick.
+    private func kick() {
+        sleeper?.cancel()
+    }
 
-        let shop = ShopStatus(core.shop_status())
-        let newOffers = core.offers().map(Offer.init)
-        let offersChanged = newOffers != offers
-        assign(\.shopStatus, shop)
-        if offersChanged {
-            offers = newOffers
-            offerGroups = OfferGroup.grouping(newOffers)
-            if let id = offerSelection, !newOffers.contains(where: { $0.id == id }) {
-                offerSelection = nil
-            }
+    private var request: PollRequest {
+        PollRequest(
+            scope: scope,
+            query: query,
+            inspected: selection.count == 1 ? selection.first : nil,
+            searched: searched
+        )
+    }
+
+    private func apply(_ s: Snapshot) {
+        if let t = s.tracks {
+            tracks = t
+            trackIndex = Dictionary(uniqueKeysWithValues: t.enumerated().map { ($1.id, $0) })
+            let ids = Set(trackIndex.keys)
+            if !selection.isSubset(of: ids) { selection.formIntersection(ids) }
         }
-        if offersChanged || shop.kind == .searching || shop.searchesOutstanding > 0 {
-            refreshTrackStates()
+        if let p = s.playlists, p != playlists { playlists = p }
+        if let c = s.collections, c != collections { collections = c }
+        if let v = s.visible { visibleIndices = v }
+        if s.tracks != nil || s.visible != nil {
+            visibleTracks = visibleIndices.compactMap { $0 < tracks.count ? tracks[$0] : nil }
         }
-        assign(\.fetchStatus, FetchStatus(core.fetch_status()))
-        assign(\.fetchQueue, core.fetch_queue().map { $0.as_str().toString() })
-        assign(\.queueEntries, core.queue_entries().map(QueueEntry.init))
+        if case let .some(i) = s.inspection, i != inspection { inspection = i }
+
+        assign(\.status, s.status)
+        assign(\.rekordboxRunning, s.rekordboxRunning)
+        assign(\.bypassRekordboxCheck, s.bypassRekordboxCheck)
+        assign(\.copyReplace, s.copyReplace)
+        assign(\.copyLock, s.copyLock)
+        assign(\.shop, s.shop)
+        if s.offers != offers {
+            offers = s.offers
+            offersBySrc = Dictionary(grouping: s.offers, by: \.srcId)
+        }
+        assign(\.shopStates, s.shopStates)
+        assign(\.fetch, s.fetch)
+        assign(\.fetchQueue, s.fetchQueue)
+        if s.entries != entries {
+            entries = s.entries
+            entriesBySrc = Dictionary(grouping: s.entries, by: \.srcId)
+        }
+        unresolvedErrors = s.unresolvedErrors
+        workInFlight = s.workInFlight
+
+        receive(s.notices)
+        receive(s.confirmations)
+        polledOnce = true
     }
 
     /// Writes only on change: an @Observable property notifies on every set.
@@ -135,196 +146,194 @@ final class SessionModel {
         if self[keyPath: key] != value { self[keyPath: key] = value }
     }
 
-    private func readConfirmation(_ core: CoreSession) -> Confirmation? {
-        let c = core.confirm()
-        guard let kind = Confirmation.Kind(rawValue: c.kind) else { return nil }
-        let lines = core.confirm_lines().map {
-            Confirmation.Line(tone: Tone(rawValue: $0.tone()) ?? .plain, text: $0.text().toString())
+    private func receive(_ new: [Notice]) {
+        guard !new.isEmpty else { return }
+        notices = Array((notices + new).suffix(50))
+        // What was said before the window opened is history, not news.
+        guard polledOnce, let latest = new.last else { return }
+        toast = latest
+        toastTimer?.cancel()
+        toastTimer = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(latest.step.title == nil ? 4 : 8))
+            guard !Task.isCancelled else { return }
+            if self?.toast?.id == latest.id { self?.toast = nil }
         }
-        return Confirmation(kind: kind, title: c.title.toString(), accept: c.accept.toString(), lines: lines)
     }
 
-    // MARK: Filtering, in Rust so every frontend shares one query language.
-
-    private func refilterTransfer() {
-        guard let core else { return }
-        srcRows = core.src_visible(srcQuery).map { tracks[Int($0)] }
-        refilterDst()
-    }
-
-    private func refilterDst() {
-        guard let core else { return }
-        let visible = core.dst_visible(dstQuery, autoFilter, srcSelection ?? "", fuzzyFromSrc)
-        dstRows = visible.map { tracks[Int($0)] }
-    }
-
-    private func refilterShop() {
-        guard let core else { return }
-        shopRows = core.src_visible(shopQuery).map { tracks[Int($0)] }
-        refreshTrackStates()
-    }
-
-    private func refreshTrackStates() {
-        guard let core else { return }
-        var states: [Track.ID: Int64] = [:]
-        for row in shopRows {
-            let s = core.shop_track_state(row.id)
-            if s != -2 { states[row.id] = s }
+    private func receive(_ open: [Confirmation]) {
+        let before = Set(confirmations.map(\.kind))
+        if open != confirmations { confirmations = open }
+        if let p = presented, !open.contains(where: { $0.kind == p }) { presented = nil }
+        for c in open where !before.contains(c.kind) {
+            let asked = requested.removeValue(forKey: c.kind).map { -$0.timeIntervalSinceNow < 120 } ?? false
+            if asked, presented == nil {
+                presented = c.kind
+            }
         }
-        assign(\.trackStates, states)
     }
+
+    // MARK: Reading
 
     func track(_ id: Track.ID?) -> Track? {
-        guard let id else { return nil }
-        return tracks.first { $0.id == id }
+        guard let id, let i = trackIndex[id] else { return nil }
+        return tracks[i]
     }
 
-    // MARK: Transfer
+    var selectedTracks: [Track] { selection.compactMap(track) }
 
-    var hiddenDstSelection: Int {
-        let shown = Set(dstRows.map(\.id))
-        return dstSelection.subtracting(shown).count
+    var presentedConfirmation: Confirmation? {
+        confirmations.first { $0.kind == presented }
     }
 
-    func preview(dst: Track.ID?) -> [String] {
-        guard let core else { return [] }
-        return core.pair_preview(srcSelection ?? "", dst ?? "").map { $0.as_str().toString() }
+    /// Open confirmations not on screen.
+    var waiting: [Confirmation] {
+        confirmations.filter { $0.kind != presented }
     }
 
-    func setCopyOptions(replace: Bool, lock: Bool) {
-        core?.set_copy_opts(replace, lock)
-        refresh()
+    var busy: Bool {
+        shop.busy || fetch.kind == .running || entries.contains(where: \.inFlight)
     }
 
-    func reviewTransfer() {
-        guard let src = srcSelection else { return }
-        let dsts = dstSelection.filter { $0 != src }.sorted().joined(separator: ",")
-        core?.build_pending(src, dsts)
-        refresh()
+    func offers(for id: Track.ID) -> [Offer] { offersBySrc[id] ?? [] }
+
+    func entries(for id: Track.ID) -> [QueueEntry] { entriesBySrc[id] ?? [] }
+
+    func upgrade(for id: Track.ID) -> Upgrade? {
+        if let e = entriesBySrc[id]?.max(by: { $0.id < $1.id }) { return .entry(e) }
+        let found = offersBySrc[id] ?? []
+        if found.contains(where: { $0.fetch == .running || $0.fetch == .queued }) { return .downloading }
+        switch shopStates[id] {
+        case .some(-1): return .searching
+        case .some(0): return .notFound
+        default: break
+        }
+        if let best = found.first { return .found(best, count: found.count) }
+        return nil
+    }
+
+    // MARK: Actions
+
+    private func send(_ body: @escaping @Sendable (CoreSession) -> Void) {
+        guard let core else { return }
+        Task {
+            await core.run(body)
+            kick()
+        }
+    }
+
+    private func ask(_ kind: Confirmation.Kind) {
+        requested[kind] = Date()
     }
 
     func reload() {
-        core?.reload_rows()
-        refresh()
+        send { $0.reload_rows() }
     }
 
-    // MARK: Confirmations
-
-    func accept() {
-        guard let core, let kind = confirmation?.kind else { return }
-        if core.accept_confirm(), kind == .transfer {
-            dstSelection.removeAll()
+    func findBetterCopies(_ ids: Set<Track.ID>) {
+        searched.formUnion(ids)
+        let csv = ids.sorted().joined(separator: ",")
+        let one = ids.count == 1 ? ids.first : nil
+        send { core in
+            if let one { _ = core.shop_track(one) } else { _ = core.shop_basket(csv) }
         }
-        refresh()
     }
 
-    func cancelConfirmation() {
-        core?.cancel_confirm()
-        refresh()
+    func research(_ id: Track.ID) {
+        searched.insert(id)
+        send { _ = $0.research(id) }
     }
 
-    func setBypassRekordboxCheck(_ on: Bool) {
-        core?.set_bypass_rekordbox_check(on)
-        refresh()
-    }
-
-    // MARK: Shop
-
-    /// Cross to the shop with the transfer screen's source, and search for it.
-    func shopForSource() {
-        guard let src = srcSelection else { return }
-        screen = .shop
-        if !shopRows.contains(where: { $0.id == src }) { shopQuery = "" }
-        shopSelection = [src]
-        _ = core?.shop_track(src)
-        refresh()
-        focusCursorOffer()
-    }
-
-    func search(_ ids: Set<Track.ID>) {
-        guard let core else { return }
-        if ids.count == 1, let id = ids.first {
-            _ = core.shop_track(id)
-        } else {
-            _ = core.shop_basket(ids.sorted().joined(separator: ","))
-        }
-        refresh()
-        focusCursorOffer()
-    }
-
-    func research(_ id: Track.ID?) {
-        _ = core?.research(id ?? "")
-        refresh()
-    }
-
-    /// Select the offer the session points at, such as a newly arrived block.
-    private func focusCursorOffer() {
-        guard shopStatus.kind == .results, Int(shopStatus.offerCursor) < offers.count else { return }
-        offerSelection = offers[Int(shopStatus.offerCursor)].id
-    }
-
-    var selectedOffer: Offer? {
-        guard let id = offerSelection else { return nil }
-        return offers.first { $0.id == id }
-    }
-
-    func fetch(_ offer: Offer) {
-        _ = core?.start_fetch(offer.srcId, offer.itemRef, shopSelection.count == 1 ? shopSelection.first! : "")
-        refresh()
+    func download(_ offer: Offer) {
+        send { _ = $0.start_fetch(offer.srcId, offer.itemRef, "") }
     }
 
     func openPage(_ offer: Offer) {
-        core?.open_offer(offer.srcId, offer.itemRef)
-        refresh()
+        send { $0.open_offer(offer.srcId, offer.itemRef) }
     }
 
-    // MARK: Queue
-
-    func reloadQueue() {
-        core?.reload_queue()
-        refresh()
+    /// Ask to copy `src`'s analysis onto `dsts`.
+    func reviewTransfer(from src: Track.ID, to dsts: some Sequence<Track.ID>) {
+        let csv = dsts.filter { $0 != src }.sorted().joined(separator: ",")
+        guard !csv.isEmpty else { return }
+        ask(.transfer)
+        send { $0.build_pending(src, csv) }
     }
 
     func importDownloads() {
-        core?.start_import()
-        refresh()
+        ask(.importRows)
+        send { $0.start_import() }
     }
 
-    func checkAndApply() {
-        core?.start_apply()
-        refresh()
+    func checkDownloads() {
+        send { $0.start_apply() }
     }
 
     func retry(_ id: QueueEntry.ID) {
-        core?.retry_entry(id)
-        refresh()
+        send { $0.retry_entry(id) }
     }
 
     func forget(_ id: QueueEntry.ID) {
-        core?.forget_entry(id)
-        refresh()
+        send { $0.forget_entry(id) }
     }
 
-    func forceApply(_ id: QueueEntry.ID) {
-        core?.start_force(id)
-        refresh()
+    func force(_ id: QueueEntry.ID) {
+        ask(.forceApply)
+        send { $0.start_force(id) }
     }
 
     func clearQueue() {
-        core?.start_clear_queue()
-        refresh()
+        ask(.clearQueue)
+        send { $0.start_clear_queue() }
+    }
+
+    func perform(_ notice: Notice) {
+        guard let core else { return }
+        let id = notice.id
+        if notice.step == .importDownloads { ask(.importRows) }
+        Task {
+            let review = await core.run { $0.perform_notice(id) }
+            if let kind = Confirmation.Kind(rawValue: review) { presented = kind }
+            kick()
+        }
+    }
+
+    func present(_ kind: Confirmation.Kind) {
+        presented = kind
+        activityShown = false
+    }
+
+    func accept(_ kind: Confirmation.Kind) {
+        let code = kind.rawValue
+        send { _ = $0.accept(code) }
+    }
+
+    func cancel(_ kind: Confirmation.Kind) {
+        if presented == kind { presented = nil }
+        let code = kind.rawValue
+        send { $0.cancel(code) }
+    }
+
+    func setCopyOptions(replace: Bool, lock: Bool) {
+        send { $0.set_copy_opts(replace, lock) }
+    }
+
+    func setBypassRekordboxCheck(_ on: Bool) {
+        send { $0.set_bypass_rekordbox_check(on) }
+    }
+
+    func setAutoAdvance(_ on: Bool) {
+        UserDefaults.standard.set(on, forKey: "autoAdvance")
+        send { $0.set_auto_advance(on) }
     }
 
     // MARK: Quitting
 
     /// What a quit would throw away, or nil when nothing would be lost.
     var quitWarning: String? {
-        guard let core else { return nil }
         var bits: [String] = []
-        if !dstSelection.isEmpty { bits.append("\(dstSelection.count) destination(s) selected") }
-        if core.unresolved_errors() { bits.append("unresolved apply errors") }
-        let work = core.work_in_flight().toString()
-        if !work.isEmpty { bits.append(work) }
+        if !confirmations.isEmpty { bits.append("\(confirmations.count) confirmation(s) waiting") }
+        if unresolvedErrors { bits.append("unresolved apply errors") }
+        if !workInFlight.isEmpty { bits.append(workInFlight) }
         return bits.isEmpty ? nil : bits.joined(separator: ", ")
     }
 }

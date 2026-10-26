@@ -20,33 +20,61 @@ enum Tone: UInt8 {
 }
 
 struct Track: Identifiable, Hashable {
+    enum Origin: UInt8 { case local, cloud, stream }
+
     let id: String
+    let uuid: String
     let title: String
     let artist: String
     /// Hundredths of a beat per minute.
     let bpm: Int64?
+    let key: String
     let lengthSecs: Int64?
     let cueCount: Int64
     let locked: Bool
     let fileType: String
+    let artworkPath: String?
+    let origin: Origin
+    /// nil for a stream, or a file rekordbox cannot open.
+    let lossless: Bool?
+    /// nil when it cannot be told.
+    let present: Bool?
 
     init(_ v: TrackRowViewRef) {
         id = v.id().toString()
+        uuid = v.uuid().toString()
         title = v.title().toString()
         artist = v.artist().toString()
         bpm = v.bpm()
+        key = v.key().toString()
         lengthSecs = v.length_secs()
         cueCount = v.cue_count()
         locked = v.locked()
         fileType = v.file_type().toString()
+        let art = v.artwork_path().toString()
+        artworkPath = art.isEmpty ? nil : art
+        origin = Origin(rawValue: v.origin()) ?? .local
+        lossless = switch v.lossless() {
+        case 1: true
+        case 0: false
+        default: nil
+        }
+        present = switch v.present() {
+        case 1: true
+        case 0: false
+        default: nil
+        }
     }
 
     var displayTitle: String { title.isEmpty ? "(untitled)" : title }
+    var bpmValue: Double { bpm.map { Double($0) / 100 } ?? 0 }
     var bpmText: String { bpm.map { String(format: "%.2f", Double($0) / 100) } ?? "—" }
     var lengthText: String {
         guard let s = lengthSecs else { return "—" }
         return String(format: "%d:%02d", s / 60, s % 60)
     }
+    var missing: Bool { present == false }
+    var analysed: Bool { locked || cueCount > 0 }
 }
 
 struct StatusMessage: Equatable {
@@ -60,15 +88,149 @@ struct StatusMessage: Equatable {
         text = s.text.toString()
         level = Level(rawValue: s.level) ?? .info
     }
+}
 
+extension StatusMessage.Level {
     var tone: Tone {
-        switch level {
+        switch self {
         case .info: .plain
         case .warn: .warn
         case .error: .bad
         case .ok: .good
         }
     }
+
+    var symbol: String {
+        switch self {
+        case .info: "info.circle"
+        case .warn: "exclamationmark.triangle"
+        case .error: "xmark.octagon"
+        case .ok: "checkmark.circle"
+        }
+    }
+}
+
+/// The step a notice or queue entry points at.
+enum Step: UInt8 {
+    case none, openBuyPage, research, fillBasket, nextBasketBatch, importDownloads, checkDownloads, force,
+         forget, review
+
+    /// A button title, or nil where the app has nothing to offer: the basket
+    /// steps belong to the TUI.
+    var title: String? {
+        switch self {
+        case .none, .fillBasket, .nextBasketBatch: nil
+        case .openBuyPage: "Open Buy Page"
+        case .research: "Search Again"
+        case .importDownloads: "Import"
+        case .checkDownloads: "Check"
+        case .force: "Force…"
+        case .forget: "Forget"
+        case .review: "Review…"
+        }
+    }
+}
+
+struct Notice: Identifiable, Equatable {
+    let id: UInt64
+    let level: StatusMessage.Level
+    let text: String
+    let step: Step
+
+    init(_ v: NoticeViewRef) {
+        id = v.id()
+        level = StatusMessage.Level(rawValue: v.level()) ?? .info
+        text = v.text().toString()
+        step = Step(rawValue: v.action()) ?? .none
+    }
+}
+
+/// What the library table shows.
+enum Scope: Hashable {
+    /// A `CollectionCount.code`.
+    case collection(UInt8)
+    case playlist(String)
+
+    static let library = Scope.collection(0)
+}
+
+struct CollectionCount: Identifiable, Equatable {
+    let code: UInt8
+    let title: String
+    let count: UInt32
+
+    var id: UInt8 { code }
+
+    init(_ v: CollectionViewRef) {
+        code = v.code()
+        title = v.title().toString()
+        count = v.count()
+    }
+
+    var symbol: String {
+        switch code {
+        case 0: "music.note.list"
+        case 1: "arrow.up.circle"
+        case 2: "waveform.badge.exclamationmark"
+        case 3: "questionmark.folder"
+        default: "wand.and.stars"
+        }
+    }
+}
+
+struct PlaylistNode: Identifiable, Hashable {
+    let id: String
+    let name: String
+    let folder: Bool
+    let smart: Bool
+    /// nil for a playlist, so an outline shows no disclosure triangle.
+    var children: [PlaylistNode]?
+
+    /// Nests the flat, parent-first list the session reports.
+    static func tree(_ list: RustVec<PlaylistView>) -> [PlaylistNode] {
+        var byParent: [String: [(String, String, Bool, Bool)]] = [:]
+        for v in list {
+            let entry = (v.id().toString(), v.name().toString(), v.folder(), v.smart())
+            byParent[v.parent().toString(), default: []].append(entry)
+        }
+        func build(_ parent: String) -> [PlaylistNode] {
+            (byParent[parent] ?? []).map { id, name, folder, smart in
+                PlaylistNode(id: id, name: name, folder: folder, smart: smart,
+                             children: folder ? build(id) : nil)
+            }
+        }
+        // Top-level nodes report an empty parent.
+        return build("")
+    }
+}
+
+struct Suggestion: Identifiable, Equatable {
+    let id: String
+    /// Analysis would go from the inspected track to this one.
+    let outgoing: Bool
+}
+
+struct CueMark: Equatable {
+    let ms: Int64
+    let endMs: Int64?
+    /// 0 for a memory cue, otherwise a hot cue slot.
+    let kind: Int64
+
+    init(_ v: CueMarkViewRef) {
+        ms = v.ms()
+        let end = v.end_ms()
+        endMs = end >= 0 ? end : nil
+        kind = v.kind()
+    }
+
+    var hot: Bool { kind != 0 }
+}
+
+/// What the inspector shows about one track beyond its row.
+struct Inspection: Equatable {
+    let trackId: String
+    var suggestions: [Suggestion] = []
+    var cueMarks: [CueMark] = []
 }
 
 struct ShopStatus: Equatable {
@@ -77,7 +239,6 @@ struct ShopStatus: Equatable {
     var text = ""
     var done: UInt32 = 0
     var total: UInt32 = 0
-    var offerCursor: UInt32 = 0
     var searchesOutstanding: UInt32 = 0
     var elapsedSecs: UInt64 = 0
 
@@ -88,10 +249,11 @@ struct ShopStatus: Equatable {
         text = s.text.toString()
         done = s.done
         total = s.total
-        offerCursor = s.offer_cursor
         searchesOutstanding = s.searches_outstanding
         elapsedSecs = s.elapsed_secs
     }
+
+    var busy: Bool { kind == .searching || searchesOutstanding > 0 }
 }
 
 struct FetchStatus: Equatable {
@@ -119,7 +281,6 @@ struct Offer: Identifiable, Hashable {
     /// Track and item together: one offer can answer two tracks' searches.
     var id: String { "\(srcId)|\(itemRef)" }
     let srcId: String
-    let groupLabel: String
     let itemRef: String
     let backend: String
     let artist: String
@@ -138,7 +299,6 @@ struct Offer: Identifiable, Hashable {
 
     init(_ v: OfferViewRef) {
         srcId = v.src_id().toString()
-        groupLabel = v.group_label().toString()
         itemRef = v.item_ref().toString()
         backend = v.backend().toString()
         artist = v.artist().toString()
@@ -158,42 +318,33 @@ struct Offer: Identifiable, Hashable {
         fetch = Fetch(rawValue: v.fetch()) ?? .none
         matchScore = v.match_score()
     }
-}
 
-struct OfferGroup: Identifiable, Equatable {
-    let id: String
-    let label: String
-    let offers: [Offer]
-
-    static func grouping(_ offers: [Offer]) -> [OfferGroup] {
-        var groups: [OfferGroup] = []
-        for offer in offers {
-            if let last = groups.last, last.id == offer.srcId {
-                groups[groups.count - 1] = OfferGroup(id: last.id, label: last.label, offers: last.offers + [offer])
-            } else {
-                groups.append(OfferGroup(id: offer.srcId, label: offer.groupLabel, offers: [offer]))
-            }
-        }
-        return groups
+    /// "FLAC · £1.00 · bandcamp"
+    var summary: String {
+        [formats, price, backend].filter { !$0.isEmpty }.joined(separator: " · ")
     }
 }
 
 struct QueueEntry: Identifiable, Hashable {
     let id: Int64
+    let srcId: String
     let title: String
     let artist: String
     let fileName: String
     let state: String
     let tone: Tone
+    let step: Step
     let inFlight: Bool
 
     init(_ v: QueueEntryViewRef) {
         id = v.id()
+        srcId = v.src_id().toString()
         title = v.title().toString()
         artist = v.artist().toString()
         fileName = v.file_name().toString()
         state = v.state().toString()
         tone = Tone(rawValue: v.tone()) ?? .plain
+        step = Step(rawValue: v.action()) ?? .none
         inFlight = v.in_flight()
     }
 }
@@ -210,6 +361,43 @@ struct Confirmation: Equatable, Identifiable {
     let accept: String
     let lines: [Line]
 
-    var id: String { "\(kind.rawValue)|\(title)" }
+    var id: Kind { kind }
     var isDestructive: Bool { kind == .forceApply || kind == .clearQueue }
+
+    var waitingLabel: String {
+        switch kind {
+        case .transfer: "Transfer ready to review"
+        case .importRows: "Downloads ready to import"
+        case .forceApply: "Unverified transfer ready to review"
+        case .clearQueue: "Clearing the queue"
+        }
+    }
+}
+
+/// Where a track has got to in finding and fitting a better copy.
+enum Upgrade: Equatable {
+    case searching
+    case notFound
+    case found(Offer, count: Int)
+    case downloading
+    case entry(QueueEntry)
+
+    var text: String {
+        switch self {
+        case .searching: "Searching…"
+        case .notFound: "No better copy found"
+        case let .found(offer, count): count > 1 ? "\(offer.summary) +\(count - 1)" : offer.summary
+        case .downloading: "Downloading…"
+        case let .entry(e): e.state
+        }
+    }
+
+    var tone: Tone {
+        switch self {
+        case .searching, .downloading: .active
+        case .notFound: .muted
+        case let .found(offer, _): offer.requiresPurchase ? .plain : .good
+        case let .entry(e): e.tone
+        }
+    }
 }

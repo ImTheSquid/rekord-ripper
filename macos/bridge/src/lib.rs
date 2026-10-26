@@ -256,6 +256,9 @@ mod ffi {
         fn state(&self) -> String;
         fn tone(&self) -> u8;
         fn in_flight(&self) -> bool;
+        fn src_id(&self) -> String;
+        // The step that moves it along, as `NoticeView::action`.
+        fn action(&self) -> u8;
     }
 
     extern "Rust" {
@@ -286,6 +289,7 @@ pub struct QueueEntryView {
     entry: Entry,
     state: String,
     tone: Tone,
+    action: Option<NoticeAction>,
     in_flight: bool,
 }
 
@@ -331,6 +335,21 @@ fn level_code(level: StatusLevel) -> u8 {
         StatusLevel::Warn => 1,
         StatusLevel::Err => 2,
         StatusLevel::Ok => 3,
+    }
+}
+
+fn action_code(action: Option<&NoticeAction>) -> u8 {
+    match action {
+        None => 0,
+        Some(NoticeAction::OpenBuyPage { .. }) => 1,
+        Some(NoticeAction::Research { .. }) => 2,
+        Some(NoticeAction::FillBasket) => 3,
+        Some(NoticeAction::NextBasketBatch { .. }) => 4,
+        Some(NoticeAction::ImportDownloads) => 5,
+        Some(NoticeAction::CheckDownloads) => 6,
+        Some(NoticeAction::ForceEntry { .. }) => 7,
+        Some(NoticeAction::ForgetEntry { .. }) => 8,
+        Some(NoticeAction::Review(_)) => 9,
     }
 }
 
@@ -657,11 +676,12 @@ impl CoreSession {
     }
 
     fn entry_view(&self, e: &Entry) -> QueueEntryView {
-        let (state, tone, _) = view::entry_state(&self.0, e);
+        let (state, tone, action) = view::entry_state(&self.0, e);
         QueueEntryView {
             entry: e.clone(),
             state,
             tone,
+            action,
             in_flight: self.0.queue.in_flight(e.id),
         }
     }
@@ -961,18 +981,7 @@ impl NoticeView {
         self.0.text.clone()
     }
     fn action(&self) -> u8 {
-        match &self.0.action {
-            None => 0,
-            Some(NoticeAction::OpenBuyPage { .. }) => 1,
-            Some(NoticeAction::Research { .. }) => 2,
-            Some(NoticeAction::FillBasket) => 3,
-            Some(NoticeAction::NextBasketBatch { .. }) => 4,
-            Some(NoticeAction::ImportDownloads) => 5,
-            Some(NoticeAction::CheckDownloads) => 6,
-            Some(NoticeAction::ForceEntry { .. }) => 7,
-            Some(NoticeAction::ForgetEntry { .. }) => 8,
-            Some(NoticeAction::Review(_)) => 9,
-        }
+        action_code(self.0.action.as_ref())
     }
 }
 
@@ -1061,6 +1070,12 @@ impl QueueEntryView {
     }
     fn in_flight(&self) -> bool {
         self.in_flight
+    }
+    fn src_id(&self) -> String {
+        self.entry.src_content_id.clone()
+    }
+    fn action(&self) -> u8 {
+        action_code(self.action.as_ref())
     }
 }
 

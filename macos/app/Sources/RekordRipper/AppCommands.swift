@@ -1,44 +1,32 @@
 import AppKit
 import SwiftUI
 
-/// Menu commands, with shortcuts that follow the TUI's keys behind ⌘.
 struct AppCommands: Commands {
     let model: SessionModel
 
     var body: some Commands {
         CommandGroup(after: .sidebar) {
-            Divider()
-            ForEach(Array(Screen.allCases.enumerated()), id: \.element) { i, screen in
-                Button(screen.rawValue) { model.screen = screen }
-                    .keyboardShortcut(KeyEquivalent(Character("\(i + 1)")), modifiers: .command)
-            }
+            Button(model.inspectorShown ? "Hide Inspector" : "Show Inspector") { model.inspectorShown.toggle() }
+                .keyboardShortcut("i", modifiers: [.command, .option])
+            Button("Activity") { model.activityShown.toggle() }
+                .keyboardShortcut("0", modifiers: .command)
         }
 
         CommandMenu("Library") {
             Button("Reload") { model.reload() }
                 .keyboardShortcut("r", modifiers: .command)
             Divider()
-            Button("Review Transfer…") { model.reviewTransfer() }
-                .keyboardShortcut(.return, modifiers: .command)
-                .disabled(model.srcSelection == nil || model.dstSelection.isEmpty)
-            Button("Shop for Source") { model.shopForSource() }
-                .keyboardShortcut("s", modifiers: [.command, .shift])
-                .disabled(model.srcSelection == nil)
-            Button("Clear Destinations") { model.dstSelection.removeAll() }
-                .keyboardShortcut("c", modifiers: [.command, .shift])
-            Divider()
-            Toggle("Unanalysed Destinations Only", isOn: Binding(
-                get: { model.autoFilter }, set: { model.autoFilter = $0 }))
-                .keyboardShortcut("a", modifiers: [.command, .shift])
-            Toggle("Destinations Matching Source", isOn: Binding(
-                get: { model.fuzzyFromSrc }, set: { model.fuzzyFromSrc = $0 }))
+            Button("Find Better Copies") { model.findBetterCopies(model.selection) }
                 .keyboardShortcut("f", modifiers: [.command, .shift])
+                .disabled(model.selection.isEmpty)
+            Divider()
+            Button("Import Downloads") { model.importDownloads() }
+            Button("Check Downloads") { model.checkDownloads() }
+            Divider()
             Toggle("Replace Existing Cues", isOn: Binding(
                 get: { model.copyReplace }, set: { model.setCopyOptions(replace: $0, lock: model.copyLock) }))
-                .keyboardShortcut("r", modifiers: [.command, .shift])
             Toggle("Lock After Copying", isOn: Binding(
                 get: { model.copyLock }, set: { model.setCopyOptions(replace: model.copyReplace, lock: $0) }))
-                .keyboardShortcut("l", modifiers: [.command, .shift])
             Divider()
             Toggle("Allow Writes While Rekordbox Is Running", isOn: Binding(
                 get: { model.bypassRekordboxCheck }, set: { setBypass($0) }))
