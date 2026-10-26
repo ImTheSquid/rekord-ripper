@@ -148,6 +148,16 @@ struct SidebarView: View {
     @Environment(SessionModel.self) private var model
 
     var body: some View {
+        // Built once the library has loaded: filling an empty outline with
+        // every row at once trips AppKit's reentrancy warning.
+        if model.collections.isEmpty {
+            ProgressView().controlSize(.small).frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            list
+        }
+    }
+
+    private var list: some View {
         List(selection: Binding(get: { model.scope }, set: { if let s = $0 { model.scope = s } })) {
             Section("Library") {
                 ForEach(model.collections) { c in

@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 struct LibraryTable: View {
@@ -73,6 +74,7 @@ struct LibraryTable: View {
                 ContentUnavailableView.search(text: model.query)
             }
         }
+        .background(FixedRowHeight(rows: rows.count))
     }
 
     private var rows: [Track] {
@@ -140,5 +142,50 @@ struct UpgradeCell: View {
             }
             .font(.callout)
         }
+    }
+}
+
+/// Gives the library table a fixed row height. SwiftUI turns on automatic
+/// heights, whose estimate re-enters the table's own update when thousands of
+/// rows change, which AppKit reports as reentrancy. Every row is one line.
+private struct FixedRowHeight: NSViewRepresentable {
+    /// Only so SwiftUI calls `updateNSView` when the rows change.
+    let rows: Int
+
+    /// Applies on joining the window, before the first rows arrive.
+    final class Probe: NSView {
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            FixedRowHeight.apply(near: self)
+        }
+    }
+
+    func makeNSView(context _: Context) -> NSView { Probe() }
+
+    func updateNSView(_ view: NSView, context _: Context) {
+        DispatchQueue.main.async { Self.apply(near: view) }
+    }
+
+    fileprivate static func apply(near view: NSView) {
+        var ancestor = view.superview
+        while let a = ancestor {
+            if let table = firstTable(in: a) {
+                if table.usesAutomaticRowHeights {
+                    table.usesAutomaticRowHeights = false
+                    table.rowHeight = 24
+                }
+                return
+            }
+            ancestor = a.superview
+        }
+    }
+
+    /// The first multi-column table: the sidebar is a one-column outline.
+    private static func firstTable(in view: NSView) -> NSTableView? {
+        if let t = view as? NSTableView, t.numberOfColumns > 1 { return t }
+        for sub in view.subviews {
+            if let t = firstTable(in: sub) { return t }
+        }
+        return nil
     }
 }
