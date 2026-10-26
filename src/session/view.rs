@@ -80,8 +80,15 @@ pub struct ConfirmView {
 }
 
 impl Session {
+    /// The newest open confirmation.
     pub fn confirm_view(&self) -> Option<ConfirmView> {
-        let kind = self.confirm()?;
+        self.confirm_view_for(self.confirm()?)
+    }
+
+    pub fn confirm_view_for(&self, kind: ConfirmKind) -> Option<ConfirmView> {
+        if !self.confirmations.is_open(kind) {
+            return None;
+        }
         let mut lines = Vec::new();
         let (title, accept) = match kind {
             ConfirmKind::Transfer => {
@@ -218,7 +225,8 @@ mod tests {
             assert!(!text.is_empty(), "{state:?} renders as nothing");
         }
         // The verdict is appended when there is one, and never as a bare dash.
-        let (with, _, _) = stored_state_label(State::Rejected, Some("duration differs by 9s"), false);
+        let (with, _, _) =
+            stored_state_label(State::Rejected, Some("duration differs by 9s"), false);
         assert!(with.contains("rejected") && with.contains("9s"));
         let (without, _, _) = stored_state_label(State::Rejected, Some(""), false);
         assert_eq!(without, "rejected");

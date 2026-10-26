@@ -10,13 +10,17 @@
 
 use rekord_ripper::acquire::ItemRef;
 use rekord_ripper::acquire::shop::{GroupOutcome, RankedOffer};
+use rekord_ripper::analysis::CueMark;
 use rekord_ripper::db::SafetyOpts;
+use rekord_ripper::format::Origin;
 use rekord_ripper::library::TrackRow;
 use rekord_ripper::pending::Entry;
+use rekord_ripper::playlists::PlaylistNode;
+use rekord_ripper::session::collections::{Collection, Direction, Scope, Suggestion};
 use rekord_ripper::session::filter::{dst_visible, src_visible};
 use rekord_ripper::session::shop::{FetchState, OfferFetch, ShopState, ShopTrackState};
 use rekord_ripper::session::view::{self, Tone};
-use rekord_ripper::session::{ConfirmKind, Session, StatusLevel};
+use rekord_ripper::session::{ConfirmKind, Notice, NoticeAction, Session, StatusLevel};
 
 /// Matches the TUI's tolerance for the fuzzy-from-source filter.
 const DURATION_TOL_SECS: i64 = 1;
@@ -122,6 +126,36 @@ mod ffi {
         fn forget_entry(&mut self, id: i64);
         fn start_force(&mut self, id: i64);
         fn start_clear_queue(&mut self);
+
+        // Library + inspector.
+        fn playlists(&self) -> Vec<PlaylistView>;
+        fn collections(&self) -> Vec<CollectionView>;
+        // Indices into `rows()`: a collection (`CollectionView::code`), or a
+        // playlist in its own order, narrowed by `query`.
+        fn collection_visible(&self, code: u8, query: &str) -> Vec<u32>;
+        fn playlist_visible(&self, id: &str, query: &str) -> Vec<u32>;
+        fn suggestions(&self, id: &str) -> Vec<SuggestionView>;
+        // The top-ranked offer for the track, or none.
+        fn best_offer(&self, src_id: &str) -> Vec<OfferView>;
+        fn entries_for(&self, src_id: &str) -> Vec<QueueEntryView>;
+        fn cue_marks(&self, id: &str) -> Vec<CueMarkView>;
+
+        // Notices after `after`, oldest first.
+        fn notices(&self, after: u64) -> Vec<NoticeView>;
+        // Takes the notice's step. A review step is the frontend's to show:
+        // this returns its confirm kind (as `confirm`), otherwise 0.
+        fn perform_notice(&mut self, id: u64) -> u8;
+
+        // Open confirm kinds, oldest first.
+        fn open_confirms(&self) -> Vec<u8>;
+        fn confirm_for(&self, kind: u8) -> ConfirmFfi;
+        fn confirm_lines_for(&self, kind: u8) -> Vec<ToneLine>;
+        fn accept(&mut self, kind: u8) -> bool;
+        fn cancel(&mut self, kind: u8);
+
+        // The new entry's id, or -1.
+        fn queue_file(&mut self, src_id: &str, path: &str) -> i64;
+        fn set_auto_advance(&mut self, on: bool);
     }
 
     extern "Rust" {
@@ -135,6 +169,60 @@ mod ffi {
         fn cue_count(&self) -> i64;
         fn locked(&self) -> bool;
         fn file_type(&self) -> String;
+        fn uuid(&self) -> String;
+        fn key(&self) -> String;
+        // Absolute path to the cover art, or empty.
+        fn artwork_path(&self) -> String;
+        // 0 local, 1 cloud, 2 stream.
+        fn origin(&self) -> u8;
+        // 1 lossless, 0 lossy, -1 neither (a stream, or unreadable).
+        fn lossless(&self) -> i8;
+        // 1 on disk, 0 missing, -1 cannot tell.
+        fn present(&self) -> i8;
+    }
+
+    extern "Rust" {
+        type PlaylistView;
+        fn id(&self) -> String;
+        fn name(&self) -> String;
+        // Empty at the top level.
+        fn parent(&self) -> String;
+        fn folder(&self) -> bool;
+        fn smart(&self) -> bool;
+    }
+
+    extern "Rust" {
+        type CollectionView;
+        fn code(&self) -> u8;
+        fn title(&self) -> String;
+        fn count(&self) -> u32;
+    }
+
+    extern "Rust" {
+        type SuggestionView;
+        fn id(&self) -> String;
+        // True when analysis would go from the selected track to this one.
+        fn outgoing(&self) -> bool;
+    }
+
+    extern "Rust" {
+        type CueMarkView;
+        fn ms(&self) -> i64;
+        // Loop end, or -1.
+        fn end_ms(&self) -> i64;
+        // 0 memory cue, otherwise a hot cue slot.
+        fn kind(&self) -> i64;
+    }
+
+    extern "Rust" {
+        type NoticeView;
+        fn id(&self) -> u64;
+        // As `StatusFfi::level`.
+        fn level(&self) -> u8;
+        fn text(&self) -> String;
+        // 0 none, 1 open buy page, 2 search again, 3 fill basket, 4 next basket
+        // batch, 5 import, 6 check, 7 force, 8 forget, 9 review.
+        fn action(&self) -> u8;
     }
 
     extern "Rust" {
@@ -182,7 +270,10 @@ use ffi::{ConfirmFfi, FetchStatusFfi, ShopStatusFfi, StatusFfi};
 
 pub struct CoreSession(Session);
 
-pub struct TrackRowView(TrackRow);
+pub struct TrackRowView {
+    row: TrackRow,
+    artwork: Option<std::path::PathBuf>,
+}
 
 pub struct OfferView {
     src_id: Option<String>,
@@ -200,6 +291,53 @@ pub struct QueueEntryView {
 
 pub struct ToneLine(Tone, String);
 
+pub struct PlaylistView(PlaylistNode);
+
+pub struct CollectionView(Collection, usize);
+
+pub struct SuggestionView(Suggestion);
+
+pub struct CueMarkView(CueMark);
+
+pub struct NoticeView(Notice);
+
+/// Codes in the order of `Collection::ALL`.
+fn collection_code(code: u8) -> Option<Collection> {
+    Collection::ALL.get(code as usize).copied()
+}
+
+fn confirm_code(kind: ConfirmKind) -> u8 {
+    match kind {
+        ConfirmKind::Transfer => 1,
+        ConfirmKind::ImportRows => 2,
+        ConfirmKind::ForceApply => 3,
+        ConfirmKind::ClearQueue => 4,
+    }
+}
+
+fn confirm_kind(code: u8) -> Option<ConfirmKind> {
+    Some(match code {
+        1 => ConfirmKind::Transfer,
+        2 => ConfirmKind::ImportRows,
+        3 => ConfirmKind::ForceApply,
+        4 => ConfirmKind::ClearQueue,
+        _ => return None,
+    })
+}
+
+fn level_code(level: StatusLevel) -> u8 {
+    match level {
+        StatusLevel::Info => 0,
+        StatusLevel::Warn => 1,
+        StatusLevel::Err => 2,
+        StatusLevel::Ok => 3,
+    }
+}
+
+fn indices(v: Vec<usize>) -> Vec<u32> {
+    v.into_iter().map(|i| i as u32).collect()
+}
+
 fn tone_code(t: Tone) -> u8 {
     match t {
         Tone::Plain => 0,
@@ -213,7 +351,25 @@ fn tone_code(t: Tone) -> u8 {
 }
 
 fn ids(csv: &str) -> impl Iterator<Item = String> + '_ {
-    csv.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
+    csv.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn confirm_ffi(view: Option<view::ConfirmView>) -> ConfirmFfi {
+    match view {
+        Some(v) => ConfirmFfi {
+            kind: confirm_code(v.kind),
+            title: v.title,
+            accept: v.accept,
+        },
+        None => ConfirmFfi {
+            kind: 0,
+            title: String::new(),
+            accept: String::new(),
+        },
+    }
 }
 
 fn non_empty(s: &str) -> Option<&str> {
@@ -223,9 +379,9 @@ fn non_empty(s: &str) -> Option<&str> {
 impl CoreSession {
     fn open() -> Result<CoreSession, String> {
         // Downloads rip into a scratch dir that a quit mid-gate leaves behind.
-        let _ = rekord_ripper::fingerprint::ScratchDir::sweep_stale(std::time::Duration::from_secs(
-            24 * 3600,
-        ));
+        let _ = rekord_ripper::fingerprint::ScratchDir::sweep_stale(
+            std::time::Duration::from_secs(24 * 3600),
+        );
         Session::open(SafetyOpts::default())
             .map(CoreSession)
             .map_err(|e| format!("{e:#}"))
@@ -249,15 +405,9 @@ impl CoreSession {
     }
 
     fn status(&self) -> StatusFfi {
-        let level = match self.0.status.level {
-            StatusLevel::Info => 0,
-            StatusLevel::Warn => 1,
-            StatusLevel::Err => 2,
-            StatusLevel::Ok => 3,
-        };
         StatusFfi {
             text: self.0.status.text.clone(),
-            level,
+            level: level_code(self.0.status.level),
         }
     }
 
@@ -279,7 +429,17 @@ impl CoreSession {
     }
 
     fn rows(&self) -> Vec<TrackRowView> {
-        self.0.rows.iter().cloned().map(TrackRowView).collect()
+        self.0
+            .rows
+            .iter()
+            .map(|r| TrackRowView {
+                artwork: r
+                    .artwork
+                    .as_deref()
+                    .map(|p| self.0.db.resolve_analysis_path(p)),
+                row: r.clone(),
+            })
+            .collect()
     }
 
     fn reload_rows(&mut self) {
@@ -339,23 +499,7 @@ impl CoreSession {
     }
 
     fn confirm(&self) -> ConfirmFfi {
-        match self.0.confirm_view() {
-            Some(v) => ConfirmFfi {
-                kind: match v.kind {
-                    ConfirmKind::Transfer => 1,
-                    ConfirmKind::ImportRows => 2,
-                    ConfirmKind::ForceApply => 3,
-                    ConfirmKind::ClearQueue => 4,
-                },
-                title: v.title,
-                accept: v.accept,
-            },
-            None => ConfirmFfi {
-                kind: 0,
-                title: String::new(),
-                accept: String::new(),
-            },
-        }
+        confirm_ffi(self.0.confirm_view())
     }
 
     fn confirm_lines(&self) -> Vec<ToneLine> {
@@ -508,16 +652,18 @@ impl CoreSession {
             .queue
             .entries
             .iter()
-            .map(|e| {
-                let (state, tone, _) = view::entry_state(&self.0, e);
-                QueueEntryView {
-                    entry: e.clone(),
-                    state,
-                    tone,
-                    in_flight: self.0.queue.in_flight(e.id),
-                }
-            })
+            .map(|e| self.entry_view(e))
             .collect()
+    }
+
+    fn entry_view(&self, e: &Entry) -> QueueEntryView {
+        let (state, tone, _) = view::entry_state(&self.0, e);
+        QueueEntryView {
+            entry: e.clone(),
+            state,
+            tone,
+            in_flight: self.0.queue.in_flight(e.id),
+        }
     }
 
     fn start_import(&mut self) {
@@ -543,32 +689,290 @@ impl CoreSession {
     fn start_clear_queue(&mut self) {
         self.0.start_clear_queue();
     }
+
+    fn playlists(&self) -> Vec<PlaylistView> {
+        match rekord_ripper::playlists::tree(&self.0.db) {
+            Ok(nodes) => nodes.into_iter().map(PlaylistView).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn collections(&self) -> Vec<CollectionView> {
+        self.0
+            .collection_counts()
+            .into_iter()
+            .map(|(c, n)| CollectionView(c, n))
+            .collect()
+    }
+
+    fn collection_visible(&self, code: u8, query: &str) -> Vec<u32> {
+        let Some(c) = collection_code(code) else {
+            return Vec::new();
+        };
+        indices(self.0.scoped_visible(&Scope::Collection(c), query))
+    }
+
+    fn playlist_visible(&self, id: &str, query: &str) -> Vec<u32> {
+        indices(
+            self.0
+                .scoped_visible(&Scope::Playlist(id.to_string()), query),
+        )
+    }
+
+    fn suggestions(&self, id: &str) -> Vec<SuggestionView> {
+        self.0
+            .suggestions(id)
+            .into_iter()
+            .map(SuggestionView)
+            .collect()
+    }
+
+    fn best_offer(&self, src_id: &str) -> Vec<OfferView> {
+        self.0
+            .best_offer(src_id)
+            .map(|r| OfferView {
+                src_id: Some(src_id.to_string()),
+                group_label: String::new(),
+                offer: r.clone(),
+                fetch: self.0.offer_fetch(&r.offer.item_ref),
+            })
+            .into_iter()
+            .collect()
+    }
+
+    fn entries_for(&self, src_id: &str) -> Vec<QueueEntryView> {
+        self.0
+            .entries_for(src_id)
+            .map(|e| self.entry_view(e))
+            .collect()
+    }
+
+    fn cue_marks(&self, id: &str) -> Vec<CueMarkView> {
+        rekord_ripper::analysis::cue_marks(&self.0.db, id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(CueMarkView)
+            .collect()
+    }
+
+    fn notices(&self, after: u64) -> Vec<NoticeView> {
+        self.0
+            .status
+            .since(after)
+            .cloned()
+            .map(NoticeView)
+            .collect()
+    }
+
+    fn perform_notice(&mut self, id: u64) -> u8 {
+        let Some(action) = self
+            .0
+            .status
+            .since(0)
+            .find(|n| n.id == id)
+            .and_then(|n| n.action.clone())
+        else {
+            return 0;
+        };
+        match action {
+            NoticeAction::OpenBuyPage { src_id, item } => {
+                let offer = self
+                    .0
+                    .shop
+                    .find(src_id.as_deref(), &item)
+                    .map(|(_, r)| r.offer.clone());
+                match offer {
+                    Some(offer) => self.0.open_offer(&offer),
+                    None => self.0.status.warn("that offer is no longer listed."),
+                }
+            }
+            NoticeAction::Research { src_id } => {
+                self.0.research(Some(&src_id));
+            }
+            NoticeAction::ImportDownloads => self.0.start_import(),
+            NoticeAction::CheckDownloads => self.0.start_apply(),
+            NoticeAction::ForceEntry { entry_id } => self.0.start_force(entry_id),
+            NoticeAction::ForgetEntry { entry_id } => self.0.forget_entry(entry_id),
+            NoticeAction::Review(kind) => return confirm_code(kind),
+            // The basket is the TUI's; the app searches its selection instead.
+            NoticeAction::FillBasket | NoticeAction::NextBasketBatch { .. } => {}
+        }
+        0
+    }
+
+    fn open_confirms(&self) -> Vec<u8> {
+        self.0.confirmations.kinds().map(confirm_code).collect()
+    }
+
+    fn confirm_for(&self, kind: u8) -> ConfirmFfi {
+        confirm_ffi(confirm_kind(kind).and_then(|k| self.0.confirm_view_for(k)))
+    }
+
+    fn confirm_lines_for(&self, kind: u8) -> Vec<ToneLine> {
+        confirm_kind(kind)
+            .and_then(|k| self.0.confirm_view_for(k))
+            .map(|v| v.lines.into_iter().map(|(t, s)| ToneLine(t, s)).collect())
+            .unwrap_or_default()
+    }
+
+    fn accept(&mut self, kind: u8) -> bool {
+        confirm_kind(kind).is_some_and(|k| self.0.accept(k))
+    }
+
+    fn cancel(&mut self, kind: u8) {
+        if let Some(k) = confirm_kind(kind) {
+            self.0.cancel(k);
+        }
+    }
+
+    fn queue_file(&mut self, src_id: &str, path: &str) -> i64 {
+        self.0
+            .queue_file(src_id, std::path::Path::new(path))
+            .unwrap_or(-1)
+    }
+
+    fn set_auto_advance(&mut self, on: bool) {
+        self.0.set_auto_advance(on);
+    }
 }
 
 impl TrackRowView {
     fn id(&self) -> String {
-        self.0.id.clone()
+        self.row.id.clone()
     }
     fn title(&self) -> String {
-        self.0.title.clone()
+        self.row.title.clone()
     }
     fn artist(&self) -> String {
-        self.0.artist.clone()
+        self.row.artist.clone()
     }
     fn bpm(&self) -> Option<i64> {
-        self.0.bpm
+        self.row.bpm
     }
     fn length_secs(&self) -> Option<i64> {
-        self.0.length
+        self.row.length
     }
     fn cue_count(&self) -> i64 {
-        self.0.cue_count
+        self.row.cue_count
     }
     fn locked(&self) -> bool {
-        self.0.locked
+        self.row.locked
     }
     fn file_type(&self) -> String {
-        rekord_ripper::format::file_type_name(self.0.file_type).to_string()
+        rekord_ripper::format::file_type_name(self.row.file_type).to_string()
+    }
+    fn uuid(&self) -> String {
+        self.row.uuid.clone()
+    }
+    fn key(&self) -> String {
+        self.row.key.clone()
+    }
+    fn artwork_path(&self) -> String {
+        self.artwork
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+    fn origin(&self) -> u8 {
+        match self.row.origin {
+            Origin::Local => 0,
+            Origin::Cloud => 1,
+            Origin::Stream => 2,
+        }
+    }
+    fn lossless(&self) -> i8 {
+        match self.row.lossless() {
+            Some(true) => 1,
+            Some(false) => 0,
+            None => -1,
+        }
+    }
+    fn present(&self) -> i8 {
+        match self.row.present {
+            Some(true) => 1,
+            Some(false) => 0,
+            None => -1,
+        }
+    }
+}
+
+impl PlaylistView {
+    fn id(&self) -> String {
+        self.0.id.clone()
+    }
+    fn name(&self) -> String {
+        self.0.name.clone()
+    }
+    fn parent(&self) -> String {
+        self.0.parent.clone().unwrap_or_default()
+    }
+    fn folder(&self) -> bool {
+        self.0.folder
+    }
+    fn smart(&self) -> bool {
+        self.0.smart
+    }
+}
+
+impl CollectionView {
+    fn code(&self) -> u8 {
+        Collection::ALL
+            .iter()
+            .position(|&c| c == self.0)
+            .unwrap_or(0) as u8
+    }
+    fn title(&self) -> String {
+        self.0.title().to_string()
+    }
+    fn count(&self) -> u32 {
+        self.1 as u32
+    }
+}
+
+impl SuggestionView {
+    fn id(&self) -> String {
+        self.0.id.clone()
+    }
+    fn outgoing(&self) -> bool {
+        self.0.direction == Direction::To
+    }
+}
+
+impl CueMarkView {
+    fn ms(&self) -> i64 {
+        self.0.ms
+    }
+    fn end_ms(&self) -> i64 {
+        self.0.end_ms.unwrap_or(-1)
+    }
+    fn kind(&self) -> i64 {
+        self.0.kind
+    }
+}
+
+impl NoticeView {
+    fn id(&self) -> u64 {
+        self.0.id
+    }
+    fn level(&self) -> u8 {
+        level_code(self.0.level)
+    }
+    fn text(&self) -> String {
+        self.0.text.clone()
+    }
+    fn action(&self) -> u8 {
+        match &self.0.action {
+            None => 0,
+            Some(NoticeAction::OpenBuyPage { .. }) => 1,
+            Some(NoticeAction::Research { .. }) => 2,
+            Some(NoticeAction::FillBasket) => 3,
+            Some(NoticeAction::NextBasketBatch { .. }) => 4,
+            Some(NoticeAction::ImportDownloads) => 5,
+            Some(NoticeAction::CheckDownloads) => 6,
+            Some(NoticeAction::ForceEntry { .. }) => 7,
+            Some(NoticeAction::ForgetEntry { .. }) => 8,
+            Some(NoticeAction::Review(_)) => 9,
+        }
     }
 }
 

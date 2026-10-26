@@ -104,8 +104,11 @@ fn scoped(
     let matches = |r: &TrackRow| q.matches(r.fields());
     match members {
         Some(ids) => {
-            let index: HashMap<&str, usize> =
-                rows.iter().enumerate().map(|(i, r)| (r.id.as_str(), i)).collect();
+            let index: HashMap<&str, usize> = rows
+                .iter()
+                .enumerate()
+                .map(|(i, r)| (r.id.as_str(), i))
+                .collect();
             ids.iter()
                 .filter_map(|id| index.get(id.as_str()).copied())
                 .filter(|&i| matches(&rows[i]))
@@ -148,7 +151,13 @@ impl Session {
             Scope::Collection(c) => scoped(&self.rows, *c, None, &self.suggested, query),
             Scope::Playlist(id) => {
                 let members = crate::playlists::members(&self.db, id).unwrap_or_default();
-                scoped(&self.rows, Collection::Library, Some(&members), &self.suggested, query)
+                scoped(
+                    &self.rows,
+                    Collection::Library,
+                    Some(&members),
+                    &self.suggested,
+                    query,
+                )
             }
         }
     }
@@ -157,14 +166,20 @@ impl Session {
         Collection::ALL
             .iter()
             .map(|&c| {
-                let n = self.rows.iter().filter(|r| c.contains(r, &self.suggested)).count();
+                let n = self
+                    .rows
+                    .iter()
+                    .filter(|r| c.contains(r, &self.suggested))
+                    .count();
                 (c, n)
             })
             .collect()
     }
 
     pub fn suggestions(&self, id: &str) -> Vec<Suggestion> {
-        self.row(id).map(|row| twins(&self.rows, row)).unwrap_or_default()
+        self.row(id)
+            .map(|row| twins(&self.rows, row))
+            .unwrap_or_default()
     }
 
     /// The top-ranked offer found for `src_id`, if it has been searched.
@@ -177,7 +192,10 @@ impl Session {
 
     /// Queued downloads for `src_id`, oldest first.
     pub fn entries_for<'a>(&'a self, src_id: &'a str) -> impl Iterator<Item = &'a Entry> + 'a {
-        self.queue.entries.iter().filter(move |e| e.src_content_id == src_id)
+        self.queue
+            .entries
+            .iter()
+            .filter(move |e| e.src_content_id == src_id)
     }
 }
 
@@ -230,7 +248,11 @@ mod tests {
 
     #[test]
     fn a_playlist_keeps_its_order_and_skips_unknown_ids() {
-        let rows = [row("1", "apple", 0), row("2", "banana", 0), row("3", "apricot", 0)];
+        let rows = [
+            row("1", "apple", 0),
+            row("2", "banana", 0),
+            row("3", "apricot", 0),
+        ];
         let members = ["3".to_string(), "gone".into(), "1".into(), "2".into()];
         let got = scoped(&rows, Collection::Library, Some(&members), &none(), "");
         assert_eq!(got, [2, 0, 1]);
@@ -242,7 +264,10 @@ mod tests {
     fn suggested_transfers_are_the_auto_match_destinations() {
         let rows = [row("1", "a", 0), row("2", "b", 0)];
         let suggested = HashSet::from(["2".to_string()]);
-        assert_eq!(scoped(&rows, Collection::SuggestedTransfers, None, &suggested, ""), [1]);
+        assert_eq!(
+            scoped(&rows, Collection::SuggestedTransfers, None, &suggested, ""),
+            [1]
+        );
     }
 
     #[test]
@@ -258,13 +283,25 @@ mod tests {
         assert_eq!(
             from_bare,
             [
-                Suggestion { id: "cued".into(), direction: Direction::From },
-                Suggestion { id: "more".into(), direction: Direction::From },
+                Suggestion {
+                    id: "cued".into(),
+                    direction: Direction::From
+                },
+                Suggestion {
+                    id: "more".into(),
+                    direction: Direction::From
+                },
             ],
             "two unanalysed twins have nothing to give each other"
         );
         let from_cued = twins(&rows, &rows[0]);
-        assert!(from_cued.contains(&Suggestion { id: "bare".into(), direction: Direction::To }));
-        assert!(from_cued.contains(&Suggestion { id: "more".into(), direction: Direction::From }));
+        assert!(from_cued.contains(&Suggestion {
+            id: "bare".into(),
+            direction: Direction::To
+        }));
+        assert!(from_cued.contains(&Suggestion {
+            id: "more".into(),
+            direction: Direction::From
+        }));
     }
 }
