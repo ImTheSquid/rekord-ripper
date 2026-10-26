@@ -6,6 +6,7 @@
 //! reach the write without it.
 
 pub mod collections;
+pub mod config;
 pub mod confirm;
 pub mod diff;
 pub mod filter;
@@ -169,6 +170,9 @@ pub struct Session {
     /// searching the same track twice does not search it twice.
     shop_queued: Vec<String>,
     pub cfg: crate::config::Config,
+    /// Bumped whenever `cfg` is replaced.
+    pub config_revision: u64,
+    config_watch: config::ConfigWatch,
     pub unresolved_errors: bool,
     /// The download queue, and the store behind it.
     ///
@@ -218,9 +222,10 @@ impl Session {
 
     pub fn new(db: MasterDb, safety: SafetyOpts) -> anyhow::Result<Self> {
         let cfg_path = crate::paths::config_path(None)?;
+        let creds_path = crate::paths::credentials_path()?;
         let cfg = crate::config::Config::load(&cfg_path).unwrap_or_default();
-        let creds = crate::config::Credentials::load(&crate::paths::credentials_path()?)
-            .unwrap_or_default();
+        let creds = crate::config::Credentials::load(&creds_path).unwrap_or_default();
+        let config_watch = config::ConfigWatch::new(cfg_path, Some(creds_path));
         // A worker that will not start costs us searching, not the whole session.
         let worker = worker::Worker::spawn(&cfg, &creds).ok();
 
@@ -242,6 +247,8 @@ impl Session {
             fetched: HashSet::new(),
             shop_queued: Vec::new(),
             cfg,
+            config_revision: 0,
+            config_watch,
             unresolved_errors: false,
             queue: QueueState::default(),
             store: crate::pending::PendingStore::open().ok(),
@@ -266,7 +273,9 @@ impl Session {
         self.rows.iter().find(|r| r.id == id)
     }
 
-    pub fn poll_rekordbox_if_due(&mut self) {
+    /// Checks on rekordbox and the config files, each at most once a second.
+    pub fn poll_if_due(&mut self) {
+        self.poll_config();
         if self.rb_last_polled.elapsed() >= std::time::Duration::from_secs(1) {
             self.rb_running = rekordbox_running();
             self.rb_last_polled = Instant::now();

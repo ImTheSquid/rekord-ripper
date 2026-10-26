@@ -23,6 +23,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::acquire::Registry;
@@ -179,6 +180,8 @@ pub struct Worker {
     outstanding: usize,
     /// The same count, split by kind, so a message can name what is running.
     by_kind: HashMap<JobKind, usize>,
+    /// Settings the thread takes up before its next job.
+    reconfig: Arc<Mutex<Option<(Config, Credentials)>>>,
 }
 
 impl Worker {
@@ -187,8 +190,10 @@ impl Worker {
     pub fn spawn(cfg: &Config, creds: &Credentials) -> std::io::Result<Self> {
         let (job_tx, job_rx) = channel::<Job>();
         let (up_tx, up_rx) = channel::<Update>();
-        let cfg = cfg.clone();
+        let mut cfg = cfg.clone();
         let creds = creds.clone();
+        let reconfig = Arc::new(Mutex::new(None::<(Config, Credentials)>));
+        let pending = Arc::clone(&reconfig);
 
         std::thread::Builder::new()
             .name("rr-shop".into())
@@ -200,9 +205,13 @@ impl Worker {
                     let _ = notes.send(Update::Note(line.to_string()));
                 }));
 
-                let reg = Registry::from_config(&cfg, &creds);
+                let mut reg = Registry::from_config(&cfg, &creds);
                 // Ends when the UI drops its sender.
                 while let Ok(job) = job_rx.recv() {
+                    if let Some((c, k)) = pending.lock().ok().and_then(|mut p| p.take()) {
+                        reg = Registry::from_config(&c, &k);
+                        cfg = c;
+                    }
                     match job {
                         Job::Shop { specs, opts } => {
                             if up_tx.send(Update::Started).is_err() {
@@ -294,7 +303,16 @@ impl Worker {
             updates: up_rx,
             outstanding: 0,
             by_kind: HashMap::new(),
+            reconfig,
         })
+    }
+
+    /// Rebuilds the backends from these settings before the next job. Jobs
+    /// already queued run with them too.
+    pub fn reconfigure(&self, cfg: Config, creds: Credentials) {
+        if let Ok(mut slot) = self.reconfig.lock() {
+            *slot = Some((cfg, creds));
+        }
     }
 
     pub fn is_busy(&self) -> bool {

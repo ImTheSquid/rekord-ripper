@@ -55,7 +55,7 @@ fn main() -> anyhow::Result<()> {
         // Exactly what event_loop does each iteration, minus the input poll.
         let t0 = Instant::now();
         term.draw(|f| render::draw(f, &mut app))?;
-        app.poll_rekordbox_if_due();
+        app.poll_if_due();
         app.pump_worker();
         let elapsed = t0.elapsed();
         worst_tick = worst_tick.max(elapsed);

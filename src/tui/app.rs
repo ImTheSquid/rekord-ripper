@@ -211,8 +211,8 @@ impl App {
             .retain(|id| existing.contains(id.as_str()));
     }
 
-    pub fn poll_rekordbox_if_due(&mut self) {
-        self.session.poll_rekordbox_if_due();
+    pub fn poll_if_due(&mut self) {
+        self.session.poll_if_due();
     }
 
     pub fn pump_worker(&mut self) {

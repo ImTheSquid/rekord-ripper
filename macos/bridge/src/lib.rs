@@ -444,7 +444,7 @@ impl CoreSession {
     }
 
     fn poll(&mut self) {
-        self.0.poll_rekordbox_if_due();
+        self.0.poll_if_due();
         self.0.pump_worker();
     }
 
