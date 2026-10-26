@@ -10,7 +10,7 @@ use std::time::Instant;
 use crate::analysis::CopyOpts;
 use crate::pending::Entry;
 
-use super::{ConfirmKind, Session, worker};
+use super::{ConfirmKind, NoticeAction, Session, worker};
 
 /// What the screen has learned about one entry since the snapshot.
 pub enum EntryWork {
@@ -495,7 +495,8 @@ impl Session {
         self.queue.next_generation();
         if !self.submit_next_gate() {
             self.status
-                .info("nothing to check — import the downloads first with 'i'.");
+                .info("nothing to check — import the downloads first.");
+            self.status.act(NoticeAction::ImportDownloads);
         }
     }
 
@@ -614,7 +615,7 @@ impl Session {
                     self.queue.set_work(
                         entry_id,
                         EntryWork::Failed(
-                            "the rekordbox row changed while checking — press 'a' again".into(),
+                            "the rekordbox row changed while checking — check it again".into(),
                         ),
                     );
                 } else {
@@ -774,7 +775,8 @@ impl Session {
                 .flatten()
         else {
             self.status
-                .err("rekordbox has no row for this file yet — press 'i', or drag it in.");
+                .err("rekordbox has no row for this file yet — import it first.");
+            self.status.act(NoticeAction::ImportDownloads);
             return;
         };
         let Ok(src) = crate::analysis::load_track(&self.db, &entry.src_content_id) else {
@@ -782,8 +784,8 @@ impl Session {
             return;
         };
         if src.uuid != entry.src_uuid {
-            self.status
-                .err("the source track was replaced — 'c' forgets this entry.");
+            self.status.err("the source track was replaced.");
+            self.status.act(NoticeAction::ForgetEntry { entry_id: entry.id });
             return;
         }
         let opts = CopyOpts {
@@ -821,7 +823,10 @@ impl Session {
         });
         if still.as_deref() != Some(batch.dst_content_id.as_str()) {
             self.status
-                .err("the rekordbox row changed since you were shown the plan — press 'F' again.");
+                .err("the rekordbox row changed since you were shown the plan.");
+            self.status.act(NoticeAction::ForceEntry {
+                entry_id: batch.entry_id,
+            });
             return;
         }
         if let Err(e) = crate::db::safety_preflight(self.safety) {

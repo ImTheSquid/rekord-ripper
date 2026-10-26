@@ -514,7 +514,7 @@ impl CoreSession {
             .entries
             .iter()
             .map(|e| {
-                let (state, tone) = view::entry_state(&self.0, e);
+                let (state, tone, _) = view::entry_state(&self.0, e);
                 QueueEntryView {
                     entry: e.clone(),
                     state,

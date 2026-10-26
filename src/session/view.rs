@@ -4,7 +4,7 @@
 use crate::pending::{Entry, State};
 
 use super::queue::EntryWork;
-use super::{ConfirmKind, Session};
+use super::{ConfirmKind, NoticeAction, Session};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tone {
@@ -18,21 +18,31 @@ pub enum Tone {
     Muted,
 }
 
-/// How a stored state reads on the row.
+/// How a stored state reads on the row, and the step that moves it along.
 ///
 /// `has_row` is why this takes three arguments: the store keeps an entry at
 /// `AwaitingImport` right up until the transfer lands, so a row created seconds
 /// ago still claimed to be waiting for one — which read as the import having
 /// silently done nothing.
-pub fn stored_state_label(state: State, verdict: Option<&str>, has_row: bool) -> (String, Tone) {
-    let (label, tone) = match state {
-        State::AwaitingImport if has_row => ("imported — press 'a' to check", Tone::Active),
-        State::AwaitingImport => ("awaiting import — press 'i'", Tone::Warn),
-        State::Matched => ("ready to apply", Tone::Good),
-        State::Applied => ("applied", Tone::Good),
-        State::Rejected => ("rejected", Tone::Bad),
-        State::Expired => ("expired", Tone::Muted),
-        State::Cancelled => ("cancelled", Tone::Muted),
+pub fn stored_state_label(
+    state: State,
+    verdict: Option<&str>,
+    has_row: bool,
+) -> (String, Tone, Option<NoticeAction>) {
+    let (label, tone, action) = match state {
+        State::AwaitingImport if has_row => {
+            ("imported", Tone::Active, Some(NoticeAction::CheckDownloads))
+        }
+        State::AwaitingImport => (
+            "awaiting import",
+            Tone::Warn,
+            Some(NoticeAction::ImportDownloads),
+        ),
+        State::Matched => ("ready to apply", Tone::Good, None),
+        State::Applied => ("applied", Tone::Good, None),
+        State::Rejected => ("rejected", Tone::Bad, None),
+        State::Expired => ("expired", Tone::Muted, None),
+        State::Cancelled => ("cancelled", Tone::Muted, None),
     };
     // The verdict is why an entry is rejected or ready; hiding it would leave
     // the user guessing at the one thing that decided the outcome.
@@ -40,16 +50,18 @@ pub fn stored_state_label(state: State, verdict: Option<&str>, has_row: bool) ->
         .filter(|v| !v.is_empty())
         .map(|v| format!(" — {v}"))
         .unwrap_or_default();
-    (format!("{label}{verdict}"), tone)
+    (format!("{label}{verdict}"), tone, action)
 }
 
 /// What a queue entry is waiting on, or what it decided.
-pub fn entry_state(session: &Session, entry: &Entry) -> (String, Tone) {
+pub fn entry_state(session: &Session, entry: &Entry) -> (String, Tone, Option<NoticeAction>) {
     if let Some(work) = session.queue.work_for(entry.id) {
         return match work {
-            EntryWork::Failed(why) => (format!("failed — {why}"), Tone::Bad),
-            EntryWork::Ready { .. } | EntryWork::Planned(_) => (work.tag().to_string(), Tone::Good),
-            _ => (work.tag().to_string(), Tone::Active),
+            EntryWork::Failed(why) => (format!("failed — {why}"), Tone::Bad, None),
+            EntryWork::Ready { .. } | EntryWork::Planned(_) => {
+                (work.tag().to_string(), Tone::Good, None)
+            }
+            _ => (work.tag().to_string(), Tone::Active, None),
         };
     }
     stored_state_label(
@@ -202,13 +214,13 @@ mod tests {
             State::Expired,
             State::Cancelled,
         ] {
-            let (text, _) = stored_state_label(state, None, false);
+            let (text, _, _) = stored_state_label(state, None, false);
             assert!(!text.is_empty(), "{state:?} renders as nothing");
         }
         // The verdict is appended when there is one, and never as a bare dash.
-        let (with, _) = stored_state_label(State::Rejected, Some("duration differs by 9s"), false);
+        let (with, _, _) = stored_state_label(State::Rejected, Some("duration differs by 9s"), false);
         assert!(with.contains("rejected") && with.contains("9s"));
-        let (without, _) = stored_state_label(State::Rejected, Some(""), false);
+        let (without, _, _) = stored_state_label(State::Rejected, Some(""), false);
         assert_eq!(without, "rejected");
     }
 
@@ -217,15 +229,16 @@ mod tests {
         // The bug: the store holds an entry at AwaitingImport until the transfer
         // lands, so a row created seconds ago still read "awaiting import" and
         // the import looked like it had done nothing.
-        let (waiting, _) = stored_state_label(State::AwaitingImport, None, false);
-        let (imported, _) = stored_state_label(State::AwaitingImport, None, true);
+        let (waiting, _, import) = stored_state_label(State::AwaitingImport, None, false);
+        let (imported, _, check) = stored_state_label(State::AwaitingImport, None, true);
         assert_ne!(waiting, imported);
         assert!(waiting.contains("awaiting"));
         assert!(
             !imported.contains("awaiting"),
             "still says awaiting: {imported}"
         );
-        // Both say which key moves them along.
-        assert!(waiting.contains('i') && imported.contains('a'));
+        // Both say what moves them along.
+        assert_eq!(import, Some(NoticeAction::ImportDownloads));
+        assert_eq!(check, Some(NoticeAction::CheckDownloads));
     }
 }

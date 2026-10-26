@@ -7,8 +7,8 @@ use crate::acquire::ItemRef;
 use crate::acquire::shop::{GroupOutcome, QuerySpec, RankedOffer};
 use crate::library::TrackRow;
 
-use super::Session;
 use super::worker;
+use super::{NoticeAction, Session, StatusLevel};
 
 /// How far along a track is in the shop's track list.
 ///
@@ -307,9 +307,12 @@ impl Session {
                 *cursor = i;
             }
             self.status.info(format!(
-                "showing the {found} offer(s) already found for {} — 'r' re-runs it.",
+                "showing the {found} offer(s) already found for {}.",
                 row.title
             ));
+            self.status.act(NoticeAction::Research {
+                src_id: row.id.clone(),
+            });
             return true;
         }
         // Already in the queue: nothing to do but say so.
@@ -401,8 +404,8 @@ impl Session {
     /// rows, and each track is a full fan-out across every backend.
     pub fn shop_basket(&mut self, basket: &HashSet<String>) -> bool {
         if basket.is_empty() {
-            self.status
-                .warn("the basket is empty — press space on the tracks you want, then 'S'.");
+            self.status.warn("the basket is empty.");
+            self.status.act(NoticeAction::FillBasket);
             return false;
         }
         let cap = self.cfg.search.bulk_max.max(1);
@@ -412,11 +415,9 @@ impl Session {
         // Said *after* the submit, which sets its own status — a warning written
         // before it was simply overwritten and never seen.
         if ok && total > queued {
-            let text = self.status.text.clone();
-            self.status.warn(format!(
-                "{text} {} left in the basket — press 'S' again for the next {cap}.",
-                total - queued
-            ));
+            let text = format!("{} {} left in the basket.", self.status.text, total - queued);
+            self.status.amend(StatusLevel::Warn, text);
+            self.status.act(NoticeAction::NextBasketBatch { cap });
         }
         ok
     }
@@ -556,9 +557,11 @@ impl Session {
                 }
                 let queued = self.queue_transfer_for(done.and_then(|q| q.src), &paths);
                 match (queued, lossy) {
-                    (Some(id), _) => self.status.ok(format!(
-                        "downloaded and queued transfer #{id} — import, then `pending --apply`"
-                    )),
+                    (Some(id), _) => {
+                        self.status
+                            .ok(format!("downloaded and queued transfer #{id}."));
+                        self.status.act(NoticeAction::ImportDownloads);
+                    }
                     (None, true) => self
                         .status
                         .warn("downloaded, but it is a lossy transcode".to_string()),
@@ -609,9 +612,13 @@ impl Session {
         // Something you have to pay for cannot be fetched; say what to do instead.
         if offer.requires_purchase() {
             self.status.warn(format!(
-                "you don't own this yet ({}). Press 'o' to open the buy page.",
+                "you don't own this yet ({}).",
                 crate::acquire::render::price_cell(&offer)
             ));
+            self.status.act(NoticeAction::OpenBuyPage {
+                src_id: group_src,
+                item: offer.item_ref.clone(),
+            });
             return false;
         }
 
@@ -718,9 +725,8 @@ impl Session {
     /// Append the outstanding download count to whatever the status line just
     /// said, so a finished download does not read as the whole queue finishing.
     fn note_downloads_left(&mut self) {
-        let text = self.status.text.clone();
-        self.status
-            .info(format!("{text} {} still queued.", self.fetch_queue.len()));
+        let text = format!("{} {} still queued.", self.status.text, self.fetch_queue.len());
+        self.status.amend(StatusLevel::Info, text);
     }
 
     /// Record a pending old→new pairing for a downloaded file.

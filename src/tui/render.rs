@@ -5,6 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
 use crate::format::{file_type_name, format_bpm, format_length};
+use crate::session::NoticeAction;
 
 use super::app::{
     App, ConfirmKind, Focus, InputMode, OfferFetch, PendingBatch, Screen, ShopFocus,
@@ -263,13 +264,45 @@ fn status_bar(app: &App, frame: Rect) -> Vec<Line<'static>> {
     // Rows enough for a wrapped message, never so many that the body above it
     // disappears.
     let budget = (frame.height / 3).max(2);
+    let status = &app.session.status;
+    let msg = match status.action.as_ref() {
+        Some(action) => format!("{} {}", status.text, status_hint(action, app.screen)),
+        None => status.text.clone(),
+    };
     status_lines(
         key_hints(app.screen),
-        &app.session.status.text,
-        app.session.status.level,
+        &msg,
+        status.level,
         frame.width,
         budget,
     )
+}
+
+/// The keys that take a notice's next step, as a sentence after it.
+fn status_hint(action: &NoticeAction, screen: Screen) -> String {
+    match action {
+        NoticeAction::OpenBuyPage { .. } => "Press 'o' to open the buy page.".into(),
+        NoticeAction::Research { .. } => "'r' re-runs it.".into(),
+        NoticeAction::FillBasket => "Press space on the tracks you want, then 'S'.".into(),
+        NoticeAction::NextBasketBatch { cap } => format!("Press 'S' again for the next {cap}."),
+        NoticeAction::ImportDownloads if screen == Screen::Pending => "Press 'i' to import.".into(),
+        NoticeAction::ImportDownloads => "Press 'p', then 'i' to import.".into(),
+        NoticeAction::CheckDownloads if screen == Screen::Pending => "Press 'a' to check.".into(),
+        NoticeAction::CheckDownloads => "Press 'p', then 'a' to check.".into(),
+        NoticeAction::ForceEntry { .. } => "Press 'F' again.".into(),
+        NoticeAction::ForgetEntry { .. } => "'c' forgets this entry.".into(),
+        // A confirmation is modal here, so it is already on screen.
+        NoticeAction::Review(_) => String::new(),
+    }
+}
+
+/// The same, short enough to follow a queue row's state.
+fn row_hint(action: &NoticeAction) -> Option<&'static str> {
+    match action {
+        NoticeAction::ImportDownloads => Some("press 'i'"),
+        NoticeAction::CheckDownloads => Some("press 'a' to check"),
+        _ => None,
+    }
 }
 
 /// The status bar's lines — key hints, then the message, both wrapped.
@@ -816,11 +849,15 @@ fn pending_state_span(app: &App, entry: &crate::pending::Entry) -> Span<'static>
         return Span::styled(text, Style::new().fg(colour));
     }
 
-    let (text, tone) = crate::session::view::stored_state_label(
+    let (text, tone, action) = crate::session::view::stored_state_label(
         entry.state,
         entry.verdict.as_deref(),
         app.session.queue.has_row(entry.id),
     );
+    let text = match action.as_ref().and_then(row_hint) {
+        Some(hint) => format!("{text} — {hint}"),
+        None => text,
+    };
     Span::styled(text, Style::new().fg(tone_colour(tone)))
 }
 

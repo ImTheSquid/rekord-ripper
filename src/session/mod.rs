@@ -37,12 +37,6 @@ pub enum ConfirmKind {
     ClearQueue,
 }
 
-#[derive(Default)]
-pub struct StatusLine {
-    pub text: String,
-    pub level: StatusLevel,
-}
-
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StatusLevel {
     #[default]
@@ -52,22 +46,105 @@ pub enum StatusLevel {
     Ok,
 }
 
+/// The next step a message points at. Text never names a key or a button;
+/// each frontend says how to take the step in its own terms.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NoticeAction {
+    OpenBuyPage {
+        src_id: Option<String>,
+        item: crate::acquire::ItemRef,
+    },
+    Research {
+        src_id: String,
+    },
+    FillBasket,
+    NextBasketBatch {
+        cap: usize,
+    },
+    ImportDownloads,
+    CheckDownloads,
+    ForceEntry {
+        entry_id: i64,
+    },
+    ForgetEntry {
+        entry_id: i64,
+    },
+    Review(ConfirmKind),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Notice {
+    /// Increasing, so a frontend can ask for everything after the last it saw.
+    pub id: u64,
+    pub level: StatusLevel,
+    pub text: String,
+    pub action: Option<NoticeAction>,
+}
+
+/// Notices kept for a frontend that shows a history.
+const NOTICE_HISTORY: usize = 50;
+
+/// What the session last said, and what it said before that.
+#[derive(Default)]
+pub struct StatusLine {
+    pub text: String,
+    pub level: StatusLevel,
+    pub action: Option<NoticeAction>,
+    history: std::collections::VecDeque<Notice>,
+    next_id: u64,
+}
+
 impl StatusLine {
     pub fn info(&mut self, msg: impl Into<String>) {
-        self.text = msg.into();
-        self.level = StatusLevel::Info;
+        self.say(StatusLevel::Info, msg.into());
     }
     pub fn ok(&mut self, msg: impl Into<String>) {
-        self.text = msg.into();
-        self.level = StatusLevel::Ok;
+        self.say(StatusLevel::Ok, msg.into());
     }
     pub fn warn(&mut self, msg: impl Into<String>) {
-        self.text = msg.into();
-        self.level = StatusLevel::Warn;
+        self.say(StatusLevel::Warn, msg.into());
     }
     pub fn err(&mut self, msg: impl Into<String>) {
-        self.text = msg.into();
-        self.level = StatusLevel::Err;
+        self.say(StatusLevel::Err, msg.into());
+    }
+
+    /// Attach the next step to what was just said.
+    pub fn act(&mut self, action: NoticeAction) {
+        self.action = Some(action.clone());
+        if let Some(last) = self.history.back_mut() {
+            last.action = Some(action);
+        }
+    }
+
+    /// Reword what was just said, rather than saying it twice.
+    pub fn amend(&mut self, level: StatusLevel, text: impl Into<String>) {
+        self.text = text.into();
+        self.level = level;
+        if let Some(last) = self.history.back_mut() {
+            last.text = self.text.clone();
+            last.level = level;
+        }
+    }
+
+    /// Everything said after notice `after`, oldest first.
+    pub fn since(&self, after: u64) -> impl Iterator<Item = &Notice> {
+        self.history.iter().filter(move |n| n.id > after)
+    }
+
+    fn say(&mut self, level: StatusLevel, text: String) {
+        self.next_id += 1;
+        self.text = text.clone();
+        self.level = level;
+        self.action = None;
+        if self.history.len() == NOTICE_HISTORY {
+            self.history.pop_front();
+        }
+        self.history.push_back(Notice {
+            id: self.next_id,
+            level,
+            text,
+            action: None,
+        });
     }
 }
 
@@ -294,5 +371,48 @@ impl Session {
 
     pub fn shop_busy(&self) -> bool {
         self.worker.as_ref().map(|w| w.is_busy()).unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_message_is_kept_with_its_action() {
+        let mut s = StatusLine::default();
+        s.info("searching");
+        s.warn("you don't own this yet.");
+        s.act(NoticeAction::FillBasket);
+        let all: Vec<&Notice> = s.since(0).collect();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].action, None);
+        assert_eq!(all[1].action, Some(NoticeAction::FillBasket));
+        assert_eq!(s.action, Some(NoticeAction::FillBasket));
+        // A new message does not inherit the last one's step.
+        s.ok("done");
+        assert_eq!(s.action, None);
+    }
+
+    #[test]
+    fn amending_rewords_the_last_message_rather_than_repeating_it() {
+        let mut s = StatusLine::default();
+        s.info("downloaded 1 file(s)");
+        s.amend(StatusLevel::Info, "downloaded 1 file(s) 2 still queued.");
+        let all: Vec<&Notice> = s.since(0).collect();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].text, s.text);
+    }
+
+    #[test]
+    fn history_is_capped_and_readable_from_any_point() {
+        let mut s = StatusLine::default();
+        for i in 0..NOTICE_HISTORY + 10 {
+            s.info(format!("{i}"));
+        }
+        assert_eq!(s.since(0).count(), NOTICE_HISTORY);
+        let last = s.since(0).last().unwrap().id;
+        assert_eq!(s.since(last).count(), 0);
+        assert_eq!(s.since(last - 3).count(), 3);
     }
 }
