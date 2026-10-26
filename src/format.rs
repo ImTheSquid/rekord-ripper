@@ -156,28 +156,17 @@ pub(crate) fn format_msec(ms: i64) -> String {
 }
 
 pub(crate) fn kind_label(kind: Option<i64>) -> &'static str {
-    // djmdCue.Kind: 0 = memory cue; 1..=16 = hot cue slots A..P.
+    // djmdCue.Kind: 0 = memory cue; hot cues A..C are 1..3 and D..P are 5..17.
+    // 4 is skipped: none of 2889 cues in a real library use it, and a track
+    // whose four hot cues were set in order reads 1, 2, 3, 5.
+    const HOT: [&str; 16] = [
+        "hot A", "hot B", "hot C", "hot D", "hot E", "hot F", "hot G", "hot H", "hot I", "hot J",
+        "hot K", "hot L", "hot M", "hot N", "hot O", "hot P",
+    ];
     match kind {
         Some(0) => "memory",
-        Some(k) if (1..=16).contains(&k) => match k {
-            1 => "hot A",
-            2 => "hot B",
-            3 => "hot C",
-            4 => "hot D",
-            5 => "hot E",
-            6 => "hot F",
-            7 => "hot G",
-            8 => "hot H",
-            9 => "hot I",
-            10 => "hot J",
-            11 => "hot K",
-            12 => "hot L",
-            13 => "hot M",
-            14 => "hot N",
-            15 => "hot O",
-            16 => "hot P",
-            _ => unreachable!(),
-        },
+        Some(k @ 1..=3) => HOT[k as usize - 1],
+        Some(k @ 5..=17) => HOT[k as usize - 2],
         _ => "?",
     }
 }
@@ -185,6 +174,17 @@ pub(crate) fn kind_label(kind: Option<i64>) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hot_cue_kinds_skip_four() {
+        assert_eq!(kind_label(Some(0)), "memory");
+        assert_eq!(kind_label(Some(3)), "hot C");
+        assert_eq!(kind_label(Some(4)), "?");
+        assert_eq!(kind_label(Some(5)), "hot D");
+        assert_eq!(kind_label(Some(9)), "hot H");
+        assert_eq!(kind_label(Some(17)), "hot P");
+        assert_eq!(kind_label(Some(18)), "?");
+    }
 
     fn facts(ft: Option<i64>, path: Option<&str>, sid: Option<i64>) -> TrackFacts {
         TrackFacts {
