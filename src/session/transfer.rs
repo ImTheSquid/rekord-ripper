@@ -3,7 +3,8 @@
 use crate::analysis::{self, Plan};
 use crate::db::safety_preflight;
 
-use super::{ConfirmKind, Session};
+use super::Session;
+use super::confirm::{Batch, ConfirmKind};
 
 pub struct PendingBatch {
     pub plans: Vec<Plan>,
@@ -28,21 +29,20 @@ impl Session {
             }
         }
 
-        self.pending = Some(PendingBatch { plans, failures });
-        self.confirm = Some(ConfirmKind::Transfer);
+        self.confirmations
+            .open(Batch::Transfer(PendingBatch { plans, failures }));
     }
 
     /// Write the batch the user was shown. True when the writes were attempted,
     /// so the frontend knows to clear its destination selection.
     pub fn apply_pending(&mut self) -> bool {
-        let Some(batch) = self.pending.take() else {
-            self.confirm = None;
+        let Some(Batch::Transfer(batch)) = self.confirmations.take(ConfirmKind::Transfer) else {
             return false;
         };
 
         if let Err(e) = safety_preflight(self.safety) {
             // Put the batch back so the user can read the confirmation again.
-            self.pending = Some(batch);
+            self.confirmations.open(Batch::Transfer(batch));
             self.status.err(format!("{e}"));
             return false;
         }
@@ -67,7 +67,6 @@ impl Session {
             }
         }
         let ok = total - errs.len();
-        self.confirm = None;
 
         if let Err(e) = self.reload_rows() {
             self.status.warn(format!("reload after apply failed: {e}"));

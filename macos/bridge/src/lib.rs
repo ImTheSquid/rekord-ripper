@@ -366,18 +366,13 @@ impl CoreSession {
     }
 
     fn accept_confirm(&mut self) -> bool {
-        match self.0.confirm {
-            Some(ConfirmKind::Transfer) => self.0.apply_pending(),
-            Some(_) => {
-                self.0.accept_confirm();
-                true
-            }
-            None => false,
-        }
+        self.0.confirm().is_some_and(|kind| self.0.accept(kind))
     }
 
     fn cancel_confirm(&mut self) {
-        self.0.cancel_confirm();
+        if let Some(kind) = self.0.confirm() {
+            self.0.cancel(kind);
+        }
     }
 
     fn shop_status(&self) -> ShopStatusFfi {

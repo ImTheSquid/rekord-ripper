@@ -81,11 +81,11 @@ pub struct ConfirmView {
 
 impl Session {
     pub fn confirm_view(&self) -> Option<ConfirmView> {
-        let kind = self.confirm?;
+        let kind = self.confirm()?;
         let mut lines = Vec::new();
         let (title, accept) = match kind {
             ConfirmKind::Transfer => {
-                let batch = self.pending.as_ref()?;
+                let batch = self.confirmations.transfer()?;
                 if let Some(p) = batch.plans.first() {
                     let title = p.src.title.as_deref().unwrap_or("?");
                     let artist = p.src.artist.as_deref().unwrap_or("?");
@@ -135,7 +135,7 @@ impl Session {
                 )
             }
             ConfirmKind::ImportRows => {
-                let batch = self.import_batch.as_ref()?;
+                let batch = self.confirmations.import_rows()?;
                 for new in &batch.rows {
                     lines.push((Tone::Good, format!("{} — {}", new.title, new.file_name)));
                     for detail in crate::import::render(new).lines() {
@@ -151,7 +151,7 @@ impl Session {
                 )
             }
             ConfirmKind::ForceApply => {
-                let batch = self.force_batch.as_ref()?;
+                let batch = self.confirmations.force_apply()?;
                 lines.push((Tone::Bad, batch.verdict.summary()));
                 lines.push((
                     Tone::Warn,

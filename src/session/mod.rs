@@ -5,6 +5,7 @@
 //! they mean by id. A gate that guards a write lives here, so no frontend can
 //! reach the write without it.
 
+pub mod confirm;
 pub mod diff;
 pub mod filter;
 pub mod queue;
@@ -20,22 +21,10 @@ use crate::analysis::CopyOpts;
 use crate::db::{MasterDb, SafetyOpts, rekordbox_running};
 use crate::library::{TrackRow, load_rows};
 
-use queue::{ForceBatch, ImportBatch, QueueState};
+pub use confirm::ConfirmKind;
+use confirm::Confirmations;
+use queue::QueueState;
 use shop::{FetchQueue, FetchState, ShopState};
-use transfer::PendingBatch;
-
-/// Which confirmation is open, and therefore what a yes means.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ConfirmKind {
-    /// The transfer screen's cp batch.
-    Transfer,
-    /// Creating `djmdContent` rows for queued downloads.
-    ImportRows,
-    /// Transferring one queued entry with the fingerprint gate skipped.
-    ForceApply,
-    /// Emptying the whole download queue.
-    ClearQueue,
-}
 
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StatusLevel {
@@ -185,13 +174,8 @@ pub struct Session {
     pub queue: QueueState,
     pub store: Option<crate::pending::PendingStore>,
 
-    /// The open confirmation, if any. Its batch below is what a yes writes.
-    pub confirm: Option<ConfirmKind>,
-    pub pending: Option<PendingBatch>,
-    /// The snapshot behind `ConfirmKind::ImportRows`.
-    pub import_batch: Option<ImportBatch>,
-    /// The snapshot behind `ConfirmKind::ForceApply`.
-    pub force_batch: Option<ForceBatch>,
+    /// Confirmations waiting on a yes, each with the batch it would write.
+    pub confirmations: Confirmations,
 }
 
 impl Session {
@@ -228,10 +212,7 @@ impl Session {
             unresolved_errors: false,
             queue: QueueState::default(),
             store: crate::pending::PendingStore::open().ok(),
-            confirm: None,
-            pending: None,
-            import_batch: None,
-            force_batch: None,
+            confirmations: Confirmations::default(),
         };
         session
             .status
@@ -256,24 +237,27 @@ impl Session {
         }
     }
 
-    /// Close whichever confirmation is open without writing anything.
-    pub fn cancel_confirm(&mut self) {
-        self.confirm = None;
-        self.pending = None;
-        self.import_batch = None;
-        self.force_batch = None;
+    /// The newest open confirmation, which a modal frontend shows.
+    pub fn confirm(&self) -> Option<ConfirmKind> {
+        self.confirmations.newest()
     }
 
-    /// Say yes to the open confirmation.
-    pub fn accept_confirm(&mut self) {
-        match self.confirm {
-            Some(ConfirmKind::Transfer) => {
-                self.apply_pending();
-            }
-            Some(ConfirmKind::ImportRows) => self.apply_import_batch(),
-            Some(ConfirmKind::ForceApply) => self.apply_force_batch(),
-            Some(ConfirmKind::ClearQueue) => self.clear_queue(),
-            None => {}
+    /// Close one confirmation without writing anything.
+    pub fn cancel(&mut self, kind: ConfirmKind) {
+        self.confirmations.take(kind);
+    }
+
+    /// Say yes to one confirmation. True when its writes were attempted, rather
+    /// than refused or not open.
+    pub fn accept(&mut self, kind: ConfirmKind) -> bool {
+        if !self.confirmations.is_open(kind) {
+            return false;
+        }
+        match kind {
+            ConfirmKind::Transfer => self.apply_pending(),
+            ConfirmKind::ImportRows => self.apply_import_batch(),
+            ConfirmKind::ForceApply => self.apply_force_batch(),
+            ConfirmKind::ClearQueue => self.clear_queue(),
         }
     }
 

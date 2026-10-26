@@ -22,7 +22,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Screen::Shop => draw_shop_screen(f, app),
         Screen::Pending => draw_pending_screen(f, app),
     }
-    match (app.session.confirm, &app.mode) {
+    match (app.session.confirm(), &app.mode) {
         (Some(ConfirmKind::Transfer), _) => draw_confirm(f, app),
         (Some(ConfirmKind::ImportRows), _) => draw_import_confirm(f, app),
         (Some(ConfirmKind::ForceApply), _) => draw_force_confirm(f, app),
@@ -357,7 +357,7 @@ fn status_lines(
 /// It scrolls because `import::render` runs to roughly 24 lines a row, and a
 /// modal that clips would be claiming to show what it is hiding.
 fn draw_import_confirm(f: &mut Frame, app: &mut App) {
-    let Some(batch) = app.session.import_batch.as_ref() else {
+    let Some(batch) = app.session.confirmations.import_rows() else {
         return;
     };
     let area = popup_area(f.area(), 88, 80);
@@ -421,7 +421,7 @@ fn draw_import_confirm(f: &mut Frame, app: &mut App) {
 /// Red rather than yellow, and it leads with the waiver — the plan below looks
 /// exactly like a checked one, so the difference has to be said, not inferred.
 fn draw_force_confirm(f: &mut Frame, app: &mut App) {
-    let Some(batch) = app.session.force_batch.as_ref() else {
+    let Some(batch) = app.session.confirmations.force_apply() else {
         return;
     };
     let area = popup_area(f.area(), 88, 80);
@@ -500,7 +500,7 @@ fn draw_clear_confirm(f: &mut Frame, app: &mut App) {
 /// the popup at about a dozen of them, and a modal that clips is asking for a
 /// yes to what it is hiding.
 fn draw_confirm(f: &mut Frame, app: &mut App) {
-    let Some(batch) = app.session.pending.as_ref() else {
+    let Some(batch) = app.session.confirmations.transfer() else {
         return;
     };
     let area = popup_area(f.area(), 80, 70);

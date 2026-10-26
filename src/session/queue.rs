@@ -10,7 +10,8 @@ use std::time::Instant;
 use crate::analysis::CopyOpts;
 use crate::pending::Entry;
 
-use super::{ConfirmKind, NoticeAction, Session, worker};
+use super::confirm::{Batch, ConfirmKind};
+use super::{NoticeAction, Session, worker};
 
 /// What the screen has learned about one entry since the snapshot.
 pub enum EntryWork {
@@ -416,27 +417,26 @@ impl Session {
         // yet, so each plan asked the database and none saw the others.
         crate::import::dedupe_lookups(&mut rows);
 
-        self.import_batch = Some(ImportBatch { rows, entry_ids });
-        self.confirm = Some(ConfirmKind::ImportRows);
+        self.confirmations
+            .open(Batch::ImportRows(ImportBatch { rows, entry_ids }));
     }
 
     /// Gates 2 and 3 are behind us: write the rows.
-    pub fn apply_import_batch(&mut self) {
-        self.confirm = None;
-        let Some(batch) = self.import_batch.take() else {
-            return;
+    pub fn apply_import_batch(&mut self) -> bool {
+        let Some(Batch::ImportRows(batch)) = self.confirmations.take(ConfirmKind::ImportRows) else {
+            return false;
         };
 
         if let Err(e) = crate::db::safety_preflight(self.safety) {
             self.status.err(format!("{e}"));
-            return;
+            return false;
         }
         let backup = match self.db.backup() {
             Ok(p) => p,
             Err(e) => {
                 self.status
                     .err(format!("backup failed, nothing written: {e}"));
-                return;
+                return false;
             }
         };
 
@@ -466,7 +466,7 @@ impl Session {
             self.unresolved_errors = true;
             self.status
                 .err(format!("imported {done}/{total}. Failed → {first}"));
-            return;
+            return true;
         }
         self.status.ok(format!(
             "imported {done} row(s) — checking fingerprints now. Backup: {}",
@@ -479,6 +479,7 @@ impl Session {
         if done > 0 {
             self.start_apply();
         }
+        true
     }
 
     /// Fingerprint the queued downloads that now have a row, one at a time.
@@ -794,23 +795,21 @@ impl Session {
         };
         match crate::analysis::build_plan(&self.db, &entry.src_content_id, &dst_content_id, &opts) {
             Ok(plan) => {
-                self.force_batch = Some(ForceBatch {
+                self.confirmations.open(Batch::ForceApply(ForceBatch {
                     entry_id: entry.id,
                     dst_content_id,
                     plan: Box::new(plan),
                     verdict: crate::transfer::bypass_verdict(&src),
-                });
-                self.confirm = Some(ConfirmKind::ForceApply);
+                }));
             }
             Err(e) => self.status.err(format!("no plan for it: {e}")),
         }
     }
 
     /// Write the forced plan.
-    pub fn apply_force_batch(&mut self) {
-        self.confirm = None;
-        let Some(batch) = self.force_batch.take() else {
-            return;
+    pub fn apply_force_batch(&mut self) -> bool {
+        let Some(Batch::ForceApply(batch)) = self.confirmations.take(ConfirmKind::ForceApply) else {
+            return false;
         };
         // The row the plan was built against may have been replaced since the
         // confirmation opened. Skipping the fingerprint does not mean writing to
@@ -827,11 +826,11 @@ impl Session {
             self.status.act(NoticeAction::ForceEntry {
                 entry_id: batch.entry_id,
             });
-            return;
+            return false;
         }
         if let Err(e) = crate::db::safety_preflight(self.safety) {
             self.status.err(format!("{e}"));
-            return;
+            return false;
         }
         match crate::analysis::apply_plan(&mut self.db, &batch.plan) {
             Ok(_backup) => {
@@ -855,6 +854,7 @@ impl Session {
                 self.status.err(format!("could not apply it: {e}"));
             }
         }
+        true
     }
 
     /// Ask before emptying the queue.
@@ -863,14 +863,14 @@ impl Session {
             self.status.info("the queue is already empty.");
             return;
         }
-        self.confirm = Some(ConfirmKind::ClearQueue);
+        self.confirmations.open(Batch::ClearQueue);
     }
 
     /// Forget every entry. The downloaded files are left on disk.
-    pub fn clear_queue(&mut self) {
-        self.confirm = None;
+    pub fn clear_queue(&mut self) -> bool {
+        self.confirmations.take(ConfirmKind::ClearQueue);
         let Some(store) = self.store.as_ref() else {
-            return;
+            return false;
         };
         match store.clear_all() {
             Ok(n) => {
@@ -881,6 +881,7 @@ impl Session {
             }
             Err(e) => self.status.err(format!("could not clear the queue: {e}")),
         }
+        true
     }
 }
 

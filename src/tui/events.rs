@@ -20,7 +20,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
 
     // An open confirmation takes the keys whatever the mode, the way its modal
     // covers whatever was on screen.
-    if let Some(kind) = app.session.confirm {
+    if let Some(kind) = app.session.confirm() {
         handle_confirm(app, kind, key);
         return;
     }
@@ -280,13 +280,15 @@ fn handle_confirm(app: &mut App, kind: ConfirmKind, key: KeyEvent) {
         (KeyCode::Char('y'), _) | (KeyCode::Enter, _) => {
             match kind {
                 ConfirmKind::Transfer => app.apply_pending(),
-                _ => app.session.accept_confirm(),
+                _ => {
+                    app.session.accept(kind);
+                }
             }
-            close_confirm_if_done(app);
+            close_confirm_if_done(app, kind);
         }
         (KeyCode::Char('n'), _) | (KeyCode::Esc, _) | (KeyCode::Char('q'), _) => {
-            app.session.cancel_confirm();
-            close_confirm_if_done(app);
+            app.session.cancel(kind);
+            close_confirm_if_done(app, kind);
         }
         // The row detail runs to about 24 lines each, so the modal scrolls.
         (KeyCode::Up, _) | (KeyCode::Char('k'), _) => app.scroll_confirm(-1),
@@ -297,12 +299,16 @@ fn handle_confirm(app: &mut App, kind: ConfirmKind, key: KeyEvent) {
     }
 }
 
-/// Back to normal keys once the confirmation is gone. A refused yes leaves it
-/// open, so the user can read it again.
-fn close_confirm_if_done(app: &mut App) {
-    if app.session.confirm.is_none() {
-        app.mode = InputMode::Normal;
-        app.confirm_scroll = 0;
+/// Move on once the confirmation is gone: to the one waiting behind it, or back
+/// to normal keys. A refused yes leaves it open, so the user can read it again.
+fn close_confirm_if_done(app: &mut App, kind: ConfirmKind) {
+    match app.session.confirm() {
+        Some(now) if now == kind => {}
+        Some(_) => app.confirm_scroll = 0,
+        None => {
+            app.mode = InputMode::Normal;
+            app.confirm_scroll = 0;
+        }
     }
 }
 
