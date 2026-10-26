@@ -64,7 +64,9 @@ final class SessionModel {
     var activityShown = false
     var inspectorShown = true
     private(set) var autoAdvance = true
-    private(set) var importEnabled = true
+    private(set) var settings: [Setting] = []
+    /// Why the last edit to a setting was refused, by key.
+    private(set) var settingError: (key: String, message: String)?
     private(set) var configPath = ""
 
     init() {
@@ -88,8 +90,7 @@ final class SessionModel {
         Notifier.shared.start()
         loop = Task { [weak self] in
             guard let core = self?.core else { return }
-            let (enabled, path) = await core.run { ($0.import_enabled(), $0.config_path().toString()) }
-            self?.importEnabled = enabled
+            let path = await core.run { $0.config_path().toString() }
             self?.configPath = path
             await self?.pollLoop()
         }
@@ -129,6 +130,7 @@ final class SessionModel {
         }
         if let p = s.playlists, p != playlists { playlists = p }
         if let c = s.collections, c != collections { collections = c }
+        if let st = s.settings { settings = st }
         if let v = s.visible { visibleIndices = v }
         if s.tracks != nil || s.visible != nil {
             visibleTracks = visibleIndices.compactMap { $0 < tracks.count ? tracks[$0] : nil }
@@ -380,6 +382,15 @@ final class SessionModel {
 
     func setBypassRekordboxCheck(_ on: Bool) {
         send { $0.set_bypass_rekordbox_check(on) }
+    }
+
+    func setSetting(_ key: String, _ value: String) {
+        guard let core else { return }
+        Task {
+            let refused = await core.run { $0.set_setting(key, value).toString() }
+            settingError = refused.isEmpty ? nil : (key, refused)
+            kick()
+        }
     }
 
     func setAutoAdvance(_ on: Bool) {

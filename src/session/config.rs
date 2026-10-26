@@ -121,6 +121,10 @@ impl Session {
         }
     }
 
+    pub fn config_path(&self) -> &Path {
+        &self.config_watch.config
+    }
+
     /// Every editable setting with its current value.
     pub fn settings(&self) -> impl Iterator<Item = (&'static Field, String)> + '_ {
         settings::FIELDS

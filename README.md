@@ -58,9 +58,15 @@ open target/macos/RekordRipper.app
   messages, each with a button for its next step.
 
 Downloads move along on their own: the app imports each one and checks its
-fingerprint without a click. **Settings** turns that off, and says so when
-`insert_content_rows` is off in the config, since nothing can be imported until
-it is on.
+fingerprint without a click. **Settings** (⌘,) turns that off, and edits
+`config.toml`: downloads, search, sources and the fingerprint gate. Each change
+is saved as you make it, keeping the file's comments. Nothing is imported until
+**Import downloads into rekordbox** is on. Compat levels and `credentials.toml`
+are edited in the files.
+
+The app and the TUI both pick up edits to `config.toml` and `credentials.toml`
+within a second. A file that no longer loads leaves the previous settings in
+place and says which line is wrong.
 
 Every write still goes through the same gates as the TUI. A review sheet shows
 each track before and after, with its cues. Confirmations the pipeline opens

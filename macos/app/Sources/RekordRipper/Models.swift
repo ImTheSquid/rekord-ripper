@@ -213,6 +213,32 @@ struct PlaylistNode: Identifiable, Hashable {
     }
 }
 
+/// One `config.toml` key, as the core describes it.
+struct Setting: Identifiable, Equatable {
+    enum Kind: UInt8 {
+        case bool, integer, number, text, path, list
+    }
+
+    /// `section.key`, as in the file.
+    let id: String
+    let group: String
+    let label: String
+    let help: String
+    let kind: Kind
+    let range: ClosedRange<Double>
+    let value: String
+
+    init(_ v: SettingViewRef) {
+        id = v.key().toString()
+        group = v.group().toString()
+        label = v.label().toString()
+        help = v.help().toString()
+        kind = Kind(rawValue: v.kind()) ?? .text
+        range = v.min()...max(v.min(), v.max())
+        value = v.value().toString()
+    }
+}
+
 struct Suggestion: Identifiable, Equatable {
     let id: String
     /// Analysis would go from the inspected track to this one.

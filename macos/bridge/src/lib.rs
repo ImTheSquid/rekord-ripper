@@ -22,6 +22,7 @@ use rekord_ripper::session::review::{Change, PlanReview};
 use rekord_ripper::session::shop::{FetchState, OfferFetch, ShopState, ShopTrackState};
 use rekord_ripper::session::view::{self, Tone};
 use rekord_ripper::session::{ConfirmKind, Notice, NoticeAction, Session, StatusLevel};
+use rekord_ripper::settings::{Field, Kind};
 
 /// Matches the TUI's tolerance for the fuzzy-from-source filter.
 const DURATION_TOL_SECS: i64 = 1;
@@ -161,9 +162,12 @@ mod ffi {
         // The new entry's id, or -1.
         fn queue_file(&mut self, src_id: &str, path: &str) -> i64;
         fn set_auto_advance(&mut self, on: bool);
-        // Whether the config lets downloads become rekordbox rows.
-        fn import_enabled(&self) -> bool;
         fn config_path(&self) -> String;
+        // Bumped whenever the settings change, by an edit or in the file.
+        fn config_revision(&self) -> u64;
+        fn settings(&self) -> Vec<SettingView>;
+        // Empty when written, otherwise why not.
+        fn set_setting(&mut self, key: &str, value: &str) -> String;
     }
 
     extern "Rust" {
@@ -204,6 +208,21 @@ mod ffi {
         fn code(&self) -> u8;
         fn title(&self) -> String;
         fn count(&self) -> u32;
+    }
+
+    extern "Rust" {
+        type SettingView;
+        // section.key, as in config.toml.
+        fn key(&self) -> String;
+        fn group(&self) -> String;
+        fn label(&self) -> String;
+        fn help(&self) -> String;
+        // 0 bool, 1 integer, 2 number, 3 text, 4 path, 5 comma-separated list.
+        fn kind(&self) -> u8;
+        // Bounds of a number; 0 otherwise.
+        fn min(&self) -> f64;
+        fn max(&self) -> f64;
+        fn value(&self) -> String;
     }
 
     extern "Rust" {
@@ -330,6 +349,8 @@ pub struct ToneLine(Tone, String);
 pub struct PlaylistView(PlaylistNode);
 
 pub struct CollectionView(Collection, usize);
+
+pub struct SettingView(&'static Field, String);
 
 pub struct SuggestionView(Suggestion);
 
@@ -915,14 +936,23 @@ impl CoreSession {
         self.0.set_auto_advance(on);
     }
 
-    fn import_enabled(&self) -> bool {
-        self.0.cfg.import.insert_content_rows
+    fn config_path(&self) -> String {
+        self.0.config_path().to_string_lossy().into_owned()
     }
 
-    fn config_path(&self) -> String {
-        rekord_ripper::paths::config_path(None)
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default()
+    fn config_revision(&self) -> u64 {
+        self.0.config_revision
+    }
+
+    fn settings(&self) -> Vec<SettingView> {
+        self.0.settings().map(|(f, v)| SettingView(f, v)).collect()
+    }
+
+    fn set_setting(&mut self, key: &str, value: &str) -> String {
+        match self.0.set_setting(key, value) {
+            Ok(()) => String::new(),
+            Err(e) => format!("{e:#}"),
+        }
     }
 }
 
@@ -1016,6 +1046,48 @@ impl CollectionView {
     }
     fn count(&self) -> u32 {
         self.1 as u32
+    }
+}
+
+impl SettingView {
+    fn key(&self) -> String {
+        self.0.key.into()
+    }
+    fn group(&self) -> String {
+        self.0.group.into()
+    }
+    fn label(&self) -> String {
+        self.0.label.into()
+    }
+    fn help(&self) -> String {
+        self.0.help.into()
+    }
+    fn kind(&self) -> u8 {
+        match self.0.kind {
+            Kind::Bool => 0,
+            Kind::Int { .. } => 1,
+            Kind::Float { .. } => 2,
+            Kind::Text => 3,
+            Kind::Path => 4,
+            Kind::List => 5,
+        }
+    }
+    fn min(&self) -> f64 {
+        match self.0.kind {
+            Kind::Int { min, .. } => min as f64,
+            Kind::Float { min, .. } => min,
+            _ => 0.0,
+        }
+    }
+    fn max(&self) -> f64 {
+        match self.0.kind {
+            Kind::Int { max, .. } => max as f64,
+            Kind::Float { max, .. } => max,
+            _ => 0.0,
+        }
+    }
+    fn value(&self) -> String {
+        self.1.clone()
     }
 }
 

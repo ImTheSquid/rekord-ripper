@@ -23,6 +23,8 @@ struct Snapshot {
     var tracks: [Track]?
     var playlists: [PlaylistNode]?
     var collections: [CollectionCount]?
+    /// Set when the settings changed.
+    var settings: [Setting]?
     /// Indices into the newest `tracks`; set when they changed.
     var visible: [Int]?
     /// Set when the inspected track or its data changed.
@@ -54,6 +56,7 @@ actor CoreActor {
 
     private let core: CoreSession
     private var revision: UInt64 = .max
+    private var configRevision: UInt64 = .max
     private var lastNotice: UInt64 = 0
     private var latestNotice: Notice?
     private var visibleKey: VisibleKey?
@@ -95,6 +98,12 @@ actor CoreActor {
             s.tracks = core.rows().map(Track.init)
             s.playlists = PlaylistNode.tree(core.playlists())
             s.collections = core.collections().map(CollectionCount.init)
+        }
+
+        let crev = core.config_revision()
+        if crev != configRevision {
+            configRevision = crev
+            s.settings = core.settings().map(Setting.init)
         }
 
         let vkey = VisibleKey(revision: rev, scope: req.scope, query: req.query)
