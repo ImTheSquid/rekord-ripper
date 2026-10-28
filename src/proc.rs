@@ -9,9 +9,11 @@
 //!    so a backend that hangs on a child process would hang the whole fan-out.
 //!    `run_with_deadline` is what makes that impossible.
 
+use std::ffi::{OsStr, OsString};
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
@@ -23,11 +25,63 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// How much of a failing child's stderr to keep for the error message.
 const STDERR_TAIL_BYTES: usize = 2048;
 
+/// `PATH` with the usual package-manager folders after it, for finding a tool
+/// and for whatever that tool runs in turn.
+///
+/// An app opened from the Finder inherits launchd's bare `PATH`, which finds
+/// none of ffmpeg, ffprobe or yt-dlp. Appended, so the shell's order still wins.
+fn search_path() -> &'static OsStr {
+    static PATH: OnceLock<OsString> = OnceLock::new();
+    PATH.get_or_init(|| {
+        with_usual_dirs(
+            std::env::var_os("PATH"),
+            std::env::var_os("HOME").map(PathBuf::from),
+            std::env::var("USER").ok(),
+        )
+    })
+}
+
+fn with_usual_dirs(
+    path: Option<OsString>,
+    home: Option<PathBuf>,
+    user: Option<String>,
+) -> OsString {
+    let mut dirs: Vec<PathBuf> = path
+        .as_deref()
+        .map(|p| std::env::split_paths(p).collect())
+        .unwrap_or_default();
+    if cfg!(unix) {
+        let mut usual: Vec<PathBuf> = [
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/opt/local/bin",
+            "/run/current-system/sw/bin",
+            "/nix/var/nix/profiles/default/bin",
+        ]
+        .map(PathBuf::from)
+        .into();
+        if let Some(user) = user {
+            usual.push(format!("/etc/profiles/per-user/{user}/bin").into());
+        }
+        if let Some(home) = home {
+            usual.push(home.join(".nix-profile/bin"));
+            usual.push(home.join(".local/bin"));
+        }
+        for dir in usual {
+            if !dirs.contains(&dir) {
+                dirs.push(dir);
+            }
+        }
+    }
+    std::env::join_paths(dirs).unwrap_or_else(|_| path.unwrap_or_default())
+}
+
 /// A command whose output we don't want: all three streams discarded, only the
 /// exit status is meaningful.
 pub fn silent(program: &str) -> Command {
     let mut cmd = Command::new(program);
-    cmd.stdin(Stdio::null())
+    cmd.env("PATH", search_path())
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     cmd
@@ -36,7 +90,8 @@ pub fn silent(program: &str) -> Command {
 /// A command whose output we intend to read. Piped, never inherited.
 pub fn capture(program: &str) -> Command {
     let mut cmd = Command::new(program);
-    cmd.stdin(Stdio::null())
+    cmd.env("PATH", search_path())
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     cmd
@@ -167,6 +222,43 @@ fn spawn_error(cmd: &Command, e: std::io::Error) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_usual_dirs_follow_the_inherited_path() {
+        let path = with_usual_dirs(
+            Some("/usr/bin:/bin:/opt/homebrew/bin".into()),
+            Some("/Users/me".into()),
+            Some("me".into()),
+        );
+        let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+        assert_eq!(
+            dirs[..3],
+            [
+                PathBuf::from("/usr/bin"),
+                "/bin".into(),
+                "/opt/homebrew/bin".into()
+            ]
+        );
+        assert_eq!(
+            dirs.iter().filter(|d| d.ends_with("homebrew/bin")).count(),
+            1
+        );
+        assert!(dirs.contains(&"/Users/me/.nix-profile/bin".into()));
+        assert!(dirs.contains(&"/etc/profiles/per-user/me/bin".into()));
+    }
+
+    #[test]
+    fn a_tool_is_found_on_the_path_given_to_the_command() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("rr-path-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tool = dir.join("rr-path-probe");
+        std::fs::write(&tool, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let ran = Command::new("rr-path-probe").env("PATH", &dir).status();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(ran.unwrap().success());
+    }
 
     #[test]
     fn stderr_tail_picks_the_last_nonempty_line() {
