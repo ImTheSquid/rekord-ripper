@@ -13,7 +13,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
@@ -76,10 +76,51 @@ fn with_usual_dirs(
     std::env::join_paths(dirs).unwrap_or_else(|_| path.unwrap_or_default())
 }
 
+/// Configured paths for tools spawned by bare name.
+static TOOLS: RwLock<Vec<(&'static str, PathBuf)>> = RwLock::new(Vec::new());
+
+/// Spawns of `ffmpeg` and `ffprobe` from here on use these paths.
+pub fn use_tools(tools: &crate::config::Tools) {
+    if let Ok(mut set) = TOOLS.write() {
+        *set = configured(tools);
+    }
+}
+
+fn configured(tools: &crate::config::Tools) -> Vec<(&'static str, PathBuf)> {
+    let mut set = Vec::new();
+    for (name, path) in [
+        ("ffmpeg", &tools.ffmpeg_path),
+        ("ffprobe", &tools.ffprobe_path),
+    ] {
+        let path = path.trim();
+        if !path.is_empty()
+            && path != name
+            && let Ok(p) = crate::paths::expand_tilde(path)
+        {
+            set.push((name, p));
+        }
+    }
+    set
+}
+
+fn resolve(program: &str) -> OsString {
+    TOOLS
+        .read()
+        .ok()
+        .and_then(|set| resolve_in(&set, program))
+        .unwrap_or_else(|| program.into())
+}
+
+fn resolve_in(set: &[(&str, PathBuf)], program: &str) -> Option<OsString> {
+    set.iter()
+        .find(|(n, _)| *n == program)
+        .map(|(_, p)| p.clone().into_os_string())
+}
+
 /// A command whose output we don't want: all three streams discarded, only the
 /// exit status is meaningful.
 pub fn silent(program: &str) -> Command {
-    let mut cmd = Command::new(program);
+    let mut cmd = Command::new(resolve(program));
     cmd.env("PATH", search_path())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -89,7 +130,7 @@ pub fn silent(program: &str) -> Command {
 
 /// A command whose output we intend to read. Piped, never inherited.
 pub fn capture(program: &str) -> Command {
-    let mut cmd = Command::new(program);
+    let mut cmd = Command::new(resolve(program));
     cmd.env("PATH", search_path())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -202,6 +243,22 @@ pub fn open_url(url: &str) -> Result<()> {
     }
 }
 
+/// Names a configured path in full, since that is what was wrong.
+pub fn not_found(cmd: &Command) -> anyhow::Error {
+    let program = Path::new(cmd.get_program());
+    if program.components().count() > 1 {
+        anyhow!(
+            "{} not found — check its path in config.toml",
+            program.display()
+        )
+    } else {
+        anyhow!(
+            "{} not found — install it, or set its path in config.toml",
+            program.display()
+        )
+    }
+}
+
 fn program_name(cmd: &Command) -> String {
     Path::new(cmd.get_program())
         .file_name()
@@ -213,7 +270,7 @@ fn program_name(cmd: &Command) -> String {
 fn spawn_error(cmd: &Command, e: std::io::Error) -> anyhow::Error {
     let name = program_name(cmd);
     if e.kind() == std::io::ErrorKind::NotFound {
-        anyhow!("{name} not found — install it, or set its path in config.toml")
+        not_found(cmd)
     } else {
         anyhow!("could not run {name}: {e}")
     }
@@ -222,6 +279,30 @@ fn spawn_error(cmd: &Command, e: std::io::Error) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_configured_tool_path_replaces_the_name_and_is_named_when_missing() {
+        let set = configured(&crate::config::Tools {
+            ffmpeg_path: "/nonexistent/bin/ffmpeg".into(),
+            ffprobe_path: "ffprobe".into(),
+        });
+        assert_eq!(
+            resolve_in(&set, "ffmpeg").unwrap(),
+            "/nonexistent/bin/ffmpeg"
+        );
+        assert_eq!(
+            resolve_in(&set, "ffprobe"),
+            None,
+            "the default name is not an override"
+        );
+
+        let cmd = Command::new("/nonexistent/bin/ffmpeg");
+        let err = run_with_deadline(cmd, Instant::now() + Duration::from_secs(5)).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("/nonexistent/bin/ffmpeg not found — check its path"),
+            "{err:#}"
+        );
+    }
 
     #[test]
     fn the_usual_dirs_follow_the_inherited_path() {

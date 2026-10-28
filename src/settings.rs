@@ -71,6 +71,7 @@ pub const BANDCAMP: &str = "Bandcamp";
 pub const SOUNDCLOUD: &str = "SoundCloud";
 pub const SOULSEEK: &str = "Soulseek";
 pub const FINGERPRINT: &str = "Fingerprint Gate";
+pub const TOOLS: &str = "Tools";
 
 #[rustfmt::skip]
 pub const FIELDS: &[Field] = &[
@@ -82,6 +83,10 @@ pub const FIELDS: &[Field] = &[
         "Adds each download to master.db itself, after a backup. Off, you drag the download folder into rekordbox."),
     field("pending.ttl_days", DOWNLOADS, "Keep unimported downloads for (days)", int(1, 3650),
         "A download not imported by then is dropped from the queue."),
+    field("tools.ffmpeg_path", TOOLS, "ffmpeg", Kind::Path,
+        "A command name or a full path. Reads, converts and fingerprints audio."),
+    field("tools.ffprobe_path", TOOLS, "ffprobe", Kind::Path,
+        "A command name or a full path. Reads a download's format before import."),
     field("search.timeout_secs", SEARCH, "Time limit per source (s)", int(1, 600), ""),
     field("search.limit", SEARCH, "Results per source", int(1, 100), ""),
     field("search.enrich_top_n", SEARCH, "Price-check the top results", int(0, 50),

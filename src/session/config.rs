@@ -109,6 +109,7 @@ impl Session {
             worker.reconfigure(cfg.clone(), creds.clone());
         }
         self.creds = creds;
+        crate::proc::use_tools(&cfg.tools);
         let unknown: Vec<_> = cfg.unknown.keys().cloned().collect();
         self.cfg = cfg;
         self.config_revision += 1;

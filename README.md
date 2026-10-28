@@ -17,6 +17,9 @@ cargo install rekord-ripper
 brew install yt-dlp ffmpeg
 ```
 
+Elsewhere, set `ffmpeg_path` and `ffprobe_path` under `[tools]`, and
+`yt_dlp_path` under `[soundcloud]`, in `config.toml` (or in the app's Settings).
+
 The Soulseek backend requires a reachable [slskd](https://github.com/slskd/slskd).
 It is optional. Until one is configured, Soulseek reports itself as unconfigured
 and the other backends continue to work. Run slskd on a machine that stays

@@ -46,6 +46,14 @@ private struct GeneralSettings: View {
                     .foregroundStyle(.secondary)
             }
             Section {
+                ForEach(model.settings.filter { $0.group == "Tools" }) { SettingRow(setting: $0) }
+            } header: {
+                Text("Tools")
+            } footer: {
+                Text("Found in your PATH, Homebrew and Nix folders unless given here.")
+                    .foregroundStyle(.secondary)
+            }
+            Section {
                 LabeledContent("Saved to") {
                     Button("Open config.toml") { openConfig() }
                 }
