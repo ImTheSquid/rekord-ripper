@@ -12,7 +12,7 @@ use toml_edit::{Array, DocumentMut, Item, Value};
 use crate::acquire::AudioFormat;
 use crate::config::{Config, CredentialSource, Credentials};
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy)]
 pub enum Kind {
     Bool,
     Int {
@@ -28,8 +28,8 @@ pub enum Kind {
     Path,
     /// Comma-separated.
     List,
-    /// One of these `(value, label)` pairs, though the file may hold another.
-    Choice(&'static [(&'static str, &'static str)]),
+    /// One of the `(value, label)` pairs this lists, though the file may hold another.
+    Choice(fn() -> Vec<(String, String)>),
 }
 
 #[derive(Debug)]
@@ -67,20 +67,6 @@ const fn float(min: f64, max: f64) -> Kind {
     Kind::Float { min, max }
 }
 
-/// What yt-dlp can read cookies from; "" is none.
-const BROWSERS: &[(&str, &str)] = &[
-    ("", "None"),
-    ("safari", "Safari"),
-    ("chrome", "Chrome"),
-    ("firefox", "Firefox"),
-    ("brave", "Brave"),
-    ("edge", "Edge"),
-    ("chromium", "Chromium"),
-    ("opera", "Opera"),
-    ("vivaldi", "Vivaldi"),
-    ("whale", "Whale"),
-];
-
 pub const DOWNLOADS: &str = "Downloads";
 pub const SEARCH: &str = "Search";
 pub const BANDCAMP: &str = "Bandcamp";
@@ -113,7 +99,7 @@ pub const FIELDS: &[Field] = &[
     field("soundcloud.enabled", SOUNDCLOUD, "Search SoundCloud", Kind::Bool, ""),
     field("soundcloud.yt_dlp_path", SOUNDCLOUD, "yt-dlp", Kind::Path,
         "A command name or a full path."),
-    field("soundcloud.cookies_from_browser", SOUNDCLOUD, "Cookies from browser", Kind::Choice(BROWSERS),
+    field("soundcloud.cookies_from_browser", SOUNDCLOUD, "Cookies from browser", Kind::Choice(crate::acquire::browsers::installed),
         "Signed in there, SoundCloud offers better formats. For one profile, write chrome:Profile 1 in config.toml."),
     field("soundcloud.cookies_file", SOUNDCLOUD, "Cookie file", Kind::Path,
         "A Netscape-format cookie jar, for a browser that isn't on this Mac."),

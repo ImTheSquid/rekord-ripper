@@ -4,6 +4,7 @@
 pub mod backend;
 pub mod bandcamp;
 pub mod blob;
+pub mod browsers;
 pub mod cmd;
 pub mod error;
 pub mod fs;

@@ -1132,15 +1132,15 @@ impl SettingView {
         }
     }
     fn choices(&self) -> Vec<String> {
-        self.choice_list().map(|(v, _)| v.to_string()).collect()
+        self.choice_list().into_iter().map(|(v, _)| v).collect()
     }
     fn choice_labels(&self) -> Vec<String> {
-        self.choice_list().map(|(_, l)| l.to_string()).collect()
+        self.choice_list().into_iter().map(|(_, l)| l).collect()
     }
-    fn choice_list(&self) -> impl Iterator<Item = &'static (&'static str, &'static str)> {
+    fn choice_list(&self) -> Vec<(String, String)> {
         match self.0.kind {
-            Kind::Choice(c) => c.iter(),
-            _ => [].iter(),
+            Kind::Choice(list) => list(),
+            _ => Vec::new(),
         }
     }
     fn min(&self) -> f64 {
