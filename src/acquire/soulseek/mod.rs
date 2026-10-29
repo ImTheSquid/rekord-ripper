@@ -108,6 +108,39 @@ impl Soulseek {
     fn staging(batch_id: &str) -> String {
         format!("{STAGING_ROOT}/{batch_id}")
     }
+
+    fn run_search(&self, client: &api::Client, text: &str) -> Result<Vec<Hit>> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let result = client.search(
+            &api::SearchRequest {
+                id: id.clone(),
+                search_text: text,
+                // Milliseconds on the wire, whatever slskd's docs claim.
+                search_timeout: self.search_window.as_millis() as u64,
+                // Bounding the peers is what bounds the wall time: slskd's
+                // timeout restarts on every response, so a popular query would
+                // otherwise run far past it. Deliberately no file limit — that
+                // ends the search early and takes whoever was quickest rather
+                // than whoever has the best copy.
+                response_limit: self.search_limit,
+                filter_responses: true,
+            },
+            // The whole budget, because the idle window is not the wall time:
+            // slskd restarts it on every response, so a search that finds
+            // anything finishes at *last answer plus the window*, and it hands
+            // over nothing at all until it has finished. Waiting one window and
+            // a little slack is a race that mostly loses — the symptom being a
+            // query that plainly matches returning no offers. A scoped thread
+            // cannot be abandoned, so the budget is still the hard ceiling.
+            Instant::now() + self.budget,
+        );
+
+        // slskd keeps searches in its history for the web UI; ours are noise.
+        // Before the `?`, so an abandoned search is tidied up too.
+        client.forget_search(&id);
+
+        Ok(hits_from(&result?))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -947,37 +980,21 @@ impl super::AcquisitionBackend for Soulseek {
             return Ok(Vec::new());
         }
         let client = self.client()?;
-        let id = uuid::Uuid::new_v4().to_string();
-
-        let result = client.search(
-            &api::SearchRequest {
-                id: id.clone(),
-                search_text: &text,
-                // Milliseconds on the wire, whatever slskd's docs claim.
-                search_timeout: self.search_window.as_millis() as u64,
-                // Bounding the peers is what bounds the wall time: slskd's
-                // timeout restarts on every response, so a popular query would
-                // otherwise run far past it. Deliberately no file limit — that
-                // ends the search early and takes whoever was quickest rather
-                // than whoever has the best copy.
-                response_limit: self.search_limit,
-                filter_responses: true,
-            },
-            // The whole budget, because the idle window is not the wall time:
-            // slskd restarts it on every response, so a search that finds
-            // anything finishes at *last answer plus the window*, and it hands
-            // over nothing at all until it has finished. Waiting one window and
-            // a little slack is a race that mostly loses — the symptom being a
-            // query that plainly matches returning no offers. A scoped thread
-            // cannot be abandoned, so the budget is still the hard ceiling.
-            Instant::now() + self.budget,
-        );
-
-        // slskd keeps searches in its history for the web UI; ours are noise.
-        // Before the `?`, so an abandoned search is tidied up too.
-        client.forget_search(&id);
-
-        Ok(rank_and_truncate(hits_from(&result?), query.limit))
+        let hits = self.run_search(&client, &text)?;
+        if !hits.is_empty() {
+            return Ok(rank_and_truncate(hits, query.limit));
+        }
+        // Peers drop some full queries outright: "exjaynine girly girl rulez"
+        // finds nothing while "girly girl rulez" finds two copies, both under an
+        // exjaynine folder. Ranking still scores the wider hits against the artist.
+        let title = query.title_text();
+        if title.is_empty() || title == text {
+            return Ok(Vec::new());
+        }
+        Ok(rank_and_truncate(
+            self.run_search(&client, &title)?,
+            query.limit,
+        ))
     }
 
     fn purchase(&self, _item: &ItemRef) -> Result<PurchaseFlow> {
