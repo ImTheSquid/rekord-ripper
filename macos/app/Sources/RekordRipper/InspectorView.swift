@@ -31,7 +31,7 @@ struct TrackInspector: View {
 
     var body: some View {
         let _ = Self.traceChanges()
-        ScrollView {
+        InspectorScroll {
             VStack(alignment: .leading, spacing: 18) {
                 TrackHeader(track: track)
                 if let lengthSecs = track.lengthSecs, lengthSecs > 0 {
@@ -46,6 +46,23 @@ struct TrackInspector: View {
                 }
             }
             .padding()
+        }
+    }
+}
+
+/// A scroll view that takes the toolbar's inset as padding instead.
+///
+/// Under the toolbar, SwiftUI draws scrolled content below the inset but matches
+/// clicks as if there were none, so a button missed clicks by the toolbar's height.
+private struct InspectorScroll<Content: View>: View {
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        GeometryReader { geo in
+            ScrollView {
+                content.padding(.top, geo.safeAreaInsets.top)
+            }
+            .ignoresSafeArea(.container, edges: .top)
         }
     }
 }
@@ -467,7 +484,7 @@ struct MultiInspector: View {
     @State private var source: Track.ID?
 
     var body: some View {
-        ScrollView {
+        InspectorScroll {
             VStack(alignment: .leading, spacing: 18) {
                 Text("\(tracks.count) Tracks").font(.headline)
                 SectionBox(title: "Better Copies") {

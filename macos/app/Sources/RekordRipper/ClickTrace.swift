@@ -13,6 +13,12 @@ enum ClickTrace {
     static func install() {
         guard on else { return }
         note("tracing clicks")
+        Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { _ in
+            MainActor.assumeIsolated {
+                guard let root = NSApp.windows.first(where: { $0.isVisible && $0.contentView != nil })?.contentView else { return }
+                note("controls: " + controls(in: root, near: nil).joined(separator: "; "))
+            }
+        }
         NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .leftMouseUp]) { e in
             guard let window = e.window else { return e }
             let p = e.locationInWindow
@@ -29,12 +35,15 @@ enum ClickTrace {
 
     /// Buttons and spinners within reach of `p`, with their frames in window coordinates.
     @MainActor
-    private static func controls(in view: NSView, near p: NSPoint) -> [String] {
+    private static func controls(in view: NSView, near p: NSPoint?) -> [String] {
         var out: [String] = []
         let name = String(describing: type(of: view))
         if name.contains("Button") || view is NSProgressIndicator {
             let f = view.convert(view.bounds, to: nil)
-            if abs(f.midY - p.y) < 120, abs(f.midX - p.x) < 300 {
+            // Near the click, or with no click, every SwiftUI button.
+            let wanted = p.map { abs(f.midY - $0.y) < 120 && abs(f.midX - $0.x) < 300 }
+                ?? name.hasPrefix("SwiftUIAppKitButton")
+            if wanted {
                 let title = (view as? NSButton)?.title ?? ""
                 out.append("\(name.prefix(24)) '\(title)' x \(Int(f.minX))-\(Int(f.maxX)) y \(Int(f.minY))-\(Int(f.maxY))")
             }
