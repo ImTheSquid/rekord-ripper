@@ -28,6 +28,8 @@ pub enum Kind {
     Path,
     /// Comma-separated.
     List,
+    /// One of these `(value, label)` pairs, though the file may hold another.
+    Choice(&'static [(&'static str, &'static str)]),
 }
 
 #[derive(Debug)]
@@ -65,6 +67,20 @@ const fn float(min: f64, max: f64) -> Kind {
     Kind::Float { min, max }
 }
 
+/// What yt-dlp can read cookies from; "" is none.
+const BROWSERS: &[(&str, &str)] = &[
+    ("", "None"),
+    ("safari", "Safari"),
+    ("chrome", "Chrome"),
+    ("firefox", "Firefox"),
+    ("brave", "Brave"),
+    ("edge", "Edge"),
+    ("chromium", "Chromium"),
+    ("opera", "Opera"),
+    ("vivaldi", "Vivaldi"),
+    ("whale", "Whale"),
+];
+
 pub const DOWNLOADS: &str = "Downloads";
 pub const SEARCH: &str = "Search";
 pub const BANDCAMP: &str = "Bandcamp";
@@ -97,8 +113,8 @@ pub const FIELDS: &[Field] = &[
     field("soundcloud.enabled", SOUNDCLOUD, "Search SoundCloud", Kind::Bool, ""),
     field("soundcloud.yt_dlp_path", SOUNDCLOUD, "yt-dlp", Kind::Path,
         "A command name or a full path."),
-    field("soundcloud.cookies_from_browser", SOUNDCLOUD, "Cookies from browser", Kind::Text,
-        "For example firefox, or chrome:Profile 1. Signed in, SoundCloud offers better formats."),
+    field("soundcloud.cookies_from_browser", SOUNDCLOUD, "Cookies from browser", Kind::Choice(BROWSERS),
+        "Signed in there, SoundCloud offers better formats. For one profile, write chrome:Profile 1 in config.toml."),
     field("soundcloud.cookies_file", SOUNDCLOUD, "Cookie file", Kind::Path,
         "A Netscape-format cookie jar, for a browser that isn't on this Mac."),
     field("soundcloud.extra_args", SOUNDCLOUD, "Extra yt-dlp arguments", Kind::List, ""),
@@ -222,8 +238,8 @@ fn parse(field: &Field, raw: &str) -> Result<Option<Value>> {
             }
             n.into()
         }
-        Kind::Text | Kind::Path if raw.is_empty() => return Ok(None),
-        Kind::Text | Kind::Path => raw.into(),
+        Kind::Text | Kind::Path | Kind::Choice(_) if raw.is_empty() => return Ok(None),
+        Kind::Text | Kind::Path | Kind::Choice(_) => raw.into(),
         Kind::List => {
             let items: Array = raw
                 .split(',')
@@ -435,6 +451,21 @@ mod tests {
     fn both_cookie_sources_are_refused() {
         let text = edit("", "soundcloud.cookies_file", "~/cookies.txt").unwrap();
         assert!(edit(&text, "soundcloud.cookies_from_browser", "firefox").is_err());
+    }
+
+    #[test]
+    fn a_choice_keeps_a_value_off_its_list() {
+        let key = "soundcloud.cookies_from_browser";
+        let text = edit("", key, "chrome:Profile 1").unwrap();
+        assert!(
+            text.contains("cookies_from_browser = \"chrome:Profile 1\""),
+            "{text}"
+        );
+        assert!(
+            !edit(&text, key, "")
+                .unwrap()
+                .contains("cookies_from_browser")
+        );
     }
 
     #[test]

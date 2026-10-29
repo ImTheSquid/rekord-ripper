@@ -129,6 +129,15 @@ private struct SettingRow: View {
             }
         case .number, .text, .list:
             SettingField(setting: setting) { EmptyView() }
+        case .choice:
+            Picker(setting.label, selection: Binding(get: { setting.value },
+                                                     set: { model.setSetting(setting.id, $0) })) {
+                ForEach(setting.choices, id: \.value) { Text($0.label).tag($0.value) }
+                // A value written into the file by hand, such as a profile.
+                if !setting.choices.contains(where: { $0.value == setting.value }) {
+                    Text(setting.value).tag(setting.value)
+                }
+            }
         }
     }
 

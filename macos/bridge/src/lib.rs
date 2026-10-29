@@ -220,8 +220,12 @@ mod ffi {
         fn group(&self) -> String;
         fn label(&self) -> String;
         fn help(&self) -> String;
-        // 0 bool, 1 integer, 2 number, 3 text, 4 path, 5 comma-separated list.
+        // 0 bool, 1 integer, 2 number, 3 text, 4 path, 5 comma-separated list,
+        // 6 choice.
         fn kind(&self) -> u8;
+        // A choice's values and their labels, in order; empty otherwise.
+        fn choices(&self) -> Vec<String>;
+        fn choice_labels(&self) -> Vec<String>;
         // Bounds of a number; 0 otherwise.
         fn min(&self) -> f64;
         fn max(&self) -> f64;
@@ -1103,6 +1107,19 @@ impl SettingView {
             Kind::Text => 3,
             Kind::Path => 4,
             Kind::List => 5,
+            Kind::Choice(_) => 6,
+        }
+    }
+    fn choices(&self) -> Vec<String> {
+        self.choice_list().map(|(v, _)| v.to_string()).collect()
+    }
+    fn choice_labels(&self) -> Vec<String> {
+        self.choice_list().map(|(_, l)| l.to_string()).collect()
+    }
+    fn choice_list(&self) -> impl Iterator<Item = &'static (&'static str, &'static str)> {
+        match self.0.kind {
+            Kind::Choice(c) => c.iter(),
+            _ => [].iter(),
         }
     }
     fn min(&self) -> f64 {

@@ -216,7 +216,12 @@ struct PlaylistNode: Identifiable, Hashable {
 /// One `config.toml` key, as the core describes it.
 struct Setting: Identifiable, Equatable {
     enum Kind: UInt8 {
-        case bool, integer, number, text, path, list
+        case bool, integer, number, text, path, list, choice
+    }
+
+    struct Choice: Hashable {
+        let value: String
+        let label: String
     }
 
     /// `section.key`, as in the file.
@@ -226,6 +231,7 @@ struct Setting: Identifiable, Equatable {
     let help: String
     let kind: Kind
     let range: ClosedRange<Double>
+    let choices: [Choice]
     let value: String
 
     init(_ v: SettingViewRef) {
@@ -235,6 +241,9 @@ struct Setting: Identifiable, Equatable {
         help = v.help().toString()
         kind = Kind(rawValue: v.kind()) ?? .text
         range = v.min()...max(v.min(), v.max())
+        choices = zip(v.choices(), v.choice_labels()).map {
+            Choice(value: $0.as_str().toString(), label: $1.as_str().toString())
+        }
         value = v.value().toString()
     }
 }
