@@ -5,6 +5,7 @@ struct InspectorView: View {
     @Environment(SessionModel.self) private var model
 
     var body: some View {
+        let _ = Self.traceChanges()
         let selected = model.selectedTracks
         switch selected.count {
         case 0:
@@ -29,6 +30,7 @@ struct TrackInspector: View {
     }
 
     var body: some View {
+        let _ = Self.traceChanges()
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 TrackHeader(track: track)
@@ -49,6 +51,7 @@ struct TrackInspector: View {
 }
 
 struct TrackHeader: View {
+    @Environment(SessionModel.self) private var model
     let track: Track
 
     var body: some View {
@@ -56,9 +59,7 @@ struct TrackHeader: View {
             ArtworkView(path: track.artworkPath, size: 72)
             VStack(alignment: .leading, spacing: 3) {
                 Text(track.displayTitle).font(.headline).lineLimit(2)
-                    .textSelection(.enabled)
                 Text(track.artist).foregroundStyle(.secondary).lineLimit(1)
-                    .textSelection(.enabled)
                 HStack(spacing: 6) {
                     SourceBadge(track: track)
                     if track.missing { Tag("Missing", .orange) }
@@ -66,6 +67,11 @@ struct TrackHeader: View {
                 }
                 .padding(.top, 2)
             }
+        }
+        .contextMenu {
+            Button("Copy Artist and Title") { model.copy([track.id], .both) }
+            Button("Copy Title") { model.copy([track.id], .title) }
+            Button("Copy Artist") { model.copy([track.id], .artist) }
         }
         Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 4) {
             GridRow {
@@ -159,6 +165,7 @@ struct BetterCopiesSection: View {
     private let fold = 4
 
     var body: some View {
+        let _ = Self.traceChanges()
         let offers = model.offers(for: track.id)
         let state = model.upgrade(for: track.id)
         VStack(alignment: .leading, spacing: 8) {

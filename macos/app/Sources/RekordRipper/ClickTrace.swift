@@ -1,4 +1,5 @@
 import AppKit
+import SwiftUI
 import os
 
 /// Traces clicks and core calls to the unified log, when turned on with
@@ -26,5 +27,12 @@ enum ClickTrace {
     static func note(_ text: String) {
         guard on else { return }
         log.notice("\(text, privacy: .public)")
+    }
+}
+
+extension View {
+    /// Logs what made SwiftUI re-evaluate this body, when tracing.
+    static func traceChanges() {
+        if ClickTrace.on, #available(macOS 14.1, *) { Self._logChanges() }
     }
 }
