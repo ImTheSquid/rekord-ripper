@@ -12,11 +12,12 @@ enum ClickTrace {
     static func install() {
         guard on else { return }
         NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .leftMouseUp]) { e in
+            guard let window = e.window else { return e }
             let p = e.locationInWindow
-            let hit = e.window?.contentView?.hitTest(p)
+            let hit = window.contentView?.hitTest(p)
             let chain = sequence(first: hit, next: { $0?.superview }).prefix(4)
                 .map { $0.map { String(describing: type(of: $0)) } ?? "nil" }.joined(separator: " < ")
-            note("\(e.type == .leftMouseDown ? "down" : "up") at \(Int(p.x)),\(Int(p.y)) -> \(chain)")
+            note("\(e.type == .leftMouseDown ? "down" : "up") at \(String(format: "%.0f,%.0f", p.x, p.y)) -> \(chain)")
             return e
         }
     }
