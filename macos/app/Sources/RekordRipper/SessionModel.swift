@@ -1,4 +1,4 @@
-import Foundation
+import AppKit
 import Observation
 import RekordRipperBridge
 
@@ -36,6 +36,9 @@ final class SessionModel {
     private(set) var offers: [Offer] = []
     @ObservationIgnored private var offersBySrc: [String: [Offer]] = [:]
     private(set) var shopStates: [String: Int64] = [:]
+    /// What each backend answered for the inspected track.
+    @ObservationIgnored private var answersTrack: String?
+    private(set) var answers: [BackendAnswer] = []
     @ObservationIgnored private var searched = Set<String>()
     /// The last multi-track search, which the session works through in batches.
     @ObservationIgnored private var lastBasket = Set<String>()
@@ -150,6 +153,8 @@ final class SessionModel {
             offersBySrc = Dictionary(grouping: s.offers, by: \.srcId)
         }
         assign(\.shopStates, s.shopStates)
+        answersTrack = s.answers?.trackId
+        assign(\.answers, s.answers?.list ?? [])
         if fetch.kind == .running, s.fetch.kind == .done {
             Notifier.shared.post("Download finished", s.fetch.text)
         } else if fetch.kind == .running, s.fetch.kind == .failed {
@@ -253,6 +258,8 @@ final class SessionModel {
 
     func offers(for id: Track.ID) -> [Offer] { offersBySrc[id] ?? [] }
 
+    func answers(for id: Track.ID) -> [BackendAnswer] { answersTrack == id ? answers : [] }
+
     func entries(for id: Track.ID) -> [QueueEntry] { entriesBySrc[id] ?? [] }
 
     func upgrade(for id: Track.ID) -> Upgrade? {
@@ -307,6 +314,26 @@ final class SessionModel {
 
     func openPage(_ offer: Offer) {
         send { $0.open_offer(offer.srcId, offer.itemRef) }
+    }
+
+    enum CopyPart { case title, artist, both }
+
+    /// One line per track, in title order.
+    func copyText(_ ids: some Sequence<Track.ID>, _ part: CopyPart) -> String? {
+        let lines = ids.compactMap { track($0) }.sorted { $0.title < $1.title }.map { t in
+            switch part {
+            case .title: t.title
+            case .artist: t.artist
+            case .both: t.artist.isEmpty ? t.title : "\(t.artist) - \(t.title)"
+            }
+        }
+        return lines.isEmpty ? nil : lines.joined(separator: "\n")
+    }
+
+    func copy(_ ids: some Sequence<Track.ID>, _ part: CopyPart) {
+        guard let text = copyText(ids, part) else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
     }
 
     /// Ask to copy `src`'s analysis onto `dsts`.

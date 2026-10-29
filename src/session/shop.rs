@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use crate::acquire::ItemRef;
 use crate::acquire::shop::{GroupOutcome, QuerySpec, RankedOffer};
+use crate::acquire::types::BackendId;
 use crate::library::TrackRow;
 
 use super::worker;
@@ -46,6 +47,14 @@ pub enum ShopState {
         specs: Vec<QuerySpec>,
     },
     Failed(String),
+}
+
+/// One backend's part in a track's search.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BackendAnswer {
+    pub backend: BackendId,
+    pub offers: usize,
+    pub error: Option<String>,
 }
 
 /// A download in flight, or its result.
@@ -245,6 +254,33 @@ fn basket_rows(
 ///
 /// A group that came back with nothing is still *answered* — the difference
 /// between "found nothing" and "not searched" is the whole reason for the tag.
+fn answers(shop: &ShopState, src_id: &str) -> Vec<BackendAnswer> {
+    let ShopState::Results { groups, .. } = shop else {
+        return Vec::new();
+    };
+    let Some(g) = groups
+        .iter()
+        .rev()
+        .find(|g| g.src_id.as_deref() == Some(src_id))
+    else {
+        return Vec::new();
+    };
+    g.outcome
+        .per_backend
+        .iter()
+        .map(|r| BackendAnswer {
+            backend: r.backend,
+            offers: g
+                .outcome
+                .offers
+                .iter()
+                .filter(|o| o.offer.item_ref.backend == r.backend)
+                .count(),
+            error: r.error.as_ref().map(|e| e.to_string()),
+        })
+        .collect()
+}
+
 fn track_state(shop: &ShopState, queued: &[String], src_id: &str) -> ShopTrackState {
     let found = shop
         .flattened()
@@ -326,6 +362,12 @@ impl Session {
         }
         // Otherwise add it to the list, behind anything already running.
         self.enqueue_shop(&[row])
+    }
+
+    /// What each backend answered for a track's latest search, in the order
+    /// they were asked.
+    pub fn shop_answers(&self, src_id: &str) -> Vec<BackendAnswer> {
+        answers(&self.shop, src_id)
     }
 
     /// How far along a track is: answered, waiting, or untouched.
@@ -799,6 +841,44 @@ mod tests {
             cursor: 0,
             specs,
         }
+    }
+
+    #[test]
+    fn answers_count_each_backends_offers_and_keep_its_error() {
+        use crate::acquire::BackendError;
+        use crate::acquire::shop::BackendReport;
+        let report = |backend, error| BackendReport {
+            backend,
+            elapsed: std::time::Duration::ZERO,
+            raw_hits: 0,
+            enriched: 0,
+            error,
+            enrich_errors: 0,
+        };
+        let mut g = group("101", 2);
+        g.outcome.per_backend = vec![
+            report(BackendId::Bandcamp, None),
+            report(
+                BackendId::Soulseek,
+                Some(BackendError::Timeout {
+                    backend: BackendId::Soulseek,
+                    op: "search",
+                    elapsed: std::time::Duration::from_secs(20),
+                }),
+            ),
+        ];
+        let s = results(vec![group("101", 1), g], vec![spec("101")]);
+        let got = answers(&s, "101");
+        assert_eq!(got.len(), 2, "the latest search only");
+        assert_eq!(
+            (got[0].backend, got[0].offers, got[0].error.is_none()),
+            (BackendId::Bandcamp, 2, true)
+        );
+        assert_eq!(
+            (got[1].backend, got[1].offers, got[1].error.is_some()),
+            (BackendId::Soulseek, 0, true)
+        );
+        assert!(answers(&s, "202").is_empty());
     }
 
     #[test]

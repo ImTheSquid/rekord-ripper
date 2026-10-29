@@ -39,6 +39,8 @@ struct Snapshot {
     var confirmations: [Confirmation] = []
     var shop = ShopStatus()
     var offers: [Offer] = []
+    /// The inspected track and what each backend answered for it.
+    var answers: (trackId: String, list: [BackendAnswer])?
     var shopStates: [String: Int64] = [:]
     var fetch = FetchStatus()
     var fetchQueue: [String] = []
@@ -143,6 +145,9 @@ actor CoreActor {
         s.confirmations = core.open_confirms().compactMap(confirmation)
         s.shop = ShopStatus(core.shop_status())
         s.offers = core.offers().map(Offer.init)
+        if let id = req.inspected {
+            s.answers = (id, core.shop_answers(id).map(BackendAnswer.init))
+        }
         for id in req.searched {
             s.shopStates[id] = core.shop_track_state(id)
         }

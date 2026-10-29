@@ -393,6 +393,20 @@ struct Offer: Identifiable, Hashable {
     }
 }
 
+/// One backend's part in a track's search.
+struct BackendAnswer: Hashable {
+    let backend: String
+    let offers: Int
+    /// Why it failed; empty when it answered.
+    let error: String
+
+    init(_ v: BackendAnswerViewRef) {
+        backend = v.backend().toString()
+        offers = Int(v.offers())
+        error = v.error().toString()
+    }
+}
+
 struct QueueEntry: Identifiable, Hashable {
     let id: Int64
     let srcId: String

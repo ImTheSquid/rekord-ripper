@@ -19,7 +19,9 @@ use rekord_ripper::playlists::PlaylistNode;
 use rekord_ripper::session::collections::{Collection, Direction, Scope, Suggestion};
 use rekord_ripper::session::filter::{dst_visible, src_visible};
 use rekord_ripper::session::review::{Change, PlanReview};
-use rekord_ripper::session::shop::{FetchState, OfferFetch, ShopState, ShopTrackState};
+use rekord_ripper::session::shop::{
+    BackendAnswer, FetchState, OfferFetch, ShopState, ShopTrackState,
+};
 use rekord_ripper::session::view::{self, Tone};
 use rekord_ripper::session::{ConfirmKind, Notice, NoticeAction, Session, StatusLevel};
 use rekord_ripper::settings::{Credential, CredentialState, Field, Kind};
@@ -137,6 +139,8 @@ mod ffi {
         fn collection_visible(&self, code: u8, query: &str) -> Vec<u32>;
         fn playlist_visible(&self, id: &str, query: &str) -> Vec<u32>;
         fn suggestions(&self, id: &str) -> Vec<SuggestionView>;
+        // What each backend answered for the track's latest search.
+        fn shop_answers(&self, src_id: &str) -> Vec<BackendAnswerView>;
         // The top-ranked offer for the track, or none.
         fn best_offer(&self, src_id: &str) -> Vec<OfferView>;
         fn entries_for(&self, src_id: &str) -> Vec<QueueEntryView>;
@@ -244,6 +248,14 @@ mod ffi {
         fn note(&self) -> String;
         // Empty for a secret.
         fn value(&self) -> String;
+    }
+
+    extern "Rust" {
+        type BackendAnswerView;
+        fn backend(&self) -> String;
+        fn offers(&self) -> u32;
+        // Why the backend failed; empty when it answered.
+        fn error(&self) -> String;
     }
 
     extern "Rust" {
@@ -376,6 +388,8 @@ pub struct SettingView(&'static Field, String);
 pub struct CredentialView(&'static Credential, CredentialState);
 
 pub struct SuggestionView(Suggestion);
+
+pub struct BackendAnswerView(BackendAnswer);
 
 pub struct CueMarkView(CueMark);
 
@@ -820,6 +834,13 @@ impl CoreSession {
         )
     }
 
+    fn shop_answers(&self, src_id: &str) -> Vec<BackendAnswerView> {
+        self.0
+            .shop_answers(src_id)
+            .into_iter()
+            .map(BackendAnswerView)
+            .collect()
+    }
     fn suggestions(&self, id: &str) -> Vec<SuggestionView> {
         self.0
             .suggestions(id)
@@ -1168,6 +1189,18 @@ impl CredentialView {
     }
 }
 
+impl BackendAnswerView {
+    fn backend(&self) -> String {
+        self.0.backend.label().into()
+    }
+    fn offers(&self) -> u32 {
+        self.0.offers as u32
+    }
+    fn error(&self) -> String {
+        self.0.error.clone().unwrap_or_default()
+    }
+}
+
 impl SuggestionView {
     fn id(&self) -> String {
         self.0.id.clone()
@@ -1268,7 +1301,7 @@ impl OfferView {
         self.offer.offer.item_ref.to_string()
     }
     fn backend(&self) -> String {
-        self.offer.offer.item_ref.backend.to_string()
+        self.offer.offer.item_ref.backend.label().into()
     }
     fn artist(&self) -> String {
         self.offer.offer.artist.clone()

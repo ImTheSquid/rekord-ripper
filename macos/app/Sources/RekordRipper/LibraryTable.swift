@@ -65,9 +65,16 @@ struct LibraryTable: View {
                 Button(ids.count == 1 ? "Find Better Copies" : "Find Better Copies for \(ids.count) Tracks") {
                     model.findBetterCopies(ids)
                 }
+                Divider()
+                Button("Copy Artist and Title") { model.copy(ids, .both) }
+                Button("Copy Title") { model.copy(ids, .title) }
+                Button("Copy Artist") { model.copy(ids, .artist) }
             }
         } primaryAction: { _ in
             model.inspectorShown = true
+        }
+        .onCopyCommand {
+            model.copyText(model.selection, .both).map { [NSItemProvider(object: $0 as NSString)] } ?? []
         }
         .overlay {
             if rows.isEmpty, !model.tracks.isEmpty {

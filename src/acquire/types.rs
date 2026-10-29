@@ -43,6 +43,15 @@ impl BackendId {
         }
     }
 
+    /// The name as the service writes it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Bandcamp => "Bandcamp",
+            Self::SoundCloud => "SoundCloud",
+            Self::Soulseek => "Soulseek",
+        }
+    }
+
     /// Final tie-break in the offer table, so output is deterministic and
     /// therefore snapshot-testable.
     pub fn sort_order(self) -> u8 {

@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 struct InspectorView: View {
@@ -55,7 +56,9 @@ struct TrackHeader: View {
             ArtworkView(path: track.artworkPath, size: 72)
             VStack(alignment: .leading, spacing: 3) {
                 Text(track.displayTitle).font(.headline).lineLimit(2)
+                    .textSelection(.enabled)
                 Text(track.artist).foregroundStyle(.secondary).lineLimit(1)
+                    .textSelection(.enabled)
                 HStack(spacing: 6) {
                     SourceBadge(track: track)
                     if track.missing { Tag("Missing", .orange) }
@@ -150,31 +153,83 @@ private struct SectionBox<Content: View>: View {
 struct BetterCopiesSection: View {
     @Environment(SessionModel.self) private var model
     let track: Track
+    @State private var showAll = false
+
+    /// Rows shown before "Show More".
+    private let fold = 4
 
     var body: some View {
-        SectionBox(title: "Better Copies") {
-            let offers = model.offers(for: track.id)
-            switch model.upgrade(for: track.id) {
-            case .searching?:
-                Label { Text("Searching…") } icon: { ProgressView().controlSize(.small) }
-            case .notFound?:
-                Text("Nothing better found.").foregroundStyle(.secondary)
-                Button("Search Again") { model.research(track.id) }
-            default:
-                if offers.isEmpty {
+        let offers = model.offers(for: track.id)
+        let state = model.upgrade(for: track.id)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Better Copies").font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
+                Spacer()
+                if state == .searching {
+                    ProgressView().controlSize(.small)
+                } else if state != nil || !offers.isEmpty {
+                    Button { model.research(track.id) } label: { Image(systemName: "arrow.clockwise") }
+                        .buttonStyle(.borderless)
+                        .help("Search Again")
+                }
+            }
+            if offers.isEmpty {
+                switch state {
+                case .searching?:
+                    Text("Searching…").foregroundStyle(.secondary)
+                case .notFound?:
+                    Text("Nothing better found.").foregroundStyle(.secondary)
+                default:
                     Button("Find Better Copies") { model.findBetterCopies([track.id]) }
-                } else {
-                    ForEach(offers.prefix(6)) { offer in
+                }
+            } else {
+                VStack(spacing: 0) {
+                    let shown = showAll ? offers[...] : offers.prefix(fold)
+                    ForEach(Array(shown.enumerated()), id: \.element.id) { i, offer in
+                        if i > 0 { Divider() }
                         OfferRow(offer: offer)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 6)
                     }
-                    if offers.count > 6 {
-                        Text("\(offers.count - 6) more").font(.caption).foregroundStyle(.secondary)
+                }
+                .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 6))
+                if offers.count > fold {
+                    Button(showAll ? "Show Fewer" : "Show \(offers.count - fold) More") {
+                        withAnimation(.snappy) { showAll.toggle() }
                     }
-                    Button("Search Again") { model.research(track.id) }
-                        .controlSize(.small)
+                    .buttonStyle(.link)
+                    .font(.caption)
+                }
+            }
+            let answers = model.answers(for: track.id)
+            if !answers.isEmpty {
+                BackendAnswers(answers: answers)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// "Bandcamp 0 · SoundCloud 1 · Soulseek failed", with the failure on hover.
+private struct BackendAnswers: View {
+    let answers: [BackendAnswer]
+
+    var body: some View {
+        HStack(spacing: 4) {
+            ForEach(Array(answers.enumerated()), id: \.element) { i, a in
+                if i > 0 { Text("·") }
+                if a.error.isEmpty {
+                    Text("\(a.backend) \(a.offers)")
+                } else {
+                    Label("\(a.backend) failed", systemImage: "exclamationmark.triangle.fill")
+                        .labelStyle(.titleAndIcon)
+                        .foregroundStyle(.orange)
+                        .help(a.error)
                 }
             }
         }
+        .font(.caption)
+        .foregroundStyle(.secondary)
     }
 }
 
@@ -183,17 +238,23 @@ struct OfferRow: View {
     let offer: Offer
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
+        HStack(alignment: .center, spacing: 8) {
+            FormatBadge(offer: offer)
             VStack(alignment: .leading, spacing: 1) {
-                Text("\(offer.artist) — \(offer.title)").lineLimit(1)
-                HStack(spacing: 4) {
-                    if offer.lossless == true {
-                        Image(systemName: "waveform").foregroundStyle(.green).help("Lossless")
-                    }
-                    Text(offer.summary)
+                Text("\(offer.artist) — \(offer.title)")
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help("\(offer.artist) — \(offer.title)")
+                Text(details)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .help(details)
+                if offer.matchScore < 100 {
+                    Text("\(offer.matchScore)% match")
+                        .font(.caption2)
+                        .foregroundStyle(offer.matchScore < 60 ? AnyShapeStyle(.orange) : AnyShapeStyle(.secondary))
                 }
-                .font(.caption)
-                .foregroundStyle(.secondary)
                 if !offer.note.isEmpty {
                     Text(offer.note).font(.caption2).foregroundStyle(.orange).lineLimit(2)
                 }
@@ -216,9 +277,45 @@ struct OfferRow: View {
             }
         }
         .controlSize(.small)
+        .contentShape(Rectangle())
         .contextMenu {
             Button("Open Store Page") { model.openPage(offer) }
+            Button("Copy Link") { copy(offer.url) }
+                .disabled(offer.url.isEmpty)
+            Button("Copy Artist and Title") { copy("\(offer.artist) - \(offer.title)") }
         }
+    }
+
+    /// "Soulseek · free · album name"
+    private var details: String {
+        var parts = [offer.backend, offer.price]
+        if !offer.ownership.isEmpty, offer.ownership != "n/a" { parts.append(offer.ownership) }
+        if !offer.album.isEmpty, offer.album != offer.title { parts.append(offer.album) }
+        return parts.filter { !$0.isEmpty }.joined(separator: " · ")
+    }
+
+    private func copy(_ text: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+    }
+}
+
+/// The best format on offer, green when lossless.
+private struct FormatBadge: View {
+    let offer: Offer
+
+    var body: some View {
+        let best = offer.formats.split(separator: " ").first.map(String.init) ?? "?"
+        let colour: Color = offer.lossless == true ? .green : .secondary
+        Text(best)
+            .font(.caption2.weight(.semibold).monospaced())
+            .lineLimit(1)
+            .fixedSize()
+            .frame(minWidth: 52)
+            .padding(.vertical, 2)
+            .foregroundStyle(colour)
+            .background(colour.opacity(0.12), in: RoundedRectangle(cornerRadius: 4))
+            .help(offer.formats.isEmpty ? "Formats not checked" : offer.formats)
     }
 }
 
