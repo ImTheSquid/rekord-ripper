@@ -73,9 +73,6 @@ struct LibraryTable: View {
         } primaryAction: { _ in
             model.inspectorShown = true
         }
-        .onCopyCommand {
-            model.copyText(model.selection, .both).map { [NSItemProvider(object: $0 as NSString)] } ?? []
-        }
         .overlay {
             if rows.isEmpty, !model.tracks.isEmpty {
                 ContentUnavailableView.search(text: model.query)
