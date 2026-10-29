@@ -168,7 +168,10 @@ struct BetterCopiesSection: View {
                 if state == .searching {
                     ProgressView().controlSize(.small)
                 } else if state != nil || !offers.isEmpty {
-                    Button { model.research(track.id) } label: { Image(systemName: "arrow.clockwise") }
+                    Button {
+                        ClickTrace.note("Search Again pressed")
+                        model.research(track.id)
+                    } label: { Image(systemName: "arrow.clockwise") }
                         .buttonStyle(.borderless)
                         .help("Search Again")
                 }
@@ -180,7 +183,10 @@ struct BetterCopiesSection: View {
                 case .notFound?:
                     Text("Nothing better found.").foregroundStyle(.secondary)
                 default:
-                    Button("Find Better Copies") { model.findBetterCopies([track.id]) }
+                    Button("Find Better Copies") {
+                        ClickTrace.note("Find Better Copies pressed")
+                        model.findBetterCopies([track.id])
+                    }
                 }
             } else {
                 VStack(spacing: 0) {
@@ -264,10 +270,16 @@ struct OfferRow: View {
             switch offer.fetch {
             case .none:
                 if offer.requiresPurchase {
-                    Button("Buy") { model.openPage(offer) }
+                    Button("Buy") {
+                        ClickTrace.note("Buy pressed")
+                        model.openPage(offer)
+                    }
                         .help("Open the store page")
                 } else if offer.fetchable {
-                    Button("Download") { model.download(offer) }
+                    Button("Download") {
+                        ClickTrace.note("Download pressed")
+                        model.download(offer)
+                    }
                 }
             case .queued:
                 Image(systemName: "clock").foregroundStyle(.secondary).help("Queued")
