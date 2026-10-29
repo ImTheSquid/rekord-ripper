@@ -23,7 +23,14 @@ rm -rf "$out"
 mkdir -p "$out/Contents/MacOS" "$out/Contents/Resources"
 cp "$bin" "$out/Contents/MacOS/RekordRipper"
 cp "$app_pkg/Resources/Info.plist" "$out/Contents/Info.plist"
-[[ -f "$app_pkg/Resources/AppIcon.icns" ]] && cp "$app_pkg/Resources/AppIcon.icns" "$out/Contents/Resources/"
+# The Icon Composer icon needs Xcode's actool; the .icns made from it stands in without.
+if xcrun --find actool >/dev/null 2>&1; then
+  xcrun actool "$app_pkg/Resources/AppIcon.icon" --compile "$out/Contents/Resources" \
+    --platform macosx --minimum-deployment-target 14.0 --app-icon AppIcon \
+    --output-partial-info-plist "$(mktemp -d)/icon.plist" --errors >/dev/null
+else
+  cp "$app_pkg/Resources/AppIcon.icns" "$out/Contents/Resources/"
+fi
 codesign --force --sign - "$out"
 
 echo "built $out"
