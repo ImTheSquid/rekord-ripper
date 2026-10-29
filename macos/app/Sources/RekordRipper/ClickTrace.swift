@@ -20,8 +20,27 @@ enum ClickTrace {
             let chain = sequence(first: hit, next: { $0?.superview }).prefix(4)
                 .map { $0.map { String(describing: type(of: $0)) } ?? "nil" }.joined(separator: " < ")
             note("\(e.type == .leftMouseDown ? "down" : "up") at \(String(format: "%.0f,%.0f", p.x, p.y)) -> \(chain)")
+            if e.type == .leftMouseDown, let root = window.contentView {
+                note("  near: " + controls(in: root, near: p).joined(separator: "; "))
+            }
             return e
         }
+    }
+
+    /// Buttons and spinners within reach of `p`, with their frames in window coordinates.
+    @MainActor
+    private static func controls(in view: NSView, near p: NSPoint) -> [String] {
+        var out: [String] = []
+        let name = String(describing: type(of: view))
+        if name.contains("Button") || view is NSProgressIndicator {
+            let f = view.convert(view.bounds, to: nil)
+            if abs(f.midY - p.y) < 120, abs(f.midX - p.x) < 300 {
+                let title = (view as? NSButton)?.title ?? ""
+                out.append("\(name.prefix(24)) '\(title)' x \(Int(f.minX))-\(Int(f.maxX)) y \(Int(f.minY))-\(Int(f.maxY))")
+            }
+        }
+        for sub in view.subviews { out += controls(in: sub, near: p) }
+        return out
     }
 
     static func note(_ text: String) {
