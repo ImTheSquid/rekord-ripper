@@ -168,12 +168,15 @@ struct BetterCopiesSection: View {
                 if state == .searching {
                     ProgressView().controlSize(.small)
                 } else if state != nil || !offers.isEmpty {
-                    Button {
+                    // A push button: borderless and link buttons in the inspector
+                    // never receive their press.
+                    Button("Search Again", systemImage: "arrow.clockwise") {
                         ClickTrace.note("Search Again pressed")
                         model.research(track.id)
-                    } label: { Image(systemName: "arrow.clockwise") }
-                        .buttonStyle(.borderless)
-                        .help("Search Again")
+                    }
+                    .labelStyle(.iconOnly)
+                    .controlSize(.small)
+                    .help("Search Again")
                 }
             }
             if offers.isEmpty {
@@ -202,10 +205,10 @@ struct BetterCopiesSection: View {
                 .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 6))
                 if offers.count > fold {
                     Button(showAll ? "Show Fewer" : "Show \(offers.count - fold) More") {
+                        ClickTrace.note("Show More pressed")
                         withAnimation(.snappy) { showAll.toggle() }
                     }
-                    .buttonStyle(.link)
-                    .font(.caption)
+                    .controlSize(.small)
                 }
             }
             let answers = model.answers(for: track.id)
@@ -214,7 +217,6 @@ struct BetterCopiesSection: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .simultaneousGesture(TapGesture().onEnded { ClickTrace.note("Better Copies section tapped") })
     }
 }
 

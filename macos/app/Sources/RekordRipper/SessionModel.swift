@@ -34,7 +34,7 @@ final class SessionModel {
     private(set) var copyLock = false
     private(set) var shop = ShopStatus()
     private(set) var offers: [Offer] = []
-    @ObservationIgnored private var offersBySrc: [String: [Offer]] = [:]
+    private var offersBySrc: [String: [Offer]] = [:]
     private(set) var shopStates: [String: Int64] = [:]
     /// What each backend answered for the inspected track.
     @ObservationIgnored private var answersTrack: String?
@@ -45,7 +45,7 @@ final class SessionModel {
     private(set) var fetch = FetchStatus()
     private(set) var fetchQueue: [String] = []
     private(set) var entries: [QueueEntry] = []
-    @ObservationIgnored private var entriesBySrc: [String: [QueueEntry]] = [:]
+    private var entriesBySrc: [String: [QueueEntry]] = [:]
     @ObservationIgnored private var unresolvedErrors = false
     @ObservationIgnored private var workInFlight = ""
 
