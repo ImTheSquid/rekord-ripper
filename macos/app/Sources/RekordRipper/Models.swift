@@ -362,6 +362,7 @@ struct Offer: Identifiable, Hashable {
     /// nil when its formats have not been checked.
     let lossless: Bool?
     let requiresPurchase: Bool
+    let fetchable: Bool
     let fetch: Fetch
     let matchScore: Int64
 
@@ -383,6 +384,7 @@ struct Offer: Identifiable, Hashable {
         default: nil
         }
         requiresPurchase = v.requires_purchase()
+        fetchable = v.fetchable()
         fetch = Fetch(rawValue: v.fetch()) ?? .none
         matchScore = v.match_score()
     }

@@ -186,7 +186,8 @@ struct BetterCopiesSection: View {
                 VStack(spacing: 0) {
                     let shown = showAll ? offers[...] : offers.prefix(fold)
                     ForEach(Array(shown.enumerated()), id: \.element.id) { i, offer in
-                        if i > 0 { Divider() }
+                        // Starts under the text, past the format badge.
+                        if i > 0 { Divider().padding(.leading, 8 + FormatBadge.width + 8) }
                         OfferRow(offer: offer)
                             .padding(.horizontal, 8)
                             .padding(.vertical, 6)
@@ -265,7 +266,7 @@ struct OfferRow: View {
                 if offer.requiresPurchase {
                     Button("Buy") { model.openPage(offer) }
                         .help("Open the store page")
-                } else {
+                } else if offer.fetchable {
                     Button("Download") { model.download(offer) }
                 }
             case .queued:
@@ -302,6 +303,7 @@ struct OfferRow: View {
 
 /// The best format on offer, green when lossless.
 private struct FormatBadge: View {
+    static let width: CGFloat = 52
     let offer: Offer
 
     var body: some View {
@@ -311,7 +313,7 @@ private struct FormatBadge: View {
             .font(.caption2.weight(.semibold).monospaced())
             .lineLimit(1)
             .fixedSize()
-            .frame(minWidth: 52)
+            .frame(minWidth: Self.width)
             .padding(.vertical, 2)
             .foregroundStyle(colour)
             .background(colour.opacity(0.12), in: RoundedRectangle(cornerRadius: 4))

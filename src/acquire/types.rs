@@ -528,6 +528,11 @@ impl Offer {
     }
 
     /// True when money must change hands before `fetch` can work.
+    /// False once probing found nothing on it that can be fetched.
+    pub fn fetchable(&self) -> bool {
+        !matches!(self.formats.as_deref(), Some([]))
+    }
+
     pub fn requires_purchase(&self) -> bool {
         if matches!(
             self.ownership,
@@ -907,6 +912,20 @@ mod tests {
         v.sort();
         assert_eq!(v[0], CostClass::AlreadyOwned);
         assert_eq!(*v.last().unwrap(), CostClass::Unavailable);
+    }
+
+    #[test]
+    fn an_offer_probed_to_nothing_is_not_fetchable() {
+        let mut o = Offer::new(
+            ItemRef::new(BackendId::SoundCloud, "track/1"),
+            ItemKind::Track,
+            "A",
+            "T",
+            "https://x/y",
+        );
+        assert!(o.fetchable(), "unprobed is worth a try");
+        o.formats = Some(Vec::new());
+        assert!(!o.fetchable());
     }
 
     #[test]

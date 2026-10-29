@@ -654,6 +654,13 @@ impl Session {
             self.status.warn("no offer selected.");
             return false;
         };
+        if !offer.fetchable() {
+            self.status.warn(match &offer.enrich_error {
+                Some(why) => format!("that one can't be downloaded: {why}."),
+                None => "that one can't be downloaded.".to_string(),
+            });
+            return false;
+        }
         // Something you have to pay for cannot be fetched; say what to do instead.
         if offer.requires_purchase() {
             self.status.warn(format!(

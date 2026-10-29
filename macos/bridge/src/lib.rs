@@ -325,6 +325,8 @@ mod ffi {
         fn note(&self) -> String;
         // 1 lossless, 0 not, -1 formats not checked.
         fn lossless(&self) -> i8;
+        // False when nothing on it can be downloaded, such as a DRM track.
+        fn fetchable(&self) -> bool;
         fn requires_purchase(&self) -> bool;
         // 0 none, 1 queued, 2 running, 3 done.
         fn fetch(&self) -> u8;
@@ -1333,6 +1335,9 @@ impl OfferView {
             Some(false) => 0,
             None => -1,
         }
+    }
+    fn fetchable(&self) -> bool {
+        self.offer.offer.fetchable()
     }
     fn requires_purchase(&self) -> bool {
         self.offer.offer.requires_purchase()
