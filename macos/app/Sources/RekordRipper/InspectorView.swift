@@ -214,6 +214,7 @@ struct BetterCopiesSection: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .simultaneousGesture(TapGesture().onEnded { ClickTrace.note("Better Copies section tapped") })
     }
 }
 
@@ -251,12 +252,10 @@ struct OfferRow: View {
                 Text("\(offer.artist) — \(offer.title)")
                     .lineLimit(1)
                     .truncationMode(.middle)
-                    .help("\(offer.artist) — \(offer.title)")
                 Text(details)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
-                    .help(details)
                 if offer.matchScore < 100 {
                     Text("\(offer.matchScore)% match")
                         .font(.caption2)
@@ -265,6 +264,13 @@ struct OfferRow: View {
                 if !offer.note.isEmpty {
                     Text(offer.note).font(.caption2).foregroundStyle(.orange).lineLimit(2)
                 }
+            }
+            // On the text only, so it never sits over the button.
+            .contextMenu {
+                Button("Open Store Page") { model.openPage(offer) }
+                Button("Copy Link") { copy(offer.url) }
+                    .disabled(offer.url.isEmpty)
+                Button("Copy Artist and Title") { copy("\(offer.artist) - \(offer.title)") }
             }
             Spacer(minLength: 4)
             switch offer.fetch {
@@ -290,13 +296,6 @@ struct OfferRow: View {
             }
         }
         .controlSize(.small)
-        .contentShape(Rectangle())
-        .contextMenu {
-            Button("Open Store Page") { model.openPage(offer) }
-            Button("Copy Link") { copy(offer.url) }
-                .disabled(offer.url.isEmpty)
-            Button("Copy Artist and Title") { copy("\(offer.artist) - \(offer.title)") }
-        }
     }
 
     /// "Soulseek · free · album name"

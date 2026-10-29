@@ -11,6 +11,7 @@ enum ClickTrace {
     @MainActor
     static func install() {
         guard on else { return }
+        note("tracing clicks")
         NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .leftMouseUp]) { e in
             guard let window = e.window else { return e }
             let p = e.locationInWindow
@@ -24,6 +25,6 @@ enum ClickTrace {
 
     static func note(_ text: String) {
         guard on else { return }
-        log.info("\(text, privacy: .public)")
+        log.notice("\(text, privacy: .public)")
     }
 }
