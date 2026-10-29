@@ -104,10 +104,7 @@ final class SessionModel {
 
     private func pollLoop() async {
         while !Task.isCancelled, let core {
-            let started = Date()
             apply(await core.poll(request))
-            let took = Date().timeIntervalSince(started)
-            if took > 0.25 { ClickTrace.note("slow poll: \(Int(took * 1000))ms") }
             let nap = Task { _ = try? await Task.sleep(for: .milliseconds(200)) }
             sleeper = nap
             await nap.value
@@ -282,10 +279,8 @@ final class SessionModel {
 
     private func send(_ body: @escaping @Sendable (CoreSession) -> Void) {
         guard let core else { return }
-        let asked = Date()
         Task {
             await core.run(body)
-            ClickTrace.note("core call done after \(Int(Date().timeIntervalSince(asked) * 1000))ms")
             kick()
         }
     }

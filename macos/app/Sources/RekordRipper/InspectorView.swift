@@ -5,7 +5,6 @@ struct InspectorView: View {
     @Environment(SessionModel.self) private var model
 
     var body: some View {
-        let _ = Self.traceChanges()
         let selected = model.selectedTracks
         switch selected.count {
         case 0:
@@ -30,7 +29,6 @@ struct TrackInspector: View {
     }
 
     var body: some View {
-        let _ = Self.traceChanges()
         InspectorScroll {
             VStack(alignment: .leading, spacing: 18) {
                 TrackHeader(track: track)
@@ -68,7 +66,6 @@ private struct InspectorScroll<Content: View>: View {
 }
 
 struct TrackHeader: View {
-    @Environment(SessionModel.self) private var model
     let track: Track
 
     var body: some View {
@@ -76,7 +73,9 @@ struct TrackHeader: View {
             ArtworkView(path: track.artworkPath, size: 72)
             VStack(alignment: .leading, spacing: 3) {
                 Text(track.displayTitle).font(.headline).lineLimit(2)
+                    .textSelection(.enabled)
                 Text(track.artist).foregroundStyle(.secondary).lineLimit(1)
+                    .textSelection(.enabled)
                 HStack(spacing: 6) {
                     SourceBadge(track: track)
                     if track.missing { Tag("Missing", .orange) }
@@ -84,11 +83,6 @@ struct TrackHeader: View {
                 }
                 .padding(.top, 2)
             }
-        }
-        .contextMenu {
-            Button("Copy Artist and Title") { model.copy([track.id], .both) }
-            Button("Copy Title") { model.copy([track.id], .title) }
-            Button("Copy Artist") { model.copy([track.id], .artist) }
         }
         Grid(alignment: .leading, horizontalSpacing: 16, verticalSpacing: 4) {
             GridRow {
@@ -182,7 +176,6 @@ struct BetterCopiesSection: View {
     private let fold = 4
 
     var body: some View {
-        let _ = Self.traceChanges()
         let offers = model.offers(for: track.id)
         let state = model.upgrade(for: track.id)
         VStack(alignment: .leading, spacing: 8) {
@@ -192,12 +185,7 @@ struct BetterCopiesSection: View {
                 if state == .searching {
                     ProgressView().controlSize(.small)
                 } else if state != nil || !offers.isEmpty {
-                    // A push button: borderless and link buttons in the inspector
-                    // never receive their press.
-                    Button("Search Again", systemImage: "arrow.clockwise") {
-                        ClickTrace.note("Search Again pressed")
-                        model.research(track.id)
-                    }
+                    Button("Search Again", systemImage: "arrow.clockwise") { model.research(track.id) }
                     .labelStyle(.iconOnly)
                     .controlSize(.small)
                     .help("Search Again")
@@ -210,10 +198,7 @@ struct BetterCopiesSection: View {
                 case .notFound?:
                     Text("Nothing better found.").foregroundStyle(.secondary)
                 default:
-                    Button("Find Better Copies") {
-                        ClickTrace.note("Find Better Copies pressed")
-                        model.findBetterCopies([track.id])
-                    }
+                    Button("Find Better Copies") { model.findBetterCopies([track.id]) }
                 }
             } else {
                 VStack(spacing: 0) {
@@ -229,7 +214,6 @@ struct BetterCopiesSection: View {
                 .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 6))
                 if offers.count > fold {
                     Button(showAll ? "Show Fewer" : "Show \(offers.count - fold) More") {
-                        ClickTrace.note("Show More pressed")
                         withAnimation(.snappy) { showAll.toggle() }
                     }
                     .controlSize(.small)
@@ -302,16 +286,10 @@ struct OfferRow: View {
             switch offer.fetch {
             case .none:
                 if offer.requiresPurchase {
-                    Button("Buy") {
-                        ClickTrace.note("Buy pressed")
-                        model.openPage(offer)
-                    }
+                    Button("Buy") { model.openPage(offer) }
                         .help("Open the store page")
                 } else if offer.fetchable {
-                    Button("Download") {
-                        ClickTrace.note("Download pressed")
-                        model.download(offer)
-                    }
+                    Button("Download") { model.download(offer) }
                 }
             case .queued:
                 Image(systemName: "clock").foregroundStyle(.secondary).help("Queued")

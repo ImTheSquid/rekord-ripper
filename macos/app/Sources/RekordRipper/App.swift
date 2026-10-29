@@ -25,11 +25,6 @@ struct RekordRipperApp: App {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     @MainActor var model: SessionModel?
 
-    @MainActor
-    func applicationDidFinishLaunching(_: Notification) {
-        ClickTrace.install()
-    }
-
     func applicationShouldTerminateAfterLastWindowClosed(_: NSApplication) -> Bool { true }
 
     @MainActor
