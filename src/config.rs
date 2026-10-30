@@ -58,6 +58,8 @@ pub struct General {
     pub download_dir: Option<String>,
     /// Tried in order when a backend offers a choice. First match wins.
     pub format_preference: Vec<String>,
+    /// Downloads that run at once; the rest wait their turn.
+    pub max_downloads: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -228,6 +230,7 @@ impl Default for General {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            max_downloads: 3,
         }
     }
 }

@@ -162,6 +162,11 @@ pub fn wait_until(
         if let Some(status) = child.try_wait()? {
             return Ok(Some(status));
         }
+        if crate::cancel::requested() {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("cancelled");
+        }
         if Instant::now() >= deadline {
             // Kill, then wait: without the wait we leave a zombie behind.
             let _ = child.kill();

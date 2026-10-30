@@ -496,6 +496,21 @@ impl Client {
         self.get_json(&path, "download listing")
     }
 
+    /// Cancel a download and drop it from slskd's list. Best effort.
+    pub fn cancel_download(&self, username: &str, id: &str) -> bool {
+        let url = self.url(&format!(
+            "transfers/downloads/{}/{}?remove=true",
+            encode_path_segment(username),
+            encode_path_segment(id)
+        ));
+        let agent = http::agent(self.budget);
+        agent
+            .delete(&url)
+            .header("X-API-Key", &self.api_key)
+            .call()
+            .is_ok()
+    }
+
     /// Delete a subdirectory of the download directory.
     ///
     /// Best effort by design: slskd answers 403 unless `remote_file_management`

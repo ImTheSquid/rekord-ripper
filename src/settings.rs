@@ -81,6 +81,8 @@ pub const FIELDS: &[Field] = &[
         "Where downloads land. Empty uses the incoming folder in the app's data folder."),
     field("general.format_preference", DOWNLOADS, "Format preference", Kind::List,
         "Tried in order; the first format a source offers wins."),
+    field("general.max_downloads", DOWNLOADS, "Downloads at once", int(1, 8),
+        "More wait their turn."),
     field("import.insert_content_rows", DOWNLOADS, "Import downloads into rekordbox", Kind::Bool,
         "Adds each download to master.db itself, after a backup. Off, you drag the download folder into rekordbox."),
     field("pending.ttl_days", DOWNLOADS, "Keep unimported downloads for (days)", int(1, 3650),

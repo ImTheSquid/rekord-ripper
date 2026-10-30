@@ -702,7 +702,13 @@ impl Soulseek {
                     elapsed: started.elapsed(),
                 });
             }
-            std::thread::sleep(POLL_EVERY.min(deadline.saturating_duration_since(Instant::now())));
+            if !crate::cancel::sleep(
+                POLL_EVERY.min(deadline.saturating_duration_since(Instant::now())),
+            ) {
+                // Unlike a timeout, nothing is coming back for this one.
+                client.cancel_download(&t.username, &t.id);
+                return Err(BackendError::Other(anyhow::anyhow!("cancelled")));
+            }
         }
     }
 

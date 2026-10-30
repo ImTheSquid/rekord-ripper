@@ -90,69 +90,168 @@ pub enum OfferFetch {
     Done,
 }
 
-/// A download handed to the worker: in flight if it is at the front, else
-/// waiting its turn.
-#[derive(Debug, PartialEq, Eq)]
+/// Where a download has got to.
+#[derive(Debug)]
+enum Stage {
+    /// Behind the downloads already running.
+    Waiting,
+    Running {
+        since: Instant,
+        /// The backend's last word on it: a queue position, a percentage.
+        note: Option<String>,
+        cancel: crate::cancel::Token,
+    },
+    /// Told to stop; its thread has yet to answer.
+    Cancelling,
+}
+
+/// The part of [`Stage`] a frontend shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DownloadStage {
+    Waiting,
+    Running,
+    Cancelling,
+}
+
+/// One download, as a frontend lists it.
+pub struct DownloadRow<'a> {
+    pub what: &'a str,
+    pub item: &'a ItemRef,
+    pub src: Option<&'a str>,
+    pub stage: DownloadStage,
+    pub since: Option<Instant>,
+    pub note: Option<&'a str>,
+}
+
+#[derive(Debug)]
 struct QueuedFetch {
+    id: u64,
     /// `artist — title`, for the status line.
     what: String,
     /// The source track to pair the finished file with, if any.
     src: Option<String>,
     /// So the same offer twice is refused rather than downloaded twice.
     item: ItemRef,
+    dest: std::path::PathBuf,
+    format_pref: Vec<crate::acquire::AudioFormat>,
+    stage: Stage,
 }
 
-/// The downloads handed to the worker, oldest first. The front one is running.
-///
-/// A queue rather than a slot because the worker already runs jobs one at a time
-/// in submission order — several fetches need somewhere to keep each one's label
-/// and source track, not a scheduler. Per-download `src` is the part that has to
-/// be a queue: a single shared slot pairs every finished file with the *last*
-/// download started rather than its own.
+/// Downloads asked for, oldest first. Several run at once, each on its own
+/// thread, and each answers by id, so a finished file is paired with its own
+/// source track whatever order they finish in.
 #[derive(Default)]
-pub struct FetchQueue(VecDeque<QueuedFetch>);
+pub struct FetchQueue {
+    items: VecDeque<QueuedFetch>,
+    next_id: u64,
+}
 
 impl FetchQueue {
-    fn push(&mut self, q: QueuedFetch) {
-        self.0.push_back(q);
+    fn push(
+        &mut self,
+        what: String,
+        src: Option<String>,
+        item: ItemRef,
+        dest: std::path::PathBuf,
+        format_pref: Vec<crate::acquire::AudioFormat>,
+    ) -> u64 {
+        self.next_id += 1;
+        self.items.push_back(QueuedFetch {
+            id: self.next_id,
+            what,
+            src,
+            item,
+            dest,
+            format_pref,
+            stage: Stage::Waiting,
+        });
+        self.next_id
     }
 
-    /// A dead worker answers none of them, not just the one in flight.
-    pub(super) fn abandon_all(&mut self) {
-        self.0.clear();
+    fn find_mut(&mut self, item: &ItemRef) -> Option<&mut QueuedFetch> {
+        self.items.iter_mut().find(|q| &q.item == item)
     }
 
-    /// Downloads ahead of `item`, or `None` when it is not queued at all.
-    fn ahead_of(&self, item: &ItemRef) -> Option<usize> {
-        self.0.iter().position(|q| &q.item == item)
+    fn take(&mut self, id: u64) -> Option<QueuedFetch> {
+        let at = self.items.iter().position(|q| q.id == id)?;
+        self.items.remove(at)
     }
 
-    /// Retire the finished front and hand it back.
-    ///
-    /// Front, not a search by id: the worker answers in submission order, and
-    /// `Fetched` carries no way to tell which download it belongs to.
-    fn finish_front(&mut self) -> Option<QueuedFetch> {
-        self.0.pop_front()
-    }
-
-    fn label(&self) -> Option<&str> {
-        self.0.front().map(|q| q.what.as_str())
-    }
-
-    /// Every download, oldest first, paired with whether it is the running one.
-    pub fn iter(&self) -> impl Iterator<Item = (&str, bool)> {
-        self.0
+    /// Downloads holding a thread, including ones being cancelled.
+    fn running(&self) -> usize {
+        self.items
             .iter()
-            .enumerate()
-            .map(|(i, q)| (q.what.as_str(), i == 0))
+            .filter(|q| !matches!(q.stage, Stage::Waiting))
+            .count()
+    }
+
+    fn next_waiting(&mut self) -> Option<&mut QueuedFetch> {
+        self.items
+            .iter_mut()
+            .find(|q| matches!(q.stage, Stage::Waiting))
+    }
+
+    fn note(&mut self, id: u64, line: String) {
+        if let Some(QueuedFetch {
+            stage: Stage::Running { note, .. },
+            ..
+        }) = self.items.iter_mut().find(|q| q.id == id)
+        {
+            *note = Some(line);
+        }
+    }
+
+    /// Where `item` stands, or `None` when it is not asked for.
+    fn stage_of(&self, item: &ItemRef) -> Option<DownloadStage> {
+        self.items
+            .iter()
+            .find(|q| &q.item == item)
+            .map(|q| row(q).stage)
+    }
+
+    /// Waiting downloads ahead of `item`.
+    fn waiting_ahead_of(&self, item: &ItemRef) -> usize {
+        self.items
+            .iter()
+            .take_while(|q| &q.item != item)
+            .filter(|q| matches!(q.stage, Stage::Waiting))
+            .count()
+    }
+
+    pub fn rows(&self) -> impl Iterator<Item = DownloadRow<'_>> {
+        self.items.iter().map(row)
+    }
+
+    /// Every download, oldest first, paired with whether it is running.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, bool)> {
+        self.rows()
+            .map(|r| (r.what, r.stage != DownloadStage::Waiting))
     }
 
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.items.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.items.is_empty()
+    }
+}
+
+fn row(q: &QueuedFetch) -> DownloadRow<'_> {
+    let (stage, since, note) = match &q.stage {
+        Stage::Waiting => (DownloadStage::Waiting, None, None),
+        Stage::Running { since, note, .. } => {
+            (DownloadStage::Running, Some(*since), note.as_deref())
+        }
+        Stage::Cancelling => (DownloadStage::Cancelling, None, None),
+    };
+    DownloadRow {
+        what: &q.what,
+        item: &q.item,
+        src: q.src.as_deref(),
+        stage,
+        since,
+        note,
     }
 }
 
@@ -582,22 +681,25 @@ impl Session {
         }
     }
 
-    /// The front download finished, one way or the other.
+    /// A download finished, one way or the other.
     pub(super) fn on_fetched(
         &mut self,
+        id: u64,
         result: Result<Vec<crate::acquire::types::AcquiredFile>, String>,
     ) {
+        let Some(done) = self.fetch_queue.take(id) else {
+            return;
+        };
+        let cancelled = matches!(done.stage, Stage::Cancelling);
         match result {
+            // A cancel that came too late: the file is here, so keep it.
             Ok(files) => {
                 let paths: Vec<std::path::PathBuf> = files.iter().map(|f| f.path.clone()).collect();
                 let lossy = files.iter().any(|f| !f.format.is_lossless());
+                self.fetched.insert(done.item.clone());
                 // Queueing needs the database, so it happens here on the session's
                 // thread rather than in the worker.
-                let done = self.finish_front_fetch();
-                if let Some(q) = &done {
-                    self.fetched.insert(q.item.clone());
-                }
-                let queued = self.queue_transfer_for(done.and_then(|q| q.src), &paths);
+                let queued = self.queue_transfer_for(done.src, &paths);
                 if queued.is_some() {
                     self.after_queueing();
                 }
@@ -612,24 +714,112 @@ impl Session {
                         .warn("downloaded, but it is a lossy transcode".to_string()),
                     (None, false) => self.status.ok(format!("downloaded {} file(s)", paths.len())),
                 }
-                // The next download owns the panel while it runs; this one's
-                // outcome stays in the status line.
                 if self.fetch_queue.is_empty() {
                     self.fetch = FetchState::Done { paths, queued };
-                } else {
-                    self.note_downloads_left();
+                }
+            }
+            Err(_) if cancelled => {
+                self.status.info(format!("cancelled {}.", done.what));
+                if self.fetch_queue.is_empty() {
+                    self.fetch = FetchState::Idle;
                 }
             }
             Err(why) => {
-                self.finish_front_fetch();
                 self.status.err(format!("download failed: {why}"));
                 if self.fetch_queue.is_empty() {
                     self.fetch = FetchState::Failed(why);
-                } else {
-                    self.note_downloads_left();
                 }
             }
         }
+        // The rest own the panel while they run; this one's outcome stays in the
+        // status line.
+        if !self.fetch_queue.is_empty() {
+            self.note_downloads_left();
+        }
+        self.start_waiting_fetches();
+    }
+
+    /// Stop a download, or drop it if it has not started. False when it is not
+    /// downloading or is already stopping.
+    pub fn cancel_fetch(&mut self, item: &ItemRef) -> bool {
+        let Some(q) = self.fetch_queue.find_mut(item) else {
+            return false;
+        };
+        match &q.stage {
+            Stage::Waiting => {
+                let id = q.id;
+                if let Some(q) = self.fetch_queue.take(id) {
+                    self.status.info(format!("cancelled {}.", q.what));
+                }
+            }
+            Stage::Running { cancel, .. } => {
+                cancel.cancel();
+                self.status.info(format!("cancelling {} …", q.what));
+                q.stage = Stage::Cancelling;
+            }
+            Stage::Cancelling => return false,
+        }
+        if self.fetch_queue.is_empty() {
+            self.fetch = FetchState::Idle;
+        }
+        self.sync_fetch_state();
+        true
+    }
+
+    /// Start waiting downloads until `max_downloads` are running.
+    fn start_waiting_fetches(&mut self) {
+        let limit = self.cfg.general.max_downloads.max(1);
+        while self.fetch_queue.running() < limit {
+            let Some(q) = self.fetch_queue.next_waiting() else {
+                break;
+            };
+            let Some(worker) = self.worker.as_mut() else {
+                break;
+            };
+            let job = worker::FetchJob {
+                item: q.item.clone(),
+                dest: q.dest.clone(),
+                format_pref: q.format_pref.clone(),
+                overwrite: false,
+            };
+            match worker.fetch(q.id, job, &self.cfg, &self.creds) {
+                Some(cancel) => {
+                    q.stage = Stage::Running {
+                        since: Instant::now(),
+                        note: None,
+                        cancel,
+                    }
+                }
+                None => {
+                    let id = q.id;
+                    if let Some(q) = self.fetch_queue.take(id) {
+                        self.status
+                            .err(format!("could not start downloading {}.", q.what));
+                    }
+                }
+            }
+        }
+        self.sync_fetch_state();
+    }
+
+    /// Point the download panel at the oldest running download.
+    fn sync_fetch_state(&mut self) {
+        if let Some(r) = self
+            .fetch_queue
+            .rows()
+            .find(|r| r.stage == DownloadStage::Running)
+        {
+            self.fetch = FetchState::Running {
+                since: r.since.unwrap_or_else(Instant::now),
+                what: r.what.to_string(),
+                note: r.note.map(str::to_string),
+            };
+        }
+    }
+
+    pub(super) fn on_fetch_note(&mut self, id: u64, line: String) {
+        self.fetch_queue.note(id, line);
+        self.sync_fetch_state();
     }
 
     /// Download one offer, as found for `src_id`.
@@ -689,74 +879,51 @@ impl Session {
             }
         };
 
-        if let Some(n) = self.fetch_queue.ahead_of(&offer.item_ref) {
-            self.status.info(match n {
-                0 => "that one is downloading now.".to_string(),
-                _ => format!("that one is already queued, {n} download(s) ahead of it."),
-            });
-            return false;
+        match self.fetch_queue.stage_of(&offer.item_ref) {
+            Some(DownloadStage::Waiting) => {
+                let n = self.fetch_queue.waiting_ahead_of(&offer.item_ref);
+                self.status.info(format!(
+                    "that one is already queued, {n} download(s) ahead of it."
+                ));
+                return false;
+            }
+            Some(_) => {
+                self.status.info("that one is downloading now.");
+                return false;
+            }
+            None => {}
         }
-
-        let Some(worker) = self.worker.as_mut() else {
+        if self.worker.is_none() {
             self.status.err("the worker thread is not running.");
-            return false;
-        };
-        if !worker.submit(worker::Job::Fetch {
-            item: offer.item_ref.clone(),
-            dest,
-            format_pref,
-            overwrite: false,
-        }) {
-            self.status.err("could not start the download.");
             return false;
         }
 
         let what = format!("{} — {}", offer.artist, offer.title);
         // Remember the source so the transfer can be queued on completion.
         let src = group_src.or(fallback_src);
-        let running = !self.fetch_queue.is_empty();
-        self.fetch_queue.push(QueuedFetch {
-            what: what.clone(),
-            src,
-            item: offer.item_ref.clone(),
-        });
-        if running {
-            self.status.info(format!(
-                "queued {what} — {} download(s) ahead of it.",
-                self.fetch_queue.len() - 1
-            ));
-        } else {
-            self.status.info(format!("downloading {what} …"));
-            self.fetch = FetchState::Running {
-                since: Instant::now(),
-                what,
-                note: None,
-            };
+        self.fetch_queue
+            .push(what.clone(), src, offer.item_ref.clone(), dest, format_pref);
+        self.start_waiting_fetches();
+        match self.fetch_queue.stage_of(&offer.item_ref) {
+            Some(DownloadStage::Waiting) => {
+                let n = self.fetch_queue.waiting_ahead_of(&offer.item_ref);
+                let running = self.fetch_queue.running();
+                self.status.info(format!(
+                    "queued {what} — {running} downloading, {n} waiting ahead of it."
+                ));
+            }
+            Some(_) => self.status.info(format!("downloading {what} …")),
+            // It could not be started, and said why.
+            None => return false,
         }
         true
     }
 
-    /// Retire the finished download and start showing the next one.
-    ///
-    /// Returns the source track the finished one was for. Popping the front is
-    /// what keeps the pairing right: the worker answers in submission order.
-    fn finish_front_fetch(&mut self) -> Option<QueuedFetch> {
-        let done = self.fetch_queue.finish_front();
-        if let Some(what) = self.fetch_queue.label().map(str::to_string) {
-            self.fetch = FetchState::Running {
-                since: Instant::now(),
-                what,
-                note: None,
-            };
-        }
-        done
-    }
-
     /// What an offer's download is doing, for the marker in its row.
     pub fn offer_fetch(&self, item: &ItemRef) -> OfferFetch {
-        match self.fetch_queue.ahead_of(item) {
-            Some(0) => OfferFetch::Running,
-            Some(_) => OfferFetch::Queued,
+        match self.fetch_queue.stage_of(item) {
+            Some(DownloadStage::Waiting) => OfferFetch::Queued,
+            Some(_) => OfferFetch::Running,
             // A failed download is deliberately left unmarked: the row has to
             // look retryable, because fetching it again is.
             None if self.fetched.contains(item) => OfferFetch::Done,
@@ -1044,60 +1211,76 @@ mod tests {
         assert_eq!(total, 2, "the total counts what is still to search");
     }
 
-    fn queued(what: &str, src: Option<&str>) -> QueuedFetch {
-        QueuedFetch {
-            what: what.to_string(),
-            src: src.map(str::to_string),
-            item: ItemRef::new(BackendId::Bandcamp, format!("k:{what}")),
-        }
+    fn item(what: &str) -> ItemRef {
+        ItemRef::new(BackendId::Bandcamp, format!("k:{what}"))
+    }
+
+    fn push(q: &mut FetchQueue, what: &str, src: Option<&str>) -> u64 {
+        q.push(
+            what.to_string(),
+            src.map(str::to_string),
+            item(what),
+            std::path::PathBuf::new(),
+            Vec::new(),
+        )
+    }
+
+    fn start(q: &mut FetchQueue) {
+        q.next_waiting().unwrap().stage = Stage::Running {
+            since: Instant::now(),
+            note: None,
+            cancel: crate::cancel::Token::default(),
+        };
     }
 
     #[test]
     fn each_finished_download_is_paired_with_its_own_source_track() {
-        // The bug this guards: one shared `fetch_src` slot meant the second
-        // download's file was queued as a transfer against the *third* track's
-        // source, silently pairing the wrong old→new tracks.
+        // Downloads finish in any order, so each answer is matched by id rather
+        // than by its place in the queue.
         let mut q = FetchQueue::default();
-        q.push(queued("a", Some("src-a")));
-        q.push(queued("b", Some("src-b")));
-        q.push(queued("c", None));
+        let a = push(&mut q, "a", Some("src-a"));
+        let b = push(&mut q, "b", Some("src-b"));
+        let c = push(&mut q, "c", None);
 
-        fn src_of(q: Option<QueuedFetch>) -> Option<String> {
-            q.and_then(|q| q.src)
-        }
-
-        assert_eq!(q.label(), Some("a"), "the front one is the running one");
-        assert_eq!(src_of(q.finish_front()).as_deref(), Some("src-a"));
-        assert_eq!(q.label(), Some("b"));
-        assert_eq!(src_of(q.finish_front()).as_deref(), Some("src-b"));
-        assert_eq!(
-            src_of(q.finish_front()),
-            None,
-            "'just download it' stays unpaired"
-        );
+        let src_of = |q: &mut FetchQueue, id| q.take(id).and_then(|q| q.src);
+        assert_eq!(src_of(&mut q, b).as_deref(), Some("src-b"));
+        assert_eq!(src_of(&mut q, c), None, "'just download it' stays unpaired");
+        assert_eq!(src_of(&mut q, a).as_deref(), Some("src-a"));
+        assert_eq!(src_of(&mut q, a), None, "an id answers once");
         assert!(q.is_empty());
-        assert_eq!(q.label(), None);
     }
 
     #[test]
-    fn the_same_offer_twice_reports_its_place_rather_than_queueing_again() {
+    fn waiting_downloads_start_oldest_first_and_count_their_place() {
         let mut q = FetchQueue::default();
-        q.push(queued("a", None));
-        q.push(queued("b", None));
+        for what in ["a", "b", "c", "d"] {
+            push(&mut q, what, None);
+        }
+        start(&mut q);
+        start(&mut q);
 
-        assert_eq!(q.ahead_of(&queued("a", None).item), Some(0));
-        assert_eq!(q.ahead_of(&queued("b", None).item), Some(1));
-        assert_eq!(q.ahead_of(&queued("c", None).item), None);
-        assert_eq!(q.len(), 2);
+        assert_eq!(q.running(), 2);
+        assert_eq!(q.stage_of(&item("b")), Some(DownloadStage::Running));
+        assert_eq!(q.stage_of(&item("d")), Some(DownloadStage::Waiting));
+        assert_eq!(
+            q.waiting_ahead_of(&item("d")),
+            1,
+            "only c is waiting ahead of it"
+        );
+        assert_eq!(q.stage_of(&item("e")), None);
     }
 
     #[test]
-    fn a_dead_worker_abandons_the_whole_queue_not_just_the_running_one() {
+    fn a_note_lands_on_its_own_download() {
         let mut q = FetchQueue::default();
-        q.push(queued("a", None));
-        q.push(queued("b", None));
-        q.abandon_all();
-        assert!(q.is_empty(), "nothing will ever answer these");
+        let a = push(&mut q, "a", None);
+        let b = push(&mut q, "b", None);
+        start(&mut q);
+        start(&mut q);
+        q.note(b, "42%".to_string());
+        let notes: Vec<_> = q.rows().map(|r| r.note).collect();
+        assert_eq!(notes, [None, Some("42%")]);
+        q.note(a + 99, "lost".to_string());
     }
 
     #[test]

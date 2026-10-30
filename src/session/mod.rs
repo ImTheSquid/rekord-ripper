@@ -336,15 +336,14 @@ impl Session {
                         }
                     }
                 }
-                worker::Update::Note(line) => {
-                    // Only a download has anywhere to put it; a warning raised
-                    // during a search has no row of its own and is dropped.
-                    if let FetchState::Running { note, .. } = &mut self.fetch {
-                        *note = Some(line);
-                    }
-                }
+                // A warning raised during a search has no row of its own.
+                worker::Update::Note(_) => {}
+                worker::Update::FetchNote(id, line) => self.on_fetch_note(id, line),
                 worker::Update::Finished(new_groups) => self.on_searched(*new_groups),
-                worker::Update::Fetched(result) => self.on_fetched(*result),
+                worker::Update::Fetched(r) => {
+                    let (id, result) = *r;
+                    self.on_fetched(id, result);
+                }
                 worker::Update::Probed(r) => {
                     let (entry_id, generation, result) = *r;
                     self.on_probed(entry_id, generation, result);
@@ -359,12 +358,8 @@ impl Session {
                     // row keeps its "working" tag forever and every action is
                     // refused as already-in-flight.
                     self.queue.abandon_in_flight(&why);
-                    if matches!(self.fetch, FetchState::Running { .. }) {
-                        self.fetch_queue.abandon_all();
-                        self.fetch = FetchState::Failed(why);
-                    } else {
-                        self.shop = ShopState::Failed(why);
-                    }
+                    // Downloads run on threads of their own and carry on.
+                    self.shop = ShopState::Failed(why);
                 }
             }
         }
