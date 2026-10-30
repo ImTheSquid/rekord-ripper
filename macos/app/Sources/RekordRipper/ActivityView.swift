@@ -55,17 +55,9 @@ struct ActivityView: View {
                         }
                     }
                 }
-                if model.fetch.kind == .running || !model.fetchQueue.isEmpty {
+                if !model.downloads.isEmpty {
                     group("Downloading") {
-                        if model.fetch.kind == .running {
-                            Label { Text(model.fetch.text).lineLimit(1) } icon: { ProgressView().controlSize(.small) }
-                            if !model.fetch.note.isEmpty {
-                                Text(model.fetch.note).font(.caption).foregroundStyle(.secondary)
-                            }
-                        }
-                        if model.fetchQueue.count > 1 {
-                            Text("\(model.fetchQueue.count - 1) more queued").font(.caption).foregroundStyle(.secondary)
-                        }
+                        ForEach(model.downloads) { DownloadRow(download: $0) }
                     }
                 }
                 if !model.entries.isEmpty {
@@ -120,6 +112,55 @@ struct NoticeRow: View {
                 Button(title) { model.perform(notice) }.controlSize(.small)
             }
         }
+    }
+}
+
+struct DownloadRow: View {
+    let download: Download
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            VStack(alignment: .leading, spacing: 0) {
+                Label {
+                    Text(download.what).lineLimit(1).help(download.what)
+                } icon: {
+                    switch download.stage {
+                    case .waiting: Image(systemName: "clock").foregroundStyle(.secondary)
+                    case .running, .cancelling: ProgressView().controlSize(.small)
+                    }
+                }
+                if let detail {
+                    Text(detail).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                }
+            }
+            Spacer(minLength: 4)
+            CancelDownloadButton(itemRef: download.itemRef)
+                .disabled(download.stage == .cancelling)
+        }
+    }
+
+    private var detail: String? {
+        switch download.stage {
+        case .waiting: "Waiting"
+        case .cancelling: "Cancelling…"
+        case .running: download.note.isEmpty ? nil : download.note
+        }
+    }
+}
+
+struct CancelDownloadButton: View {
+    @Environment(SessionModel.self) private var model
+    let itemRef: String
+
+    var body: some View {
+        Button {
+            model.cancelDownload(itemRef)
+        } label: {
+            Image(systemName: "xmark.circle.fill")
+        }
+        .buttonStyle(.borderless)
+        .foregroundStyle(.secondary)
+        .help("Cancel download")
     }
 }
 

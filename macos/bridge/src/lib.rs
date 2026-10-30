@@ -20,7 +20,7 @@ use rekord_ripper::session::collections::{Collection, Direction, Scope, Suggesti
 use rekord_ripper::session::filter::{dst_visible, src_visible};
 use rekord_ripper::session::review::{Change, PlanReview};
 use rekord_ripper::session::shop::{
-    BackendAnswer, FetchState, OfferFetch, ShopState, ShopTrackState,
+    BackendAnswer, DownloadStage, FetchState, OfferFetch, ShopState, ShopTrackState,
 };
 use rekord_ripper::session::view::{self, Tone};
 use rekord_ripper::session::{ConfirmKind, Notice, NoticeAction, Session, StatusLevel};
@@ -119,8 +119,10 @@ mod ffi {
         fn start_fetch(&mut self, src_id: &str, item_ref: &str, fallback_src: &str) -> bool;
         fn open_offer(&mut self, src_id: &str, item_ref: &str);
         fn fetch_status(&self) -> FetchStatusFfi;
-        // Every download handed to the worker, the running one first.
-        fn fetch_queue(&self) -> Vec<String>;
+        // Every download asked for, oldest first.
+        fn downloads(&self) -> Vec<DownloadView>;
+        // Stops a download, or drops it if it has not started.
+        fn cancel_fetch(&mut self, item_ref: &str) -> bool;
 
         fn reload_queue(&mut self);
         fn queue_entries(&self) -> Vec<QueueEntryView>;
@@ -310,6 +312,15 @@ mod ffi {
     }
 
     extern "Rust" {
+        type DownloadView;
+        fn what(&self) -> String;
+        fn item_ref(&self) -> String;
+        // 0 waiting, 1 running, 2 cancelling.
+        fn stage(&self) -> u8;
+        fn note(&self) -> String;
+    }
+
+    extern "Rust" {
         type OfferView;
         fn src_id(&self) -> String;
         fn group_label(&self) -> String;
@@ -396,6 +407,13 @@ pub struct BackendAnswerView(BackendAnswer);
 pub struct CueMarkView(CueMark);
 
 pub struct NoticeView(Notice);
+
+pub struct DownloadView {
+    what: String,
+    item_ref: String,
+    stage: u8,
+    note: String,
+}
 
 pub struct PlanReviewView(PlanReview);
 
@@ -751,12 +769,27 @@ impl CoreSession {
         out
     }
 
-    fn fetch_queue(&self) -> Vec<String> {
+    fn downloads(&self) -> Vec<DownloadView> {
         self.0
             .fetch_queue
-            .iter()
-            .map(|(what, _)| what.to_string())
+            .rows()
+            .map(|r| DownloadView {
+                what: r.what.to_string(),
+                item_ref: r.item.to_string(),
+                stage: match r.stage {
+                    DownloadStage::Waiting => 0,
+                    DownloadStage::Running => 1,
+                    DownloadStage::Cancelling => 2,
+                },
+                note: r.note.unwrap_or_default().to_string(),
+            })
             .collect()
+    }
+
+    fn cancel_fetch(&mut self, item_ref: &str) -> bool {
+        item_ref
+            .parse::<ItemRef>()
+            .is_ok_and(|item| self.0.cancel_fetch(&item))
     }
 
     fn reload_queue(&mut self) {
@@ -1274,6 +1307,21 @@ impl ChangeView {
     }
     fn after(&self) -> String {
         self.0.after.clone()
+    }
+}
+
+impl DownloadView {
+    fn what(&self) -> String {
+        self.what.clone()
+    }
+    fn item_ref(&self) -> String {
+        self.item_ref.clone()
+    }
+    fn stage(&self) -> u8 {
+        self.stage
+    }
+    fn note(&self) -> String {
+        self.note.clone()
     }
 }
 

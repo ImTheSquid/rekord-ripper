@@ -295,8 +295,10 @@ struct OfferRow: View {
                 }
             case .queued:
                 Image(systemName: "clock").foregroundStyle(.secondary).help("Queued")
+                CancelDownloadButton(itemRef: offer.itemRef)
             case .running:
                 ProgressView().controlSize(.small)
+                CancelDownloadButton(itemRef: offer.itemRef)
             case .done:
                 Image(systemName: "checkmark.circle.fill").foregroundStyle(.green).help("Downloaded")
             }

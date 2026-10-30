@@ -43,7 +43,7 @@ struct Snapshot {
     var answers: (trackId: String, list: [BackendAnswer])?
     var shopStates: [String: Int64] = [:]
     var fetch = FetchStatus()
-    var fetchQueue: [String] = []
+    var downloads: [Download] = []
     var entries: [QueueEntry] = []
     var unresolvedErrors = false
     var workInFlight = ""
@@ -152,7 +152,7 @@ actor CoreActor {
             s.shopStates[id] = core.shop_track_state(id)
         }
         s.fetch = FetchStatus(core.fetch_status())
-        s.fetchQueue = core.fetch_queue().map { $0.as_str().toString() }
+        s.downloads = core.downloads().map(Download.init)
         s.entries = core.queue_entries().map(QueueEntry.init)
         s.unresolvedErrors = core.unresolved_errors()
         s.workInFlight = core.work_in_flight().toString()

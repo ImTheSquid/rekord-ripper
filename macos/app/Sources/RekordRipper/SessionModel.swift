@@ -43,7 +43,7 @@ final class SessionModel {
     /// The last multi-track search, which the session works through in batches.
     @ObservationIgnored private var lastBasket = Set<String>()
     private(set) var fetch = FetchStatus()
-    private(set) var fetchQueue: [String] = []
+    private(set) var downloads: [Download] = []
     private(set) var entries: [QueueEntry] = []
     private var entriesBySrc: [String: [QueueEntry]] = [:]
     @ObservationIgnored private var unresolvedErrors = false
@@ -162,7 +162,7 @@ final class SessionModel {
             Notifier.shared.post("Download failed", s.fetch.text)
         }
         assign(\.fetch, s.fetch)
-        assign(\.fetchQueue, s.fetchQueue)
+        assign(\.downloads, s.downloads)
         if s.entries != entries {
             notifySettled(old: entries, new: s.entries)
             entries = s.entries
@@ -254,7 +254,7 @@ final class SessionModel {
     }
 
     var busy: Bool {
-        shop.busy || fetch.kind == .running || entries.contains(where: \.inFlight)
+        shop.busy || !downloads.isEmpty || entries.contains(where: \.inFlight)
     }
 
     func offers(for id: Track.ID) -> [Offer] { offersBySrc[id] ?? [] }
@@ -321,6 +321,10 @@ final class SessionModel {
 
     func download(_ offer: Offer) {
         send { _ = $0.start_fetch(offer.srcId, offer.itemRef, "") }
+    }
+
+    func cancelDownload(_ itemRef: String) {
+        send { _ = $0.cancel_fetch(itemRef) }
     }
 
     func openPage(_ offer: Offer) {

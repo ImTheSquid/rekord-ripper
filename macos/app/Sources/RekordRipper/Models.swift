@@ -343,6 +343,23 @@ struct FetchStatus: Equatable {
     }
 }
 
+struct Download: Identifiable, Equatable {
+    enum Stage: UInt8 { case waiting, running, cancelling }
+
+    var id: String { itemRef }
+    let what: String
+    let itemRef: String
+    let stage: Stage
+    let note: String
+
+    init(_ v: DownloadViewRef) {
+        what = v.what().toString()
+        itemRef = v.item_ref().toString()
+        stage = Stage(rawValue: v.stage()) ?? .waiting
+        note = v.note().toString()
+    }
+}
+
 struct Offer: Identifiable, Hashable {
     enum Fetch: UInt8 { case none, queued, running, done }
 
