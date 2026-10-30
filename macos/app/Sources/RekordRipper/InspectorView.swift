@@ -262,10 +262,12 @@ struct OfferRow: View {
                 Text("\(offer.artist) — \(offer.title)")
                     .lineLimit(1)
                     .truncationMode(.middle)
+                    .help("\(offer.artist) — \(offer.title)")
                 Text(details)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+                    .help(details)
                 if offer.matchScore < 100 {
                     Text("\(offer.matchScore)% match")
                         .font(.caption2)
