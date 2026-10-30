@@ -31,6 +31,14 @@ if xcrun --find actool >/dev/null 2>&1; then
 else
   cp "$app_pkg/Resources/AppIcon.icns" "$out/Contents/Resources/"
 fi
-codesign --force --sign - "$out"
+cp "$app_pkg/Resources/Credits.html" "$out/Contents/Resources/"
+
+# Alluja LLC's Developer ID when it is in the keychain, otherwise ad hoc.
+identity="${CODESIGN_IDENTITY:-Developer ID Application: Alluja LLC (Z74U5327X4)}"
+if security find-identity -v -p codesigning | grep -qF "$identity"; then
+  codesign --force --options runtime --timestamp --sign "$identity" "$out"
+else
+  codesign --force --sign - "$out"
+fi
 
 echo "built $out"
