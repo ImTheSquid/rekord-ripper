@@ -84,6 +84,7 @@ final class SessionModel {
             return
         }
         let defaults = UserDefaults.standard
+        Self.adoptPreferences(from: "com.github.imthesquid.rekord-ripper", into: defaults)
         setAutoAdvance(defaults.object(forKey: "autoAdvance") as? Bool ?? true)
         if defaults.object(forKey: "replaceCues") != nil {
             setCopyOptions(replace: defaults.bool(forKey: "replaceCues"), lock: defaults.bool(forKey: "lockAfterCopy"))
@@ -276,6 +277,16 @@ final class SessionModel {
     }
 
     // MARK: Actions
+
+    /// Copies preferences saved under the app's former bundle ID, once.
+    private static func adoptPreferences(from old: String, into defaults: UserDefaults) {
+        let keys = ["autoAdvance", "replaceCues", "lockAfterCopy"]
+        guard keys.allSatisfy({ defaults.object(forKey: $0) == nil }),
+              let previous = UserDefaults(suiteName: old) else { return }
+        for key in keys {
+            if let value = previous.object(forKey: key) { defaults.set(value, forKey: key) }
+        }
+    }
 
     private func send(_ body: @escaping @Sendable (CoreSession) -> Void) {
         guard let core else { return }

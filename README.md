@@ -37,7 +37,9 @@ database. See the help pages for the full options.
 
 A native SwiftUI app laid out like Music: your library and rekordbox playlists in
 the sidebar, one table of tracks, and an inspector for the selected track. It is
-built separately from `cargo install`, and needs Xcode or the Command Line Tools:
+built separately from `cargo install`, and needs Xcode or the Command Line Tools.
+With only the Command Line Tools, the icon is the flat one rather than the
+Icon Composer original, since compiling that takes Xcode's `actool`:
 
 ```bash
 scripts/build-macos-app.sh
@@ -77,14 +79,27 @@ each track before and after, with its cues. Confirmations the pipeline opens
 wait in Activity rather than interrupting you, and post a notification when the
 app is in the background. The app refuses to write while rekordbox is running.
 **Library** has an override for that, which asks first and resets when the app
-quits. The app is signed ad hoc, so on another Mac Gatekeeper asks before the
-first launch.
+quits.
 
 `REKORDBOX_DIR` points it at a copy of your library, for trying it out:
 
 ```bash
 REKORDBOX_DIR=/path/to/copy target/macos/RekordRipper.app/Contents/MacOS/RekordRipper
 ```
+
+The build signs the app with Alluja LLC's Developer ID when that certificate is
+in your keychain (`CODESIGN_IDENTITY` names another), and ad hoc otherwise. A
+signed build still needs notarizing before another Mac opens it without asking:
+`scripts/release-macos.sh` builds, notarizes, staples, and zips it. It reads
+notarization credentials stored once in the keychain:
+
+```bash
+xcrun notarytool store-credentials rekord-ripper-notary \
+  --apple-id <apple-id> --team-id Z74U5327X4 --password <app-specific-password>
+```
+
+The password is an app-specific one from appleid.apple.com. A profile already
+stored for another app on the same team works too: pass `KEYCHAIN_PROFILE`.
 
 The app is a thin layer over `rekord_ripper::session`, which holds everything the
 TUI and the app share. `macos/bridge` exposes it to Swift through swift-bridge.
