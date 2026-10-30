@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Builds target/macos/RekordRipper.app: Rust staticlib → SwiftPM → bundle.
+# Builds "target/macos/Rekord Ripper.app": Rust staticlib → SwiftPM → bundle.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 app_pkg="$root/macos/app"
-out="$root/target/macos/RekordRipper.app"
+out="$root/target/macos/Rekord Ripper.app"
 
 # C dependencies otherwise target the SDK's macOS, newer than the app's minimum.
 # Not MACOSX_DEPLOYMENT_TARGET: that also reaches proc-macro dylibs, and rustc

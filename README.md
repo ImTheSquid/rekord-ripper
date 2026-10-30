@@ -43,7 +43,7 @@ Icon Composer original, since compiling that takes Xcode's `actool`:
 
 ```bash
 scripts/build-macos-app.sh
-open target/macos/RekordRipper.app
+open "target/macos/Rekord Ripper.app"
 ```
 
 - **Sidebar.** Your whole library, plus smart collections: Needs Upgrade
@@ -84,7 +84,7 @@ quits.
 `REKORDBOX_DIR` points it at a copy of your library, for trying it out:
 
 ```bash
-REKORDBOX_DIR=/path/to/copy target/macos/RekordRipper.app/Contents/MacOS/RekordRipper
+REKORDBOX_DIR=/path/to/copy "target/macos/Rekord Ripper.app/Contents/MacOS/RekordRipper"
 ```
 
 The build signs the app with Alluja LLC's Developer ID when that certificate is
