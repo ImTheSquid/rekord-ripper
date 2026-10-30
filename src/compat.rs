@@ -892,7 +892,7 @@ pub fn default_jobs() -> usize {
 pub fn preflight(allow_lossy: bool) -> Result<()> {
     for tool in ["ffmpeg", "ffprobe"] {
         if !proc::tool_available(tool, "-version") {
-            bail!("{tool} not found; `compat` needs it to read and convert audio");
+            bail!("{tool} not found; `compat` needs it to read and convert audio. Install it, or set its path in config.toml.");
         }
     }
     if allow_lossy {

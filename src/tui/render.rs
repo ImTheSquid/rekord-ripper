@@ -5,12 +5,13 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
 use crate::format::{file_type_name, format_bpm, format_length};
+use crate::session::NoticeAction;
 
 use super::app::{
     App, ConfirmKind, Focus, InputMode, OfferFetch, PendingBatch, Screen, ShopFocus,
     ShopTrackState, StatusLevel,
 };
-use super::diff::render_pair;
+use crate::session::diff::render_pair;
 use crate::library::TrackRow;
 
 /// Takes `&mut App` for one reason: the help popup's scroll offset can only be
@@ -21,12 +22,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Screen::Shop => draw_shop_screen(f, app),
         Screen::Pending => draw_pending_screen(f, app),
     }
-    match app.mode {
-        InputMode::Confirm(ConfirmKind::Transfer) => draw_confirm(f, app),
-        InputMode::Confirm(ConfirmKind::ImportRows) => draw_import_confirm(f, app),
-        InputMode::Confirm(ConfirmKind::ForceApply) => draw_force_confirm(f, app),
-        InputMode::Confirm(ConfirmKind::ClearQueue) => draw_clear_confirm(f, app),
-        InputMode::Help => draw_help(f, app),
+    match (app.session.confirm(), &app.mode) {
+        (Some(ConfirmKind::Transfer), _) => draw_confirm(f, app),
+        (Some(ConfirmKind::ImportRows), _) => draw_import_confirm(f, app),
+        (Some(ConfirmKind::ForceApply), _) => draw_force_confirm(f, app),
+        (Some(ConfirmKind::ClearQueue), _) => draw_clear_confirm(f, app),
+        (None, InputMode::Help) => draw_help(f, app),
         _ => {}
     }
 }
@@ -61,10 +62,10 @@ fn draw_top_bar(f: &mut Frame, area: Rect, app: &App) {
     let title = Span::styled("rekord-ripper TUI", Style::new().bold().cyan());
     let opts = format!(
         "  replace={}  lock={}",
-        if app.copy_opts.replace { "ON" } else { "off" },
-        if app.copy_opts.lock { "ON" } else { "off" },
+        if app.session.copy_opts.replace { "ON" } else { "off" },
+        if app.session.copy_opts.lock { "ON" } else { "off" },
     );
-    let rb = if app.rb_running {
+    let rb = if app.session.rb_running {
         Span::styled("  rekordbox: RUNNING ", Style::new().fg(Color::Red).bold())
     } else {
         Span::styled("  rekordbox: closed", Style::new().fg(Color::DarkGray))
@@ -141,7 +142,7 @@ fn draw_column(f: &mut Frame, area: Rect, app: &App, which: Focus) {
     let dim = Style::new().add_modifier(Modifier::DIM);
     let mut items: Vec<ListItem> = Vec::with_capacity(state.visible.len() * 2);
     for (visible_pos, &row_idx) in state.visible.iter().enumerate() {
-        let row = &app.rows[row_idx];
+        let row = &app.session.rows[row_idx];
         // A tick means "this row is in the batch": the cursor row for sources
         // (there is only ever one source), and the selection for destinations —
         // falling back to the cursor row when nothing is picked.
@@ -232,7 +233,7 @@ fn track_item_line2(row: &TrackRow) -> ListItem<'static> {
 fn draw_preview(f: &mut Frame, area: Rect, app: &App) {
     let src = app.current_src();
     let dst = app.current_dst();
-    let lines: Vec<Line<'static>> = render_pair(src, dst, app.copy_opts)
+    let lines: Vec<Line<'static>> = render_pair(src, dst, app.session.copy_opts)
         .into_iter()
         .map(Line::from)
         .collect();
@@ -263,13 +264,48 @@ fn status_bar(app: &App, frame: Rect) -> Vec<Line<'static>> {
     // Rows enough for a wrapped message, never so many that the body above it
     // disappears.
     let budget = (frame.height / 3).max(2);
+    let status = &app.session.status;
+    let msg = match status.action.as_ref() {
+        Some(action) => format!("{} {}", status.text, status_hint(action, app.screen)),
+        None => status.text.clone(),
+    };
     status_lines(
         key_hints(app.screen),
-        &app.status.text,
-        app.status.level,
+        &msg,
+        status.level,
         frame.width,
         budget,
     )
+}
+
+/// The keys that take a notice's next step, as a sentence after it.
+fn status_hint(action: &NoticeAction, screen: Screen) -> String {
+    match action {
+        NoticeAction::OpenBuyPage { .. } => "Press 'o' to open the buy page.".into(),
+        NoticeAction::Research { .. } => "'r' re-runs it.".into(),
+        NoticeAction::FillBasket => "Press space on the tracks you want, then 'S'.".into(),
+        NoticeAction::NextBasketBatch { cap } => format!("Press 'S' again for the next {cap}."),
+        NoticeAction::ImportDownloads if screen == Screen::Pending => "Press 'i' to import.".into(),
+        NoticeAction::ImportDownloads => "Press 'p', then 'i' to import.".into(),
+        NoticeAction::CheckDownloads if screen == Screen::Pending => "Press 'a' to check.".into(),
+        NoticeAction::CheckDownloads => "Press 'p', then 'a' to check.".into(),
+        NoticeAction::ForceEntry { .. } => "Press 'F' again.".into(),
+        NoticeAction::ForgetEntry { .. } => "'c' forgets this entry.".into(),
+        // A confirmation is modal here, so it is already on screen.
+        NoticeAction::Review(_) => String::new(),
+        NoticeAction::AllowWritesWhileRunning => {
+            "Close it, or restart with --i-know-rekordbox-is-open-and-may-corrupt-my-data.".into()
+        }
+    }
+}
+
+/// The same, short enough to follow a queue row's state.
+fn row_hint(action: &NoticeAction) -> Option<&'static str> {
+    match action {
+        NoticeAction::ImportDownloads => Some("press 'i'"),
+        NoticeAction::CheckDownloads => Some("press 'a' to check"),
+        _ => None,
+    }
 }
 
 /// The status bar's lines — key hints, then the message, both wrapped.
@@ -324,7 +360,7 @@ fn status_lines(
 /// It scrolls because `import::render` runs to roughly 24 lines a row, and a
 /// modal that clips would be claiming to show what it is hiding.
 fn draw_import_confirm(f: &mut Frame, app: &mut App) {
-    let Some(batch) = app.import_batch.as_ref() else {
+    let Some(batch) = app.session.confirmations.import_rows() else {
         return;
     };
     let area = popup_area(f.area(), 88, 80);
@@ -359,10 +395,7 @@ fn draw_import_confirm(f: &mut Frame, app: &mut App) {
     ));
 
     let viewport = area.height.saturating_sub(2) as usize;
-    let scroll = clamp_help_scroll(batch.scroll as usize, viewport, lines.len());
-    if let Some(b) = app.import_batch.as_mut() {
-        b.scroll = scroll as u16;
-    }
+    let scroll = clamp_help_scroll(app.confirm_scroll as usize, viewport, lines.len());
 
     let title = if lines.len() > viewport {
         format!(
@@ -391,7 +424,7 @@ fn draw_import_confirm(f: &mut Frame, app: &mut App) {
 /// Red rather than yellow, and it leads with the waiver — the plan below looks
 /// exactly like a checked one, so the difference has to be said, not inferred.
 fn draw_force_confirm(f: &mut Frame, app: &mut App) {
-    let Some(batch) = app.force_batch.as_ref() else {
+    let Some(batch) = app.session.confirmations.force_apply() else {
         return;
     };
     let area = popup_area(f.area(), 88, 80);
@@ -431,10 +464,7 @@ fn draw_force_confirm(f: &mut Frame, app: &mut App) {
     ));
 
     let viewport = area.height.saturating_sub(2) as usize;
-    let scroll = clamp_help_scroll(batch.scroll as usize, viewport, lines.len());
-    if let Some(b) = app.force_batch.as_mut() {
-        b.scroll = scroll as u16;
-    }
+    let scroll = clamp_help_scroll(app.confirm_scroll as usize, viewport, lines.len());
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::new().fg(Color::Red))
@@ -449,7 +479,7 @@ fn draw_force_confirm(f: &mut Frame, app: &mut App) {
 
 /// Emptying the queue: a hard delete, so it says how many and what survives.
 fn draw_clear_confirm(f: &mut Frame, app: &mut App) {
-    let n = app.queue.entries.len();
+    let n = app.session.queue.entries.len();
     let body = format!(
         "Forget all {n} queued transfer(s)?\n\
          \n\
@@ -473,7 +503,7 @@ fn draw_clear_confirm(f: &mut Frame, app: &mut App) {
 /// the popup at about a dozen of them, and a modal that clips is asking for a
 /// yes to what it is hiding.
 fn draw_confirm(f: &mut Frame, app: &mut App) {
-    let Some(batch) = app.pending.as_ref() else {
+    let Some(batch) = app.session.confirmations.transfer() else {
         return;
     };
     let area = popup_area(f.area(), 80, 70);
@@ -489,10 +519,7 @@ fn draw_confirm(f: &mut Frame, app: &mut App) {
     let lines = confirm_lines(batch, inner.width as usize);
 
     let viewport = parts[0].height as usize;
-    let scroll = clamp_help_scroll(batch.scroll as usize, viewport, lines.len());
-    if let Some(b) = app.pending.as_mut() {
-        b.scroll = scroll as u16;
-    }
+    let scroll = clamp_help_scroll(app.confirm_scroll as usize, viewport, lines.len());
 
     let scrolls = lines.len() > viewport;
     let title = if scrolls {
@@ -670,7 +697,7 @@ fn downloading_height(queued: usize) -> u16 {
 
 fn draw_pending_screen(f: &mut Frame, app: &App) {
     let status = status_bar(app, f.area());
-    let dl = downloading_height(app.fetch_queue.len());
+    let dl = downloading_height(app.session.fetch_queue.len());
     let outer = Layout::vertical([
         Constraint::Length(1),                   // top bar
         Constraint::Length(dl),                  // downloads in flight
@@ -680,8 +707,8 @@ fn draw_pending_screen(f: &mut Frame, app: &App) {
     .split(f.area());
 
     let mut spans = vec![Span::styled("pending", Style::new().bold().magenta())];
-    spans.push(Span::raw(format!("  {} queued", app.queue.entries.len())));
-    if app.queue.any_in_flight() {
+    spans.push(Span::raw(format!("  {} queued", app.session.queue.entries.len())));
+    if app.session.queue.any_in_flight() {
         spans.push(Span::styled("  working…", Style::new().fg(Color::Cyan)));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), outer[0]);
@@ -698,7 +725,7 @@ fn draw_pending_screen(f: &mut Frame, app: &App) {
 /// Their own block rather than rows in the queue list below: they have no entry
 /// id or file yet, and the list's cursor indexes real entries that keys act on.
 fn draw_downloading(f: &mut Frame, area: Rect, app: &App) {
-    let n = app.fetch_queue.len();
+    let n = app.session.fetch_queue.len();
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::new().fg(Color::Cyan))
@@ -706,12 +733,12 @@ fn draw_downloading(f: &mut Frame, area: Rect, app: &App) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let since = match &app.fetch {
+    let since = match &app.session.fetch {
         super::app::FetchState::Running { since, .. } => Some(*since),
         _ => None,
     };
     let mut lines: Vec<Line> = Vec::new();
-    for (what, running) in app.fetch_queue.iter().take(MAX_DL_ROWS) {
+    for (what, running) in app.session.fetch_queue.iter().take(MAX_DL_ROWS) {
         let mut spans = if running {
             vec![Span::styled(
                 format!("{} ", spinner(since)),
@@ -744,12 +771,12 @@ fn draw_pending_list(f: &mut Frame, area: Rect, app: &App) {
         .border_style(Style::new().fg(Color::Cyan))
         // Not "DOWNLOADS": these have already downloaded, and the block above
         // holds the ones that have not.
-        .title(format!(" AWAITING TRANSFER ({}) ", app.queue.entries.len()));
+        .title(format!(" AWAITING TRANSFER ({}) ", app.session.queue.entries.len()));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    if app.queue.entries.is_empty() {
-        let empty = if app.store.is_none() {
+    if app.session.queue.entries.is_empty() {
+        let empty = if app.session.store.is_none() {
             "the queue could not be opened."
         } else {
             "nothing queued. Download something on the shop screen and it lands here."
@@ -764,6 +791,7 @@ fn draw_pending_list(f: &mut Frame, area: Rect, app: &App) {
     }
 
     let items: Vec<ListItem> = app
+        .session
         .queue
         .entries
         .iter()
@@ -794,7 +822,7 @@ fn draw_pending_list(f: &mut Frame, area: Rect, app: &App) {
         .collect();
 
     let mut state = ListState::default();
-    state.select(Some(app.queue.cursor * 2));
+    state.select(Some(app.session.queue.cursor * 2));
     let list = List::new(items)
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD));
     f.render_stateful_widget(list, inner, &mut state);
@@ -806,9 +834,9 @@ fn draw_pending_list(f: &mut Frame, area: Rect, app: &App) {
 /// a streaming source rips it before decoding, so a queue of five would sit on a
 /// single spinner for minutes and look hung.
 fn pending_state_span(app: &App, entry: &crate::pending::Entry) -> Span<'static> {
-    use crate::tui::queue::EntryWork;
+    use crate::session::queue::EntryWork;
 
-    if let Some(work) = app.queue.work_for(entry.id) {
+    if let Some(work) = app.session.queue.work_for(entry.id) {
         let text = match work {
             EntryWork::Failed(why) => format!("failed — {why}"),
             other => match other.since() {
@@ -824,42 +852,28 @@ fn pending_state_span(app: &App, entry: &crate::pending::Entry) -> Span<'static>
         return Span::styled(text, Style::new().fg(colour));
     }
 
-    let (text, colour) = stored_state_label(
+    let (text, tone, action) = crate::session::view::stored_state_label(
         entry.state,
         entry.verdict.as_deref(),
-        app.queue.has_row(entry.id),
+        app.session.queue.has_row(entry.id),
     );
-    Span::styled(text, Style::new().fg(colour))
+    let text = match action.as_ref().and_then(row_hint) {
+        Some(hint) => format!("{text} — {hint}"),
+        None => text,
+    };
+    Span::styled(text, Style::new().fg(tone_colour(tone)))
 }
 
-/// How a stored state reads on the row, kept free of `App` so it can be tested.
-///
-/// `has_row` is why this takes three arguments: the store keeps an entry at
-/// `AwaitingImport` right up until the transfer lands, so a row created seconds
-/// ago still claimed to be waiting for one — which read as the import having
-/// silently done nothing.
-fn stored_state_label(
-    state: crate::pending::State,
-    verdict: Option<&str>,
-    has_row: bool,
-) -> (String, Color) {
-    use crate::pending::State;
-    let (label, colour) = match state {
-        State::AwaitingImport if has_row => ("imported — press 'a' to check", Color::Cyan),
-        State::AwaitingImport => ("awaiting import — press 'i'", Color::Yellow),
-        State::Matched => ("ready to apply", Color::Green),
-        State::Applied => ("applied", Color::Green),
-        State::Rejected => ("rejected", Color::Red),
-        State::Expired => ("expired", Color::DarkGray),
-        State::Cancelled => ("cancelled", Color::DarkGray),
-    };
-    // The verdict is why an entry is rejected or ready; hiding it would leave
-    // the user guessing at the one thing that decided the outcome.
-    let verdict = verdict
-        .filter(|v| !v.is_empty())
-        .map(|v| format!(" — {v}"))
-        .unwrap_or_default();
-    (format!("{label}{verdict}"), colour)
+fn tone_colour(tone: crate::session::view::Tone) -> Color {
+    use crate::session::view::Tone;
+    match tone {
+        Tone::Plain | Tone::Strong => Color::Reset,
+        Tone::Active => Color::Cyan,
+        Tone::Warn => Color::Yellow,
+        Tone::Good => Color::Green,
+        Tone::Bad => Color::Red,
+        Tone::Muted => Color::DarkGray,
+    }
 }
 
 fn draw_shop_top_bar(f: &mut Frame, area: Rect, app: &App) {
@@ -876,12 +890,12 @@ fn draw_shop_top_bar(f: &mut Frame, area: Rect, app: &App) {
     // The spinner lives here rather than in the table: results stay on screen
     // while more searches run, and a line appearing above them would shove the
     // whole table down a row.
-    let queued = app.shop_outstanding();
+    let queued = app.session.shop_outstanding();
     if queued > 0 {
         spans.push(Span::styled(
             format!(
                 "  {} {queued} search(es) running",
-                spinner(app.shop_since())
+                spinner(app.session.shop_since())
             ),
             Style::new().fg(Color::Cyan),
         ));
@@ -932,20 +946,20 @@ fn draw_shop_tracks(f: &mut Frame, area: Rect, app: &App) {
         parts[0],
     );
 
-    let offer_src = app.shop_offer_src();
+    let offer_src = app.session.shop_offer_src();
     let items: Vec<ListItem> = app
         .shop_list
         .visible
         .iter()
         .map(|&i| {
-            let row = &app.rows[i];
+            let row = &app.session.rows[i];
             let in_basket = app.shop_list.selected.contains(&row.id);
             // Two independent one-character slots: basket membership, and whether
             // the highlighted offer came from this track.
             let is_offer_src = offer_src == Some(row.id.as_str());
             // The state tag is what makes a queue of searches legible: how many
             // offers each track found, and which are still waiting their turn.
-            let (tag, tag_style) = match app.shop_track_state(&row.id) {
+            let (tag, tag_style) = match app.session.shop_track_state(&row.id) {
                 ShopTrackState::Done(0) => ("  · ".to_string(), Style::new().fg(Color::DarkGray)),
                 ShopTrackState::Done(n) => (format!("{n:>3} "), Style::new().fg(Color::Green)),
                 ShopTrackState::Queued => ("  … ".to_string(), Style::new().fg(Color::Cyan)),
@@ -1083,7 +1097,7 @@ fn offer_body(app: &App, width: u16, focused: bool) -> OfferView {
 
     let mut cursor_line: Option<usize> = None;
     let mut header: Option<Line<'static>> = None;
-    let (title, body_lines): (String, Vec<Line>) = match &app.shop {
+    let (title, body_lines): (String, Vec<Line>) = match &app.session.shop {
         ShopState::Idle => (
             " OFFERS ".into(),
             vec![
@@ -1203,7 +1217,7 @@ fn offer_body(app: &App, width: u16, focused: bool) -> OfferView {
                         offer_row(
                             Row {
                                 marker: lossless_marker(o),
-                                dl: dl_marker(app.offer_fetch(&o.item_ref)),
+                                dl: dl_marker(app.session.offer_fetch(&o.item_ref)),
                                 backend: o.backend().as_str(),
                                 title: &format!("{} — {}", o.artist, o.title),
                                 formats: &crate::acquire::render::format_cell(o),
@@ -1295,7 +1309,7 @@ fn detail_lines(app: &App, width: u16) -> Vec<Line<'static>> {
 
     // A download in flight goes first, because it is the thing you are waiting
     // on and it must never be the part that gets clipped.
-    match &app.fetch {
+    match &app.session.fetch {
         FetchState::Idle => {}
         FetchState::Running { since, what, note } => {
             lines.push(Line::from(vec![
@@ -1311,7 +1325,7 @@ fn detail_lines(app: &App, width: u16) -> Vec<Line<'static>> {
                 // Waiting downloads are invisible otherwise: the panel only ever
                 // shows the one in flight.
                 Span::styled(
-                    match app.fetch_queue.len() {
+                    match app.session.fetch_queue.len() {
                         0 | 1 => String::new(),
                         n => format!("  +{} queued", n - 1),
                     },
@@ -1357,7 +1371,7 @@ fn detail_lines(app: &App, width: u16) -> Vec<Line<'static>> {
         }
     }
 
-    if let Some(r) = app.shop.selected() {
+    if let Some(r) = app.session.shop.selected() {
         let o = &r.offer;
         lines.push(Line::from(Span::styled(
             MARKER_LEGEND,
@@ -2170,46 +2184,6 @@ mod tests {
             "help would be clipped horizontally"
         );
         assert!(r.height >= rows + 2, "help would be clipped vertically");
-    }
-
-    #[test]
-    fn every_queue_state_reads_as_something() {
-        use crate::pending::State;
-        // All six, so a state added later cannot render as a blank row.
-        for state in [
-            State::AwaitingImport,
-            State::Matched,
-            State::Applied,
-            State::Rejected,
-            State::Expired,
-            State::Cancelled,
-        ] {
-            let (text, _) = stored_state_label(state, None, false);
-            assert!(!text.is_empty(), "{state:?} renders as nothing");
-        }
-        // The verdict is appended when there is one, and never as a bare dash.
-        let (with, _) = stored_state_label(State::Rejected, Some("duration differs by 9s"), false);
-        assert!(with.contains("rejected") && with.contains("9s"));
-        let (without, _) = stored_state_label(State::Rejected, Some(""), false);
-        assert_eq!(without, "rejected");
-    }
-
-    #[test]
-    fn an_imported_row_stops_claiming_to_be_awaiting_import() {
-        use crate::pending::State;
-        // The bug: the store holds an entry at AwaitingImport until the transfer
-        // lands, so a row created seconds ago still read "awaiting import" and
-        // the import looked like it had done nothing.
-        let (waiting, _) = stored_state_label(State::AwaitingImport, None, false);
-        let (imported, _) = stored_state_label(State::AwaitingImport, None, true);
-        assert_ne!(waiting, imported);
-        assert!(waiting.contains("awaiting"));
-        assert!(
-            !imported.contains("awaiting"),
-            "still says awaiting: {imported}"
-        );
-        // Both say which key moves them along.
-        assert!(waiting.contains('i') && imported.contains('a'));
     }
 
     #[test]

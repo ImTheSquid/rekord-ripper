@@ -1,10 +1,6 @@
 pub mod app;
-pub mod data;
-pub mod diff;
 pub mod events;
-pub mod queue;
 pub mod render;
-pub mod worker;
 
 use std::io;
 use std::time::Duration;
@@ -55,7 +51,7 @@ fn event_loop(terminal: &mut Term, app: &mut App) -> Result<()> {
         {
             events::handle_key(app, key);
         }
-        app.poll_rekordbox_if_due();
+        app.poll_if_due();
         // Results from the background search land here, so the UI stays
         // responsive while a backend is being slow.
         app.pump_worker();

@@ -42,9 +42,10 @@ pub(crate) struct TrackFacts {
 }
 
 /// Where a row's audio actually lives.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Origin {
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Origin {
     /// A file on this machine.
+    #[default]
     Local,
     /// A real file, but one Cloud Library Sync owns — its `FolderPath` is a
     /// `/contents_…` cloud path, so it may or may not be downloaded here.
@@ -79,15 +80,17 @@ pub(crate) fn track_tags(f: TrackFacts) -> String {
     // have a lossy file", which is the question worth asking before shopping.
     // FileType 0 gets none either: rekordbox cannot open it, so it is neither a
     // lossy file you have nor a lossless one.
-    match f.file_type {
-        Some(1) => tags.extend(["mp3", "lossy"]),
-        Some(4) => tags.extend(["m4a", "lossy"]),
-        // ALAC, as rekordbox itself writes it.
-        Some(6) => tags.extend(["m4a", "lossless"]),
-        Some(5) => tags.extend(["flac", "lossless"]),
-        Some(11) => tags.extend(["wav", "lossless"]),
-        Some(12) => tags.extend(["aiff", "lossless"]),
-        _ => {}
+    let format = match f.file_type {
+        Some(1) => Some("mp3"),
+        // AAC and ALAC alike, as rekordbox itself writes them.
+        Some(4 | 6) => Some("m4a"),
+        Some(5) => Some("flac"),
+        Some(11) => Some("wav"),
+        Some(12) => Some("aiff"),
+        _ => None,
+    };
+    if let (Some(format), Some(lossless)) = (format, lossless(f.file_type)) {
+        tags.extend([format, if lossless { "lossless" } else { "lossy" }]);
     }
     if f.cue_count > 0 {
         tags.push("cues");
@@ -96,6 +99,17 @@ pub(crate) fn track_tags(f: TrackFacts) -> String {
         tags.push("locked");
     }
     format!(" {} ", tags.join(" "))
+}
+
+/// Whether a file of this type is lossless. `None` for anything that is not
+/// an audio file rekordbox can open: a stream, or FileType 0.
+pub fn lossless(file_type: Option<i64>) -> Option<bool> {
+    match file_type {
+        Some(1 | 4) => Some(false),
+        // ALAC, as rekordbox itself writes it.
+        Some(5 | 6 | 11 | 12) => Some(true),
+        _ => None,
+    }
 }
 
 /// A streaming entry keeps a service URI (`soundcloud:tracks:123`) where a real
@@ -142,28 +156,17 @@ pub(crate) fn format_msec(ms: i64) -> String {
 }
 
 pub(crate) fn kind_label(kind: Option<i64>) -> &'static str {
-    // djmdCue.Kind: 0 = memory cue; 1..=16 = hot cue slots A..P.
+    // djmdCue.Kind: 0 = memory cue; hot cues A..C are 1..3 and D..P are 5..17.
+    // 4 is skipped: none of 2889 cues in a real library use it, and a track
+    // whose four hot cues were set in order reads 1, 2, 3, 5.
+    const HOT: [&str; 16] = [
+        "hot A", "hot B", "hot C", "hot D", "hot E", "hot F", "hot G", "hot H", "hot I", "hot J",
+        "hot K", "hot L", "hot M", "hot N", "hot O", "hot P",
+    ];
     match kind {
         Some(0) => "memory",
-        Some(k) if (1..=16).contains(&k) => match k {
-            1 => "hot A",
-            2 => "hot B",
-            3 => "hot C",
-            4 => "hot D",
-            5 => "hot E",
-            6 => "hot F",
-            7 => "hot G",
-            8 => "hot H",
-            9 => "hot I",
-            10 => "hot J",
-            11 => "hot K",
-            12 => "hot L",
-            13 => "hot M",
-            14 => "hot N",
-            15 => "hot O",
-            16 => "hot P",
-            _ => unreachable!(),
-        },
+        Some(k @ 1..=3) => HOT[k as usize - 1],
+        Some(k @ 5..=17) => HOT[k as usize - 2],
         _ => "?",
     }
 }
@@ -171,6 +174,17 @@ pub(crate) fn kind_label(kind: Option<i64>) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hot_cue_kinds_skip_four() {
+        assert_eq!(kind_label(Some(0)), "memory");
+        assert_eq!(kind_label(Some(3)), "hot C");
+        assert_eq!(kind_label(Some(4)), "?");
+        assert_eq!(kind_label(Some(5)), "hot D");
+        assert_eq!(kind_label(Some(9)), "hot H");
+        assert_eq!(kind_label(Some(17)), "hot P");
+        assert_eq!(kind_label(Some(18)), "?");
+    }
 
     fn facts(ft: Option<i64>, path: Option<&str>, sid: Option<i64>) -> TrackFacts {
         TrackFacts {

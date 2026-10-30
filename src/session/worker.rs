@@ -1,12 +1,11 @@
-//! A background worker for the TUI.
+//! A background worker for the session.
 //!
 //! # Why this has to exist
 //!
-//! `event_loop` is a single-threaded blocking poll and `handle_key` is
-//! synchronous, so calling a backend search from a key handler freezes rendering
-//! for as long as the network takes — no spinner, no feedback, a dead terminal
-//! for seconds. This moves that work off the event thread and drains results from
-//! the existing tick.
+//! Every frontend drives the session from one thread, so calling a backend search
+//! from an input handler freezes the UI for as long as the network takes — no
+//! spinner, no feedback, a dead window for seconds. This moves that work off the
+//! UI thread and drains results from the frontend's tick.
 //!
 //! # Why a detached thread is safe *here*
 //!
@@ -20,10 +19,16 @@
 //! So on quit we drop the job sender and let the thread finish whatever request
 //! it is in (already bounded by the HTTP timeout) rather than blocking the user's
 //! exit on it.
+//!
+//! Downloads are the exception: each runs on a thread of its own, started by
+//! [`Worker::fetch`], so a download stuck in a peer's queue holds up neither the
+//! other downloads nor searches. They write files, so they are cancelled rather
+//! than abandoned, and only ever write through the atomic `.part` rename.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::acquire::Registry;
@@ -70,15 +75,6 @@ pub enum Job {
         specs: Vec<QuerySpec>,
         opts: Box<SearchOpts>,
     },
-    /// Download an offer. Long-running by nature — a purchased FLAC is tens of
-    /// megabytes and bandcamp may need minutes to prepare it — which is exactly
-    /// why it belongs here rather than in a key handler.
-    Fetch {
-        item: ItemRef,
-        dest: PathBuf,
-        format_pref: Vec<AudioFormat>,
-        overwrite: bool,
-    },
     /// Read one file's headers, so a `djmdContent` row can be planned for it.
     /// One `ffprobe`, but with a 60 s ceiling — not something a key handler can
     /// afford to wait on.
@@ -107,11 +103,20 @@ impl Job {
     pub fn kind(&self) -> JobKind {
         match self {
             Self::Shop { .. } => JobKind::Search,
-            Self::Fetch { .. } => JobKind::Fetch,
             Self::Probe { .. } => JobKind::Probe,
             Self::Fingerprint { .. } => JobKind::Fingerprint,
         }
     }
+}
+
+/// A download to start. Long-running by nature — a purchased FLAC is tens of
+/// megabytes, bandcamp may need minutes to prepare it, and a Soulseek peer may
+/// queue it for hours.
+pub struct FetchJob {
+    pub item: ItemRef,
+    pub dest: PathBuf,
+    pub format_pref: Vec<AudioFormat>,
+    pub overwrite: bool,
 }
 
 /// What comes back.
@@ -130,8 +135,10 @@ pub enum Update {
     Note(String),
     /// Boxed because the outcomes are large and this moves through a channel.
     Finished(Box<Vec<GroupOutcome>>),
-    /// A fetch finished. `Ok` carries where the files landed.
-    Fetched(Box<Result<Vec<AcquiredFile>, String>>),
+    /// `(download id, result)`. `Ok` carries where the files landed.
+    Fetched(Box<(u64, Result<Vec<AcquiredFile>, String>)>),
+    /// A line of a download's backend chatter: a queue position, a percentage.
+    FetchNote(u64, String),
     /// `(entry_id, generation, result)`.
     Probed(Box<(i64, u64, Result<crate::audio::AudioInfo, String>)>),
     /// `(entry_id, generation, result)`.
@@ -164,7 +171,11 @@ impl Update {
             Self::Probed(_) => Some(JobKind::Probe),
             Self::Fingerprinted(_) => Some(JobKind::Fingerprint),
             // A dead thread ends whatever was in flight; `drain` handles it.
-            Self::Failed(_) | Self::Started | Self::Progress { .. } | Self::Note(_) => None,
+            Self::Failed(_)
+            | Self::Started
+            | Self::Progress { .. }
+            | Self::Note(_)
+            | Self::FetchNote(..) => None,
         }
     }
 }
@@ -172,6 +183,10 @@ impl Update {
 pub struct Worker {
     jobs: Option<Sender<Job>>,
     updates: Receiver<Update>,
+    /// Downloads answer on their own channel, so the job thread's ending still
+    /// reads as a disconnect while downloads hold senders.
+    fetch_tx: Sender<Update>,
+    fetch_updates: Receiver<Update>,
     /// Jobs submitted but not yet finished.
     ///
     /// A count rather than a flag: the thread takes one job at a time off the
@@ -180,6 +195,8 @@ pub struct Worker {
     outstanding: usize,
     /// The same count, split by kind, so a message can name what is running.
     by_kind: HashMap<JobKind, usize>,
+    /// Settings the thread takes up before its next job.
+    reconfig: Arc<Mutex<Option<(Config, Credentials)>>>,
 }
 
 impl Worker {
@@ -188,22 +205,28 @@ impl Worker {
     pub fn spawn(cfg: &Config, creds: &Credentials) -> std::io::Result<Self> {
         let (job_tx, job_rx) = channel::<Job>();
         let (up_tx, up_rx) = channel::<Update>();
-        let cfg = cfg.clone();
+        let mut cfg = cfg.clone();
         let creds = creds.clone();
+        let reconfig = Arc::new(Mutex::new(None::<(Config, Credentials)>));
+        let pending = Arc::clone(&reconfig);
 
         std::thread::Builder::new()
             .name("rr-shop".into())
             .spawn(move || {
-                // Backend chatter belongs on screen, not on the stderr the TUI
-                // is drawing over. Best-effort: a closed channel just drops it.
+                // Backend chatter belongs on screen, not on a stderr the TUI
+                // may be drawing over. Best-effort: a closed channel just drops it.
                 let notes = up_tx.clone();
                 crate::acquire::route_progress(Box::new(move |line| {
                     let _ = notes.send(Update::Note(line.to_string()));
                 }));
 
-                let reg = Registry::from_config(&cfg, &creds);
+                let mut reg = Registry::from_config(&cfg, &creds);
                 // Ends when the UI drops its sender.
                 while let Ok(job) = job_rx.recv() {
+                    if let Some((c, k)) = pending.lock().ok().and_then(|mut p| p.take()) {
+                        reg = Registry::from_config(&c, &k);
+                        cfg = c;
+                    }
                     match job {
                         Job::Shop { specs, opts } => {
                             if up_tx.send(Update::Started).is_err() {
@@ -221,34 +244,6 @@ impl Worker {
                                     });
                                 });
                             if up_tx.send(Update::Finished(Box::new(groups))).is_err() {
-                                return;
-                            }
-                        }
-                        Job::Fetch {
-                            item,
-                            dest,
-                            format_pref,
-                            overwrite,
-                        } => {
-                            if up_tx.send(Update::Started).is_err() {
-                                return;
-                            }
-                            let result = match reg.get(item.backend) {
-                                None => Err(format!("{} is not enabled", item.backend)),
-                                Some(backend) => backend
-                                    .fetch(
-                                        &item,
-                                        &FetchOpts {
-                                            dest_dir: dest,
-                                            format_pref,
-                                            retention: Retention::Keep,
-                                            overwrite,
-                                            deadline: Instant::now() + FETCH_BUDGET,
-                                        },
-                                    )
-                                    .map_err(|e| e.to_string()),
-                            };
-                            if up_tx.send(Update::Fetched(Box::new(result))).is_err() {
                                 return;
                             }
                         }
@@ -290,12 +285,24 @@ impl Worker {
                 }
             })?;
 
+        let (fetch_tx, fetch_updates) = channel::<Update>();
         Ok(Self {
             jobs: Some(job_tx),
             updates: up_rx,
+            fetch_tx,
+            fetch_updates,
             outstanding: 0,
             by_kind: HashMap::new(),
+            reconfig,
         })
+    }
+
+    /// Rebuilds the backends from these settings before the next job. Jobs
+    /// already queued run with them too.
+    pub fn reconfigure(&self, cfg: Config, creds: Credentials) {
+        if let Ok(mut slot) = self.reconfig.lock() {
+            *slot = Some((cfg, creds));
+        }
     }
 
     pub fn is_busy(&self) -> bool {
@@ -331,36 +338,96 @@ impl Worker {
         }
     }
 
+    /// Start a download on a thread of its own, with backends built from `cfg`.
+    /// The token cancels it; it still answers, with an error.
+    pub fn fetch(
+        &mut self,
+        id: u64,
+        job: FetchJob,
+        cfg: &Config,
+        creds: &Credentials,
+    ) -> Option<crate::cancel::Token> {
+        let token = crate::cancel::Token::default();
+        let (cfg, creds, tx, cancel) = (
+            cfg.clone(),
+            creds.clone(),
+            self.fetch_tx.clone(),
+            token.clone(),
+        );
+        std::thread::Builder::new()
+            .name("rr-fetch".into())
+            .spawn(move || {
+                let notes = tx.clone();
+                crate::acquire::route_progress_here(Box::new(move |line| {
+                    let _ = notes.send(Update::FetchNote(id, line.to_string()));
+                }));
+                let run = move || match Registry::from_config(&cfg, &creds).get(job.item.backend) {
+                    None => Err(format!("{} is not enabled", job.item.backend)),
+                    Some(backend) => crate::cancel::with(cancel, || {
+                        backend.fetch(
+                            &job.item,
+                            &FetchOpts {
+                                dest_dir: job.dest,
+                                format_pref: job.format_pref,
+                                retention: Retention::Keep,
+                                overwrite: job.overwrite,
+                                deadline: Instant::now() + FETCH_BUDGET,
+                            },
+                        )
+                    })
+                    .map_err(|e| e.to_string()),
+                };
+                // A panic still answers, so the download does not sit there forever.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run))
+                    .unwrap_or_else(|_| Err("the download crashed".to_string()));
+                let _ = tx.send(Update::Fetched(Box::new((id, result))));
+            })
+            .ok()?;
+        self.outstanding += 1;
+        *self.by_kind.entry(JobKind::Fetch).or_insert(0) += 1;
+        Some(token)
+    }
+
     /// Collect whatever has arrived. Never blocks, so it is safe on the tick.
     pub fn drain(&mut self) -> Vec<Update> {
         let mut out = Vec::new();
+        while let Ok(u) = self.fetch_updates.try_recv() {
+            self.count(&u);
+            out.push(u);
+        }
         loop {
             match self.updates.try_recv() {
                 Ok(u) => {
-                    if u.is_terminal() {
-                        self.outstanding = self.outstanding.saturating_sub(1);
-                    }
-                    if let Some(kind) = u.ends()
-                        && let Some(n) = self.by_kind.get_mut(&kind)
-                    {
-                        *n = n.saturating_sub(1);
-                    }
+                    self.count(&u);
                     out.push(u);
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     // Report one failure per lost job, so nothing sits pending
-                    // forever waiting on a thread that has gone.
-                    while self.outstanding > 0 {
+                    // forever waiting on a thread that has gone. Downloads run
+                    // apart from it and still answer for themselves.
+                    let downloads = self.outstanding_of(JobKind::Fetch);
+                    while self.outstanding > downloads {
                         self.outstanding -= 1;
                         out.push(Update::Failed("the worker thread stopped".into()));
                     }
-                    self.by_kind.clear();
+                    self.by_kind.retain(|k, _| *k == JobKind::Fetch);
                     break;
                 }
             }
         }
         out
+    }
+
+    fn count(&mut self, u: &Update) {
+        if u.is_terminal() {
+            self.outstanding = self.outstanding.saturating_sub(1);
+        }
+        if let Some(kind) = u.ends()
+            && let Some(n) = self.by_kind.get_mut(&kind)
+        {
+            *n = n.saturating_sub(1);
+        }
     }
 
     /// Signal shutdown. Does not block: see the module docs on why not joining is

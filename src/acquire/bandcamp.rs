@@ -346,7 +346,9 @@ fn download_when_ready(
             },
             Err(e) => note!("  (could not re-read the download page: {e})"),
         }
-        std::thread::sleep(delay);
+        if !crate::cancel::sleep(delay) {
+            return Err(BackendError::Other(anyhow::anyhow!("cancelled")));
+        }
         delay = (delay * 2).min(READY_MAX_BACKOFF);
     }
 

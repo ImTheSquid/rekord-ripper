@@ -17,6 +17,9 @@ cargo install rekord-ripper
 brew install yt-dlp ffmpeg
 ```
 
+Elsewhere, set `ffmpeg_path` and `ffprobe_path` under `[tools]`, and
+`yt_dlp_path` under `[soundcloud]`, in `config.toml` (or in the app's Settings).
+
 The Soulseek backend requires a reachable [slskd](https://github.com/slskd/slskd).
 It is optional. Until one is configured, Soulseek reports itself as unconfigured
 and the other backends continue to work. Run slskd on a machine that stays
@@ -29,6 +32,80 @@ awake: a Soulseek queue position can take hours, and a sleeping laptop loses it.
 `rekord-ripper tui` opens the TUI. `rekord-ripper cp` copies manually,
 `rekord-ripper auto` copies automatically, and `rekord-ripper dump` prints the
 database. See the help pages for the full options.
+
+### The macOS app
+
+A native SwiftUI app laid out like Music: your library and rekordbox playlists in
+the sidebar, one table of tracks, and an inspector for the selected track. It is
+built separately from `cargo install`, and needs Xcode or the Command Line Tools.
+With only the Command Line Tools, the icon is the flat one rather than the
+Icon Composer original, since compiling that takes Xcode's `actool`:
+
+```bash
+scripts/build-macos-app.sh
+open "target/macos/Rekord Ripper.app"
+```
+
+- **Sidebar.** Your whole library, plus smart collections: Needs Upgrade
+  (streams and lossy files), Unanalysed, Missing (local files not on disk) and
+  Suggested Transfers (what `auto` would fill). Below them, your rekordbox
+  playlists and folders.
+- **Table.** The search field takes the same query language as the TUI, and
+  narrows whichever collection or playlist is selected. The Upgrade column
+  shows how far each track has got: searching, the best offer found, downloading,
+  then the fingerprint verdict.
+- **Inspector.** Cover art, cues on a timeline, better copies with Download or
+  Buy, and twins it can copy analysis to or from. With several tracks selected,
+  it searches all of them, or copies one track's analysis to the rest.
+- **Drag and drop.** Drop a track on another to copy its analysis there. Drop an
+  audio file on a track to queue it as a better copy of that track.
+- **Activity** (toolbar, ⌘0). Searches, downloads, the queue, and recent
+  messages, each with a button for its next step.
+
+Downloads move along on their own: the app imports each one and checks its
+fingerprint without a click. **Settings** (⌘,) turns that off, and edits
+`config.toml`: downloads, search, sources and the fingerprint gate. Each change
+is saved as you make it, keeping the file's comments. Nothing is imported until
+**Import downloads into rekordbox** is on. The Sources tab also saves keys,
+passwords and cookies to `credentials.toml`, readable only by you; a saved one is
+never shown again. Compat levels are edited in the file.
+
+The app and the TUI both pick up edits to `config.toml` and `credentials.toml`
+within a second. A file that no longer loads leaves the previous settings in
+place and says which line is wrong.
+
+Every write still goes through the same gates as the TUI. A review sheet shows
+each track before and after, with its cues. Confirmations the pipeline opens
+wait in Activity rather than interrupting you, and post a notification when the
+app is in the background. The app refuses to write while rekordbox is running.
+**Library** has an override for that, which asks first and resets when the app
+quits.
+
+`REKORDBOX_DIR` points it at a copy of your library, for trying it out:
+
+```bash
+REKORDBOX_DIR=/path/to/copy "target/macos/Rekord Ripper.app/Contents/MacOS/RekordRipper"
+```
+
+The build signs the app with Alluja LLC's Developer ID when that certificate is
+in your keychain (`CODESIGN_IDENTITY` names another), and ad hoc otherwise. A
+signed build still needs notarizing before another Mac opens it without asking:
+`scripts/release-macos.sh` builds, notarizes, staples, and zips it. It reads
+notarization credentials stored once in the keychain:
+
+```bash
+xcrun notarytool store-credentials rekord-ripper-notary \
+  --apple-id <apple-id> --team-id Z74U5327X4 --password <app-specific-password>
+```
+
+The password is an app-specific one from appleid.apple.com. A profile already
+stored for another app on the same team works too: pass `KEYCHAIN_PROFILE`.
+
+The app is a thin layer over `rekord_ripper::session`, which holds everything the
+TUI and the app share. `macos/bridge` exposes it to Swift through swift-bridge.
+The Swift side keeps the session on a serial queue of its own, so a write never
+blocks the window. Another platform would add its own binding over the same
+module.
 
 ### Searching your library
 

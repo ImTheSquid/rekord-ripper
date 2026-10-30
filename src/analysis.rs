@@ -394,6 +394,49 @@ fn load_new_cues_from_src(db: &MasterDb, src_id: &str, _dst_uuid: &str) -> Resul
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// A cue as a timeline draws it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CueMark {
+    pub ms: i64,
+    /// Where a loop ends; `None` for a plain cue.
+    pub end_ms: Option<i64>,
+    /// `djmdCue.Kind`: 0 for a memory cue, otherwise a hot cue slot.
+    pub kind: i64,
+}
+
+impl CueMark {
+    fn new(in_msec: Option<i64>, out_msec: Option<i64>, kind: Option<i64>) -> Option<Self> {
+        let ms = in_msec?;
+        Some(Self {
+            ms,
+            // rekordbox writes -1 when there is no loop.
+            end_ms: out_msec.filter(|&end| end > ms),
+            kind: kind.unwrap_or(0),
+        })
+    }
+
+    pub fn hot(&self) -> bool {
+        self.kind != 0
+    }
+}
+
+/// A track's current cues, in time order.
+pub fn cue_marks(db: &MasterDb, content_id: &str) -> Result<Vec<CueMark>> {
+    let mut stmt = db.conn.prepare(
+        "SELECT InMsec, OutMsec, Kind FROM djmdCue
+         WHERE ContentID = ?1 AND (rb_local_deleted = 0 OR rb_local_deleted IS NULL)
+         ORDER BY InMsec",
+    )?;
+    let rows = stmt.query_map(params![content_id], |r| {
+        Ok(CueMark::new(r.get(0)?, r.get(1)?, r.get(2)?))
+    })?;
+    Ok(rows
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect())
+}
+
 fn load_new_censors_from_src(
     db: &MasterDb,
     src_id: &str,
@@ -793,7 +836,72 @@ fn format_header_line(h: &TrackHeader) -> String {
     )
 }
 
+#[cfg(test)]
 impl Plan {
+    /// A plan that writes `cues` (in, out, kind) and the given fields, for
+    /// tests outside this module.
+    pub(crate) fn stub(
+        src: TrackHeader,
+        dst: TrackHeader,
+        cues: &[(i64, i64, i64)],
+        delete_existing_cues: bool,
+    ) -> Self {
+        let new_cues = cues
+            .iter()
+            .map(|&(in_msec, out_msec, kind)| NewCue {
+                id: random_numeric_id(),
+                uuid: Uuid::new_v4().to_string(),
+                in_msec: Some(in_msec),
+                in_frame: None,
+                in_mpeg_frame: None,
+                in_mpeg_abs: None,
+                out_msec: Some(out_msec),
+                out_frame: None,
+                out_mpeg_frame: None,
+                out_mpeg_abs: None,
+                kind: Some(kind),
+                color: None,
+                color_table_index: None,
+                active_loop: None,
+                comment: None,
+                beat_loop_size: None,
+                cue_microsec: None,
+                in_point_seek_info: None,
+                out_point_seek_info: None,
+            })
+            .collect();
+        Plan {
+            set_bpm: src.bpm,
+            set_length: src.length,
+            src,
+            dst,
+            opts: CopyOpts::default(),
+            file_copies: Vec::new(),
+            new_analysis_data_path: String::new(),
+            delete_existing_cues,
+            delete_existing_censors: false,
+            new_cues,
+            new_censors: Vec::new(),
+            new_mixer_param: None,
+            new_content_cue: None,
+            new_content_active_censor: None,
+            set_key_id: None,
+            set_analysed: 0,
+            warnings: Vec::new(),
+        }
+    }
+}
+
+impl Plan {
+    /// The cues this plan writes. The destination keeps its own as well unless
+    /// `delete_existing_cues`.
+    pub fn cue_marks(&self) -> Vec<CueMark> {
+        self.new_cues
+            .iter()
+            .filter_map(|c| CueMark::new(c.in_msec, c.out_msec, c.kind))
+            .collect()
+    }
+
     pub fn render(&self) -> String {
         use std::fmt::Write;
         let mut s = String::new();
@@ -1092,6 +1200,32 @@ fn _path_marker(_: &Path) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cue_marks_keep_loops_and_drop_deleted_cues() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE djmdCue (ContentID TEXT, InMsec INTEGER, OutMsec INTEGER,
+                Kind INTEGER, rb_local_deleted INTEGER);
+             INSERT INTO djmdCue VALUES
+                ('1', 9000, 13000, 2, 0), ('1', 500, -1, 0, NULL),
+                ('1', 700, -1, 1, 1), ('2', 1, -1, 1, 0), ('1', NULL, -1, 3, 0);",
+        )
+        .unwrap();
+        let db = MasterDb {
+            conn,
+            app_dir: PathBuf::from("."),
+        };
+        let marks = cue_marks(&db, "1").unwrap();
+        assert_eq!(
+            marks,
+            [
+                CueMark { ms: 500, end_ms: None, kind: 0 },
+                CueMark { ms: 9000, end_ms: Some(13000), kind: 2 },
+            ]
+        );
+        assert!(!marks[0].hot() && marks[1].hot());
+    }
 
     #[test]
     fn usn_allocator_assigns_sequential_values_and_returns_max() {

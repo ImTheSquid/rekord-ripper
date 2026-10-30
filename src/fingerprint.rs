@@ -153,9 +153,7 @@ pub fn fingerprint_file(path: &Path, window_secs: u32) -> Result<Fingerprint> {
     .stdin(Stdio::null());
 
     let mut child = cmd.spawn().map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => {
-            anyhow!("ffmpeg not found — install it, or fingerprinting cannot work")
-        }
+        std::io::ErrorKind::NotFound => proc::not_found(&cmd),
         _ => anyhow!("could not run ffmpeg: {e}"),
     })?;
 

@@ -92,7 +92,9 @@ pub fn with_retries<T>(
             Ok(v) => return Ok(v),
             Err(e) if e.is_retryable() && attempt + 1 < attempts => {
                 // Honour a server-supplied wait over our own guess.
-                std::thread::sleep(e.retry_after().unwrap_or(delay));
+                if !crate::cancel::sleep(e.retry_after().unwrap_or(delay)) {
+                    return Err(BackendError::Other(anyhow::anyhow!("cancelled")));
+                }
                 delay = (delay * 2).min(Duration::from_secs(8));
                 last = Some(e);
             }

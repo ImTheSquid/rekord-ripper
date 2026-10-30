@@ -16,14 +16,14 @@ use rekord_ripper::tui::render;
 fn main() -> anyhow::Result<()> {
     let db = MasterDb::open()?;
     let mut app = App::new(db, SafetyOpts::default())?;
-    println!("loaded {} rows", app.rows.len());
+    println!("loaded {} rows", app.session.rows.len());
 
     // Pick a source row that has a title to search for.
     let idx = app
         .src
         .visible
         .iter()
-        .position(|&i| !app.rows[i].title.trim().is_empty())
+        .position(|&i| !app.session.rows[i].title.trim().is_empty())
         .expect("no titled track in the library");
     app.src.cursor = idx;
     app.recompute_visible();
@@ -35,7 +35,7 @@ fn main() -> anyhow::Result<()> {
 
     // 's' from the transfer screen: cross to the shop screen and search.
     if !app.open_shop() {
-        println!("open_shop refused: {}", app.status.text);
+        println!("open_shop refused: {}", app.session.status.text);
         return Ok(());
     }
     assert_eq!(app.screen, Screen::Shop, "should be on the shop screen");
@@ -55,7 +55,7 @@ fn main() -> anyhow::Result<()> {
         // Exactly what event_loop does each iteration, minus the input poll.
         let t0 = Instant::now();
         term.draw(|f| render::draw(f, &mut app))?;
-        app.poll_rekordbox_if_due();
+        app.poll_if_due();
         app.pump_worker();
         let elapsed = t0.elapsed();
         worst_tick = worst_tick.max(elapsed);
@@ -64,7 +64,7 @@ fn main() -> anyhow::Result<()> {
         }
         ticks += 1;
 
-        if matches!(app.shop, ShopState::Results { .. } | ShopState::Failed(_)) {
+        if matches!(app.session.shop, ShopState::Results { .. } | ShopState::Failed(_)) {
             break;
         }
         if began.elapsed() > Duration::from_secs(90) {
@@ -80,24 +80,25 @@ fn main() -> anyhow::Result<()> {
         worst_tick.as_secs_f64() * 1000.0,
         worst_warm.as_secs_f64() * 1000.0
     );
-    println!("status: {}\n", app.status.text);
+    println!("status: {}\n", app.session.status.text);
 
     // Download the highlighted offer, the way Enter does, and keep ticking.
     if std::env::var("RR_SMOKE_FETCH").is_ok() {
         use rekord_ripper::tui::app::FetchState;
         // Pick the first free offer, since a paid one is refused by design.
         let free = app
+            .session
             .shop
             .flattened()
             .position(|(_, r)| !r.offer.requires_purchase());
-        if let ShopState::Results { cursor, .. } = &mut app.shop
+        if let ShopState::Results { cursor, .. } = &mut app.session.shop
             && let Some(i) = free
         {
             *cursor = i;
         }
         println!(
             "fetching: {:?}",
-            app.shop.selected().map(|r| r.offer.title.clone())
+            app.session.shop.selected().map(|r| r.offer.title.clone())
         );
         if app.start_fetch() {
             let t = Instant::now();
@@ -107,7 +108,7 @@ fn main() -> anyhow::Result<()> {
                 term.draw(|f| render::draw(f, &mut app))?;
                 app.pump_worker();
                 worst = worst.max(t0.elapsed());
-                if matches!(app.fetch, FetchState::Done { .. } | FetchState::Failed(_)) {
+                if matches!(app.session.fetch, FetchState::Done { .. } | FetchState::Failed(_)) {
                     break;
                 }
                 if t.elapsed() > Duration::from_secs(240) {
@@ -121,7 +122,7 @@ fn main() -> anyhow::Result<()> {
                 t.elapsed().as_secs_f64(),
                 worst.as_secs_f64() * 1000.0
             );
-            match &app.fetch {
+            match &app.session.fetch {
                 FetchState::Done { paths, queued } => {
                     for p in paths {
                         println!(
@@ -136,26 +137,26 @@ fn main() -> anyhow::Result<()> {
                 _ => {}
             }
         } else {
-            println!("start_fetch refused: {}", app.status.text);
+            println!("start_fetch refused: {}", app.session.status.text);
         }
     }
 
     // The reported bug: step away from finished results, come back with 's'.
     {
-        let before = app.shop.len();
+        let before = app.session.shop.len();
         app.screen = Screen::Transfer; // Esc
         let reopened = app.open_shop(); // s
         println!(
             "reopen after finishing: opened={reopened} on_shop_screen={} offers_kept={} (was {before})",
             app.screen == Screen::Shop,
-            app.shop.len()
+            app.session.shop.len()
         );
         assert!(
             reopened && app.screen == Screen::Shop,
             "s must come back to the shop screen"
         );
-        assert_eq!(app.shop.len(), before, "results must not be discarded");
-        assert!(!app.shop_busy(), "reopening must not start a new search");
+        assert_eq!(app.session.shop.len(), before, "results must not be discarded");
+        assert!(!app.session.shop_busy(), "reopening must not start a new search");
     }
 
     // The reported dead key: browsing offers must not drag the track cursor with
@@ -179,7 +180,7 @@ fn main() -> anyhow::Result<()> {
         );
         println!(
             "  offer now highlighted belongs to src {:?}",
-            app.shop_offer_src()
+            app.session.shop_offer_src()
         );
     }
 
@@ -191,7 +192,7 @@ fn main() -> anyhow::Result<()> {
         let picks: Vec<usize> = app.shop_list.visible.iter().take(3).copied().collect();
         println!("tapping s on {} tracks", picks.len());
 
-        let before = app.shop.len();
+        let before = app.session.shop.len();
         for (n, _) in picks.iter().enumerate() {
             app.shop_list.cursor = n;
             let label = app
@@ -201,16 +202,16 @@ fn main() -> anyhow::Result<()> {
             let ok = app.shop_track();
             println!(
                 "  s on {label:<48} accepted={ok} outstanding={}",
-                app.shop_outstanding()
+                app.session.shop_outstanding()
             );
         }
         // Pressing s again on the same track must not queue it twice.
         app.shop_list.cursor = 0;
-        let dup = app.shop_outstanding();
+        let dup = app.session.shop_outstanding();
         app.shop_track();
         println!(
             "  s again on the first track: outstanding {dup} -> {}",
-            app.shop_outstanding()
+            app.session.shop_outstanding()
         );
 
         let t = Instant::now();
@@ -218,11 +219,11 @@ fn main() -> anyhow::Result<()> {
         loop {
             term.draw(|f| render::draw(f, &mut app))?;
             app.pump_worker();
-            let n = app.shop.len();
+            let n = app.session.shop.len();
             if seen_counts.last().copied() != Some(n) {
                 seen_counts.push(n);
             }
-            if !app.shop_busy() {
+            if !app.session.shop_busy() {
                 break;
             }
             if t.elapsed() > Duration::from_secs(240) {
@@ -232,7 +233,7 @@ fn main() -> anyhow::Result<()> {
             std::thread::sleep(Duration::from_millis(300));
         }
         println!("  offer count over time: {seen_counts:?} (started at {before})");
-        if let S::Results { groups, .. } = &app.shop {
+        if let S::Results { groups, .. } = &app.session.shop {
             println!("  accumulated {} groups:", groups.len());
             for g in groups.iter() {
                 println!("    {:<48} {} offers", g.label, g.outcome.offers.len());
@@ -251,7 +252,7 @@ fn main() -> anyhow::Result<()> {
             .visible
             .iter()
             .take(3)
-            .filter_map(|&i| app.rows.get(i))
+            .filter_map(|&i| app.session.rows.get(i))
             .map(|r| r.id.clone())
             .collect();
         for id in &picks {
@@ -287,7 +288,7 @@ fn main() -> anyhow::Result<()> {
                 app.pump_worker();
                 // Wait on the worker, not on the state: results may already be
                 // showing from an earlier search.
-                if !app.shop_busy() {
+                if !app.session.shop_busy() {
                     break;
                 }
                 if t.elapsed() > Duration::from_secs(180) {
@@ -296,7 +297,7 @@ fn main() -> anyhow::Result<()> {
                 }
                 std::thread::sleep(Duration::from_millis(300));
             }
-            if let S::Results { groups, .. } = &app.shop {
+            if let S::Results { groups, .. } = &app.session.shop {
                 println!("bulk groups: {}", groups.len());
                 for g in groups.iter() {
                     println!("  {:<44} {} offers", g.label, g.outcome.offers.len());
@@ -316,9 +317,9 @@ fn main() -> anyhow::Result<()> {
                     "a filter must not drop basket items from the search"
                 );
             }
-            println!("total offers: {}", app.shop.len());
+            println!("total offers: {}", app.session.shop.len());
         } else {
-            println!("bulk refused: {}", app.status.text);
+            println!("bulk refused: {}", app.session.status.text);
         }
     }
 

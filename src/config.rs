@@ -43,6 +43,8 @@ pub struct Config {
     pub soulseek: Soulseek,
     #[serde(default)]
     pub compat: crate::compat::CompatConfig,
+    #[serde(default)]
+    pub tools: Tools,
 
     /// Keys we don't recognise, kept so a round-trip doesn't delete them.
     #[serde(flatten, default, skip_serializing_if = "toml::Table::is_empty")]
@@ -56,6 +58,8 @@ pub struct General {
     pub download_dir: Option<String>,
     /// Tried in order when a backend offers a choice. First match wins.
     pub format_preference: Vec<String>,
+    /// Downloads that run at once; the rest wait their turn.
+    pub max_downloads: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,6 +109,15 @@ pub struct Fingerprint {
     pub cache: bool,
     /// Fetch streaming sources to a scratch file so they can be fingerprinted.
     pub stream_fetch: bool,
+}
+
+/// External programs found on `PATH` unless given here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Tools {
+    /// A command name or a full path. `~/` is expanded; nothing else is.
+    pub ffmpeg_path: String,
+    pub ffprobe_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,6 +230,7 @@ impl Default for General {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            max_downloads: 3,
         }
     }
 }
@@ -248,6 +262,15 @@ impl Default for Fingerprint {
             duration_tol_secs: 2,
             cache: true,
             stream_fetch: true,
+        }
+    }
+}
+
+impl Default for Tools {
+    fn default() -> Self {
+        Self {
+            ffmpeg_path: "ffmpeg".into(),
+            ffprobe_path: "ffprobe".into(),
         }
     }
 }
@@ -296,11 +319,18 @@ impl Default for Soulseek {
 }
 
 impl Config {
-    /// Load from `path`, or return defaults if it doesn't exist.
+    /// Load from `path`, or return defaults if it doesn't exist, and point
+    /// every later spawn at its tools.
     ///
     /// Warnings about unknown keys go to stderr, matching how the rest of the
     /// crate separates status output from product output.
     pub fn load(path: &Path) -> Result<Self> {
+        let cfg = Self::load_quietly(path)?;
+        crate::proc::use_tools(&cfg.tools);
+        Ok(cfg)
+    }
+
+    fn load_quietly(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
         }

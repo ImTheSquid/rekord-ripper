@@ -560,7 +560,12 @@ impl super::AcquisitionBackend for SoundCloud {
                 },
                 // Per-offer failure never fails the batch — a DRM track must not
                 // cost us the other rows.
-                Err(e) => offer.enrich_error = Some(e.to_string()),
+                Err(e) => {
+                    if matches!(e, BackendError::Unsupported { .. }) {
+                        offer.formats = Some(Vec::new());
+                    }
+                    offer.enrich_error = Some(e.to_string());
+                }
             }
         }
         Ok(())

@@ -23,6 +23,16 @@ pub struct TrackRow {
     pub cue_count: i64,
     pub analysed: i64,
     pub file_type: Option<i64>,
+    pub uuid: String,
+    /// Musical key as rekordbox names it ("Am", "8A"), empty when unanalysed.
+    pub key: String,
+    /// Cover art, share-relative (`/PIONEER/Artwork/…`); resolve it with
+    /// `MasterDb::resolve_analysis_path`.
+    pub artwork: Option<String>,
+    pub origin: crate::format::Origin,
+    /// Whether a local file is really on this machine; `None` when that cannot
+    /// be checked — see `crate::presence`.
+    pub present: Option<bool>,
 
     // Derived once at load — keeps the filter hot path branch-free:
     pub norm_title: String,
@@ -91,12 +101,26 @@ impl TrackRow {
             cue_count,
             analysed,
             file_type,
+            uuid: String::new(),
+            key: String::new(),
+            artwork: None,
+            origin: crate::format::Origin::default(),
+            present: None,
             norm_title,
             locked,
             is_unlocked_cueless_audio,
             search_blob,
             playlist_blob: String::new(),
             tags: String::new(),
+        }
+    }
+
+    /// Whether the audio is lossless. `None` for a stream, or a file rekordbox
+    /// cannot open.
+    pub fn lossless(&self) -> Option<bool> {
+        match self.origin {
+            crate::format::Origin::Stream => None,
+            _ => crate::format::lossless(self.file_type),
         }
     }
 
@@ -139,12 +163,14 @@ impl TrackRow {
 pub fn load_rows(db: &MasterDb) -> Result<Vec<TrackRow>> {
     let sql = "
         SELECT c.ID, c.Title, c.BPM, c.Length, c.Analysed, c.FileType,
-               c.FolderPath, c.ServiceID, a.Name AS Artist,
+               c.FolderPath, c.ServiceID, c.UUID, c.ImagePath, a.Name AS Artist,
+               k.ScaleName AS KeyName,
                (SELECT COUNT(*) FROM djmdCue
                  WHERE ContentID = c.ID
                    AND (rb_local_deleted = 0 OR rb_local_deleted IS NULL)) AS cue_count
         FROM djmdContent c
         LEFT JOIN djmdArtist a ON a.ID = c.ArtistID
+        LEFT JOIN djmdKey k ON k.ID = c.KeyID
         WHERE c.rb_local_deleted = 0 OR c.rb_local_deleted IS NULL
         ORDER BY c.Title COLLATE NOCASE";
 
@@ -163,13 +189,21 @@ pub fn load_rows(db: &MasterDb) -> Result<Vec<TrackRow>> {
         let path = r.get::<_, Option<String>>("FolderPath")?;
         let path = path.as_deref();
         let origin = crate::format::origin(row.file_type, path, r.get("ServiceID")?);
+        let present = crate::presence::check(origin, path);
         row.tags = crate::format::track_tags(crate::format::TrackFacts {
             origin,
             file_type: row.file_type,
             cue_count: row.cue_count,
             locked: row.locked,
-            present: crate::presence::check(origin, path),
+            present,
         });
+        row.origin = origin;
+        row.present = present;
+        row.uuid = r.get::<_, Option<String>>("UUID")?.unwrap_or_default();
+        row.key = r.get::<_, Option<String>>("KeyName")?.unwrap_or_default();
+        row.artwork = r
+            .get::<_, Option<String>>("ImagePath")?
+            .filter(|p| !p.is_empty());
         Ok(row)
     })?;
     let mut out = rows.collect::<rusqlite::Result<Vec<_>>>()?;

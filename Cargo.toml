@@ -1,11 +1,12 @@
 [package]
 name = "rekord-ripper"
-version = "1.2.0"
+version = "2.0.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["Jack Hogan <jackhogan11@gmail.com>"]
 description = "Rekordbox analysis utilities"
 repository = "https://github.com/ImTheSquid/rekord-ripper"
+exclude = ["macos", "scripts"]
 
 [dependencies]
 anyhow = "1.0.102"
@@ -27,6 +28,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 toml = "0.9"
+toml_edit = "0.23"
 # Blocking by design, so no tokio. rustls default rather than native-tls: the
 # build already pays for vendored OpenSSL via rusqlite, and native-tls would
 # mean debugging schannel on Windows as well.
@@ -34,3 +36,6 @@ ureq = { version = "3.4", features = ["cookies", "json"] }
 # v5 as well as v4: a download batch id derived from the offer is stable across
 # runs, which is what makes re-fetching attach instead of duplicating.
 uuid = { version = "1", features = ["v4", "v5"] }
+
+[workspace]
+members = ["macos/bridge"]

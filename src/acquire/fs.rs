@@ -168,7 +168,7 @@ pub fn write_atomically(target: &Path, reader: &mut impl Read) -> Result<u64> {
 
     let written = {
         let mut file = std::fs::File::create(&part)?;
-        match std::io::copy(reader, &mut file) {
+        match std::io::copy(&mut crate::cancel::Reader(reader), &mut file) {
             Ok(n) => {
                 file.flush()?;
                 n

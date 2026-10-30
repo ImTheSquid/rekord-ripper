@@ -4,6 +4,7 @@
 pub mod backend;
 pub mod bandcamp;
 pub mod blob;
+pub mod browsers;
 pub mod cmd;
 pub mod error;
 pub mod fs;
@@ -40,8 +41,21 @@ pub fn route_progress(sink: Sink) {
     *SINK.lock().unwrap_or_else(|e| e.into_inner()) = Some(sink);
 }
 
+thread_local! {
+    static THREAD_SINK: std::cell::RefCell<Option<Sink>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Send this thread's backend progress to `sink`, ahead of [`route_progress`],
+/// so work running side by side can tell its lines apart.
+pub fn route_progress_here(sink: Sink) {
+    THREAD_SINK.with(|s| *s.borrow_mut() = Some(sink));
+}
+
 /// One line of backend progress. Prefer the `note!` macro.
 pub fn note_line(line: &str) {
+    if THREAD_SINK.with(|s| s.borrow().as_ref().map(|sink| sink(line)).is_some()) {
+        return;
+    }
     match SINK.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
         Some(sink) => sink(line),
         None => eprintln!("{line}"),

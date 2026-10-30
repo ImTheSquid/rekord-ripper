@@ -1,0 +1,5 @@
+/.build
+/.rust
+/.swiftpm
+/Sources/RekordRipperFFI/*.h
+/Sources/RekordRipperBridge

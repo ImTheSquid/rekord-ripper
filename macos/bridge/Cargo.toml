@@ -1,0 +1,17 @@
+[package]
+name = "rekord-ripper-macos"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+build = "build.rs"
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+rekord-ripper = { path = "../.." }
+swift-bridge = "=0.1.59"
+
+[build-dependencies]
+swift-bridge-build = "=0.1.59"
