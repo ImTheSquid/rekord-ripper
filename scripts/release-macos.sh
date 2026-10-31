@@ -8,7 +8,7 @@
 set -euo pipefail
 
 TEAM_ID="${TEAM_ID:-Z74U5327X4}"
-KEYCHAIN_PROFILE="${KEYCHAIN_PROFILE:-rekord-ripper-notary}"
+KEYCHAIN_PROFILE="${KEYCHAIN_PROFILE:-alluja-notary}"
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 app="$root/target/macos/Rekord Ripper.app"
