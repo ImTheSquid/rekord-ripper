@@ -94,7 +94,7 @@ signed build still needs notarizing before another Mac opens it without asking:
 notarization credentials stored once in the keychain:
 
 ```bash
-xcrun notarytool store-credentials rekord-ripper-notary \
+xcrun notarytool store-credentials alluja-notary \
   --apple-id <apple-id> --team-id Z74U5327X4 --password <app-specific-password>
 ```
 
